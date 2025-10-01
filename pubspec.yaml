@@ -1,0 +1,63 @@
+name: church_management_app
+description: A church management system with admin and member dashboards.
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Core Firebase packages
+
+  cloud_firestore: ^5.6.7
+
+  # UI Enhancements
+  #flutter_local_notifications: ^14.1.1
+  firebase_messaging: ^15.2.5
+  fl_chart: ^0.71.0
+  font_awesome_flutter: ^10.6.0
+  #payment utilities
+  flutter_stripe: ^9.3.0
+  http: ^1.5.0
+  # Useful utilities
+  intl: ^0.20.2 # For date formatting
+  provider: ^6.0.5 # (optional) if you later want better state management
+  another_flushbar: ^1.12.30 # For nice toast messages
+  #excel: ^4.0.6
+  path_provider: ^2.0.14
+  go_router: ^14.0.0
+  firebase_auth: ^5.5.3
+  firebase_core: ^3.13.0
+  image_picker: ^1.1.2
+  firebase_storage: ^12.3.0
+  
+  excel: ^4.0.6
+  syncfusion_flutter_xlsio: ^29.1.38
+  flutter_animate: ^4.5.2
+  url_launcher: ^6.3.1
+  file_picker: ^8.0.3
+  cloud_functions: ^5.5.1
+  youtube_player_flutter: ^9.1.1
+  fluttertoast: ^8.2.12
+  uuid: ^4.5.1
+  html: ^0.15.4
+  cached_network_image: ^3.3.1
+  shared_preferences: ^2.5.3
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+      - assets/images/female_avatar.png
+      - assets/images/male_avatar.png
+
+

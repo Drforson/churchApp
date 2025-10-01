@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "97136137754",
+    "project_id": "resmanageapp",
+    "storage_bucket": "resmanageapp.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:97136137754:android:1458222f1ee58a22cde3a3",
+        "android_client_info": {
+          "package_name": "com.example.churchapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCqTIhXmQ1XZ4LER52eaiFxW_qdGf7_Z7k"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
