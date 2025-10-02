@@ -16,8 +16,12 @@ dependencies:
   cloud_firestore: ^5.6.7
 
   # UI Enhancements
-  #flutter_local_notifications: ^14.1.1
+  flutter_local_notifications: ^14.1.1
   firebase_messaging: ^15.2.5
+  #firebase_core: ^latest
+  #firebase_messaging: ^latest
+  #flutter_local_notifications: ^latest
+
   fl_chart: ^0.71.0
   font_awesome_flutter: ^10.6.0
   #payment utilities

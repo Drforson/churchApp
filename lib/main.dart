@@ -6,6 +6,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
 
+// ✅ Add these
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
 // Pages
 import 'pages/login_page.dart';
 import 'pages/signup1.dart';
@@ -31,13 +35,104 @@ import 'pages/successpage.dart';
 import 'services/theme_provider.dart';
 import 'firebase_options.dart';
 
+// ---------------------------------------------------------------------------
+// 🔔 Notification wiring (FCM + foreground banners)
+// ---------------------------------------------------------------------------
+
+final FlutterLocalNotificationsPlugin _fln = FlutterLocalNotificationsPlugin();
+
+const String _androidChannelId = 'default_channel';
+const String _androidChannelName = 'General';
+const String _androidChannelDescription = 'General notifications';
+
+const AndroidNotificationChannel _androidChannel = AndroidNotificationChannel(
+  _androidChannelId,
+  _androidChannelName,
+  description: _androidChannelDescription,
+  importance: Importance.high,
+);
+
+// Runs in its own isolate on background push
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  // Handle background data if needed.
+}
+
+Future<void> _initLocalNotifications() async {
+  // Android: create channel
+  final androidImpl = _fln.resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  await androidImpl?.createNotificationChannel(_androidChannel);
+
+  const initSettings = InitializationSettings(
+    android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    iOS: DarwinInitializationSettings(
+      requestAlertPermission: false,
+      requestBadgePermission: false,
+      requestSoundPermission: false,
+    ),
+  );
+  await _fln.initialize(initSettings);
+}
+
+Future<void> _initMessaging() async {
+  // Background handler
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  // Ask permissions (iOS + Android 13+)
+  await FirebaseMessaging.instance.requestPermission(
+    alert: true,
+    badge: true,
+    sound: true,
+    provisional: false,
+  );
+
+  // Show alerts while app is foreground (iOS)
+  await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
+    alert: true,
+    badge: true,
+    sound: true,
+  );
+
+  // Foreground notifications -> show a local banner
+  FirebaseMessaging.onMessage.listen((RemoteMessage m) {
+    final n = m.notification;
+    _fln.show(
+      n.hashCode,
+      n?.title ?? 'New message',
+      n?.body ?? '',
+      const NotificationDetails(
+        android: AndroidNotificationDetails(
+          _androidChannelId,
+          _androidChannelName,
+          channelDescription: _androidChannelDescription,
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+        iOS: DarwinNotificationDetails(),
+      ),
+      payload: m.data.isNotEmpty ? m.data.toString() : null,
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  Stripe.publishableKey = 'pk_test_your_publishable_key'; // Replace with real key!
 
-  // ✅ Start/stop notification listeners automatically with auth changes
+  // 🔑 Stripe (replace with your real key)
+  Stripe.publishableKey = 'pk_test_your_publishable_key';
+
+  // ✅ Ensure in-app Firestore listeners start/stop with auth changes
+  // (so real-time updates work even if the bell icon hasn't built yet)
   NotificationCenter.instance.bindToAuth();
+
+  // 🔔 OS-level notifications
+  await _initLocalNotifications();
+  await _initMessaging();
 
   runApp(
     MultiProvider(
@@ -85,7 +180,8 @@ class _RoleLoaderState extends State<RoleLoader> {
     final memberId = data['memberId'] as String?;
     if (effectiveRole == 'member' && memberId != null) {
       final mem = await _db.collection('members').doc(memberId).get();
-      final ms = List<String>.from((mem.data() ?? const {})['leadershipMinistries'] ?? const <String>[]);
+      final ms = List<String>.from(
+          (mem.data() ?? const {})['leadershipMinistries'] ?? const <String>[]);
       if (ms.isNotEmpty) effectiveRole = 'leader';
     }
 
@@ -128,11 +224,14 @@ class RoleGate extends StatelessWidget {
           future: db.collection('users').doc(uid).get(),
           builder: (context, userSnap) {
             if (userSnap.connectionState == ConnectionState.waiting) {
-              return const Scaffold(body: Center(child: CircularProgressIndicator()));
+              return const Scaffold(
+                  body: Center(child: CircularProgressIndicator()));
             }
 
-            final userData = (userSnap.data?.data() as Map<String, dynamic>?) ?? {};
-            final roles = List<String>.from(userData['roles'] ?? const <String>[]);
+            final userData =
+                (userSnap.data?.data() as Map<String, dynamic>?) ?? {};
+            final roles =
+            List<String>.from(userData['roles'] ?? const <String>[]);
             final memberId = userData['memberId'] as String?;
 
             String effectiveRole = 'member';
@@ -154,10 +253,12 @@ class RoleGate extends StatelessWidget {
               stream: db.collection('members').doc(memberId).snapshots(),
               builder: (context, memSnap) {
                 if (memSnap.connectionState == ConnectionState.waiting) {
-                  return const Scaffold(body: Center(child: CircularProgressIndicator()));
+                  return const Scaffold(
+                      body: Center(child: CircularProgressIndicator()));
                 }
                 final md = memSnap.data?.data() as Map<String, dynamic>?;
-                final leads = List<String>.from(md?['leadershipMinistries'] ?? const <String>[]);
+                final leads = List<String>.from(
+                    md?['leadershipMinistries'] ?? const <String>[]);
                 if (leads.isNotEmpty) {
                   return const AdminDashboardPage();
                 }
