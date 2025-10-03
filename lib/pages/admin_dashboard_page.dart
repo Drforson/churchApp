@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter/services.dart';
+
 class AdminDashboardPage extends StatefulWidget {
   const AdminDashboardPage({super.key});
 
@@ -18,8 +19,10 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
 
   bool _isAdmin = false;
   bool _isLeader = false;
+  bool _isPastor = false; // NEW: gate for “My Follow-Up”
   Set<String> _leadershipMinistries = {};
   String? _uid;
+  String? _displayName; // NEW: show real user name
 
   @override
   void initState() {
@@ -28,6 +31,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     _primeRole();
   }
 
+  /// Pull roles + best-effort name from users + members
   Future<void> _primeRole() async {
     final uid = _uid;
     if (uid == null) return;
@@ -38,23 +42,47 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     final memberId = data['memberId'] as String?;
     final fromUsers = List<String>.from(data['leadershipMinistries'] ?? const []);
 
+    // Try to get name from users first
+    String? name = (data['displayName'] ?? data['name'])?.toString();
+    bool isPastor = roles.contains('pastor');
+
     var isAdmin = roles.contains('admin');
     var isLeader = roles.contains('leader');
     final mins = <String>{...fromUsers};
 
+    Map<String, dynamic> md = {};
     if (memberId != null) {
       final m = await _db.collection('members').doc(memberId).get();
-      final md = m.data() ?? {};
+      md = m.data() ?? {};
       final fromMembers = List<String>.from(md['leadershipMinistries'] ?? const []);
       mins.addAll(fromMembers);
       if (!isAdmin && fromMembers.isNotEmpty) isLeader = true;
+
+      // If users doc had no name, fallback to members fields
+      name ??= (md['fullName'] ??
+          ([md['firstName'], md['lastName']]
+              .where((e) => (e ?? '').toString().trim().isNotEmpty)
+              .join(' ')
+              .trim()))
+          .toString();
+
+      // Check pastoral role on members too
+      final memberRoles = List<String>.from(md['roles'] ?? const []);
+      isPastor = isPastor || memberRoles.contains('pastor') || (md['isPastor'] == true);
     }
+
+    // Final safe fallback to auth displayName/email local-part if still null
+    name ??= _auth.currentUser?.displayName ??
+        _auth.currentUser?.email?.split('@').first ??
+        'Member';
 
     if (!mounted) return;
     setState(() {
       _isAdmin = isAdmin;
       _isLeader = isLeader;
+      _isPastor = isPastor;
       _leadershipMinistries = mins;
+      _displayName = name;
     });
   }
 
@@ -94,7 +122,6 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       ),
       body: Container(
         decoration: const BoxDecoration(
-          // Neutral background
           gradient: LinearGradient(
             colors: [Color(0xFFF7F8FA), Color(0xFFEEF1F5)],
             begin: Alignment.topLeft,
@@ -107,7 +134,12 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
               children: [
-                _HeaderCard(isAdmin: _isAdmin, isLeader: _isLeader, ministries: _leadershipMinistries),
+                _HeaderCard(
+                  isAdmin: _isAdmin,
+                  isLeader: _isLeader,
+                  ministries: _leadershipMinistries,
+                  displayName: _displayName ?? 'Member', // NEW
+                ),
                 const SizedBox(height: 14),
                 const _StatsGrid(),
                 const SizedBox(height: 18),
@@ -115,7 +147,10 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
                 const SizedBox(height: 18),
                 const _SectionTitle('Quick Actions'),
                 const SizedBox(height: 8),
-                _ActionsGrid(canManage: canManage),
+                _ActionsGrid(
+                  canManage: canManage,
+                  isPastor: _isPastor, // NEW: to show “My Follow-Up”
+                ),
                 const SizedBox(height: 8),
               ],
             ),
@@ -132,23 +167,28 @@ class _HeaderCard extends StatelessWidget {
   final bool isAdmin;
   final bool isLeader;
   final Set<String> ministries;
+  final String displayName; // NEW
 
   const _HeaderCard({
     required this.isAdmin,
     required this.isLeader,
     required this.ministries,
+    required this.displayName,
   });
 
   @override
   Widget build(BuildContext context) {
     final roleLabel = isAdmin ? 'Admin' : isLeader ? 'Leader' : 'Member';
+
+    // Keep your existing ministry/role context (unchanged logic),
+    // but now the main title is the user's name.
     final subtitle = isAdmin
-        ? 'Manage church-wide content and settings'
+        ? 'Role: Admin • Manage church-wide content and settings'
         : isLeader
         ? (ministries.isEmpty
-        ? 'You are a leader'
-        : 'Leader of: ${ministries.take(3).join(", ")}${ministries.length > 3 ? " +" : ""}')
-        : 'Welcome back';
+        ? 'Role: Leader'
+        : 'Role: Leader • Leader of: ${ministries.take(3).join(", ")}${ministries.length > 3 ? " +" : ""}')
+        : 'Role: Member • Welcome back';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -169,14 +209,32 @@ class _HeaderCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Welcome, $roleLabel',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                // NEW: Welcome with actual name instead of role
+                Text(
+                  'Welcome, $displayName',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                ),
                 const SizedBox(height: 4),
                 Text(
                   subtitle,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF4B5563)),
                 ),
               ],
+            ),
+          ),
+          // Optional: small role chip on the right
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xFFE8ECF3),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              roleLabel,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+                color: const Color(0xFF1F2937),
+              ),
             ),
           ),
         ],
@@ -476,11 +534,13 @@ class _SectionTitle extends StatelessWidget {
 
 class _ActionsGrid extends StatelessWidget {
   final bool canManage;
-  const _ActionsGrid({required this.canManage});
+  final bool isPastor; // NEW
+  const _ActionsGrid({required this.canManage, required this.isPastor});
 
   @override
   Widget build(BuildContext context) {
     final items = <_ActionItem>[
+      _ActionItem('Profile', Icons.person, '/profile'), // NEW
       _ActionItem('Upload Sermons & Events', Icons.upload, '/admin-upload'),
       _ActionItem('Register Member/Visitor', Icons.how_to_reg, '/register-member'),
       _ActionItem('View Members', Icons.group, '/view-members'),
@@ -490,6 +550,8 @@ class _ActionsGrid extends StatelessWidget {
       _ActionItem('Upload Database', Icons.table_view, '/uploadExcel'),
       _ActionItem('Attendance Check-In', Icons.check_circle_outline, '/attendance'),
       _ActionItem('Sunday Follow-Up', Icons.person_off, '/follow-up'),
+      // NEW: Only for pastors
+      if (isPastor) _ActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin', requireManage: true),
     ].where((i) => !i.requireManage || canManage).toList();
 
