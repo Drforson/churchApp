@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:church_management_app/models/join_request_model.dart';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:flutter/material.dart';
@@ -17,10 +18,15 @@ class MinistresPage extends StatefulWidget {
 class _MinistresPageState extends State<MinistresPage> {
   String? currentUserId;
   String? memberId;
+  String? currentUserEmail;
   List<String> roles = [];
   bool _loading = true;
-  Set<String> pendingJoinRequests = {};
+  Set<String> pendingJoinRequests = {}; // set of ministry NAMES with pending requests
+  Set<String> myMinistryNames = {};     // current memberships for this member
   String _searchQuery = '';
+
+  // 🔹 NEW: live watcher for join_requests to keep both tabs in sync
+  StreamSubscription<QuerySnapshot>? _pendingWatcherSub;
 
   @override
   void initState() {
@@ -28,19 +34,28 @@ class _MinistresPageState extends State<MinistresPage> {
     final user = FirebaseAuth.instance.currentUser;
     if (user != null) {
       currentUserId = user.uid;
+      currentUserEmail = user.email;
       _fetchUserData();
     }
+  }
+
+  @override
+  void dispose() {
+    _pendingWatcherSub?.cancel();
+    super.dispose();
   }
 
   Future<void> _fetchUserData() async {
     if (currentUserId == null) return;
 
-    final userDoc = await FirebaseFirestore.instance.collection('users').doc(currentUserId).get();
+    final db = FirebaseFirestore.instance;
+    final userDoc = await db.collection('users').doc(currentUserId).get();
     if (!userDoc.exists) {
       setState(() {
         roles = [];
         memberId = null;
         pendingJoinRequests = {};
+        myMinistryNames = {};
         _loading = false;
       });
       return;
@@ -50,21 +65,67 @@ class _MinistresPageState extends State<MinistresPage> {
     final fetchedRoles = List<String>.from(data['roles'] ?? []);
     final linkedMemberId = data['memberId'] as String?;
 
-    Set<String> pendingMinistryIds = {};
+    Set<String> pendingNames = {};
+    Set<String> currentMins = {};
+
     if (linkedMemberId != null && linkedMemberId.isNotEmpty) {
-      final jrSnap = await FirebaseFirestore.instance
+      // current memberships
+      final memSnap = await db.collection('members').doc(linkedMemberId).get();
+      if (memSnap.exists) {
+        currentMins = (List<String>.from(
+            (memSnap.data() ?? {})['ministries'] ?? const <String>[]))
+            .toSet();
+      }
+
+      // pending requests
+      final jrSnap = await db
           .collection('join_requests')
-          .where('memberId', isEqualTo: linkedMemberId) // requester is the member
+          .where('memberId', isEqualTo: linkedMemberId)
           .where('status', isEqualTo: 'pending')
           .get();
-      pendingMinistryIds = jrSnap.docs.map((d) => (d.data()['ministryId'] as String)).toSet();
+      pendingNames = jrSnap.docs
+          .map((d) => (d.data()['ministryId'] as String))
+          .toSet();
     }
 
     setState(() {
       roles = fetchedRoles;
       memberId = linkedMemberId;
-      pendingJoinRequests = pendingMinistryIds;
+      myMinistryNames = currentMins;
+      pendingJoinRequests = pendingNames;
       _loading = false;
+    });
+
+    // 🔹 Bind live watcher AFTER memberId is known
+    _bindPendingRequestsWatcher();
+  }
+
+  // 🔹 NEW: live watcher to keep pendingJoinRequests up-to-date everywhere
+  void _bindPendingRequestsWatcher() {
+    _pendingWatcherSub?.cancel();
+    if (memberId == null || memberId!.isEmpty) return;
+
+    final q = FirebaseFirestore.instance
+        .collection('join_requests')
+        .where('memberId', isEqualTo: memberId);
+
+    _pendingWatcherSub = q.snapshots().listen((snap) {
+      // Rebuild the set from current snapshot: only PENDING remain
+      final next = <String>{};
+      for (final d in snap.docs) {
+        final data = d.data() as Map<String, dynamic>;
+        final status = (data['status'] ?? 'pending').toString();
+        if (status == 'pending') {
+          next.add((data['ministryId'] ?? '').toString());
+        }
+      }
+      if (mounted) {
+        setState(() {
+          pendingJoinRequests = next; // ⟵ updates Join buttons instantly
+        });
+      }
+    }, onError: (e) {
+      debugPrint('pending watcher error: $e');
     });
   }
 
@@ -90,42 +151,103 @@ class _MinistresPageState extends State<MinistresPage> {
       return;
     }
 
+    // Guard: already member?
+    if (myMinistryNames.contains(ministryName)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('You are already a member of this ministry.')),
+      );
+      return;
+    }
+
+    // Guard: already pending?
+    if (pendingJoinRequests.contains(ministryName)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('You already have a pending request for this ministry.')),
+      );
+      return;
+    }
+
     try {
-      final joinRef = FirebaseFirestore.instance.collection('join_requests').doc();
-      await joinRef.set({
-        'id': joinRef.id,
-        'memberId': memberId,          // requester = member doc id
-        'ministryId': ministryName,    // you’re using ministry NAME in rules
+      final db = FirebaseFirestore.instance;
+
+      // Double-check on server
+      final dup = await db
+          .collection('join_requests')
+          .where('memberId', isEqualTo: memberId)
+          .where('ministryId', isEqualTo: ministryName) // ⚠️ ministry NAME
+          .where('status', isEqualTo: 'pending')
+          .limit(1)
+          .get();
+      if (dup.docs.isNotEmpty) {
+        setState(() => pendingJoinRequests.add(ministryName));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('A pending request already exists.')),
+        );
+        return;
+      }
+
+      final ref = db.collection('join_requests').doc();
+      await ref.set({
+        'id': ref.id,
+        'memberId': memberId,
+        'ministryId': ministryName,           // ⚠️ NAME used by rules/listeners
         'status': 'pending',
         'requestedAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
+        // helpful extras
+        'requestedByUid': currentUserId,
+        'requestedByEmail': currentUserEmail,
       });
 
+      // Optimistic UI; watcher will confirm/update as well
       setState(() => pendingJoinRequests.add(ministryName));
+
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Join request sent successfully!')),
+        const SnackBar(content: Text('Join request sent!')),
+      );
+    } on FirebaseException catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send join request: ${e.message ?? e.code}')),
       );
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to send join request: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send join request: $e')),
+      );
     }
   }
-
 
   Future<void> _cancelJoinRequest(String ministryName) async {
     if (memberId == null) return;
 
-    final query = await FirebaseFirestore.instance
-        .collection('join_requests')
-        .where('memberId', isEqualTo: memberId)
-        .where('ministryId', isEqualTo: ministryName)
-        .where('status', isEqualTo: 'pending')
-        .limit(1)
-        .get();
+    try {
+      final db = FirebaseFirestore.instance;
+      final query = await db
+          .collection('join_requests')
+          .where('memberId', isEqualTo: memberId)
+          .where('ministryId', isEqualTo: ministryName)
+          .where('status', isEqualTo: 'pending')
+          .limit(1)
+          .get();
 
-    if (query.docs.isNotEmpty) {
-      await FirebaseFirestore.instance.collection('join_requests').doc(query.docs.first.id).delete();
+      if (query.docs.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No pending request found to cancel.')),
+        );
+        return;
+      }
+
+      await db.collection('join_requests').doc(query.docs.first.id).delete();
+
+      // Optimistic update; watcher will sync state even if something else changes
       setState(() => pendingJoinRequests.remove(ministryName));
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Join request cancelled')));
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Join request cancelled')),
+      );
+    } on FirebaseException catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to cancel request: ${e.message ?? e.code}')),
+      );
     }
   }
 
@@ -158,7 +280,10 @@ class _MinistresPageState extends State<MinistresPage> {
   Widget _buildMinistryCard(MinistryModel ministry, bool isMember) {
     final isLeader = _isLeaderOfMinistry(ministry);
     final hasPendingRequest = pendingJoinRequests.contains(ministry.name);
+    final alreadyMember = myMinistryNames.contains(ministry.name);
     final bool hasAccess = isMember || isAdmin;
+
+    final canJoin = !isAdmin && !alreadyMember && !hasPendingRequest && memberId != null;
 
     return FutureBuilder<int>(
       future: _getMemberCount(ministry.name),
@@ -220,15 +345,12 @@ class _MinistresPageState extends State<MinistresPage> {
                 padding: const EdgeInsets.only(top: 8.0),
                 child: Text(
                   '${ministry.description}\nMembers: $memberCount',
-                  style: TextStyle(
-                    height: 1.5,
-                    color: hasAccess ? Colors.black54 : Colors.grey,
-                  ),
+                  style: TextStyle(height: 1.5, color: hasAccess ? Colors.black54 : Colors.grey),
                 ),
               ),
               trailing: isAdmin
                   ? null
-                  : isMember
+                  : alreadyMember
                   ? const Text('Member', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold))
                   : hasPendingRequest
                   ? TextButton(
@@ -236,9 +358,9 @@ class _MinistresPageState extends State<MinistresPage> {
                 child: const Text('Cancel', style: TextStyle(color: Colors.red)),
               )
                   : ElevatedButton(
-                onPressed: () => _sendJoinRequest(ministry.name),
+                onPressed: canJoin ? () => _sendJoinRequest(ministry.name) : null,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: hasAccess ? null : Colors.grey,
+                  backgroundColor: canJoin ? null : Colors.grey,
                 ),
                 child: const Text('Join'),
               ),
@@ -293,8 +415,6 @@ class _MinistresPageState extends State<MinistresPage> {
         .collection('join_requests')
         .where('memberId', isEqualTo: memberId);
 
-    // Prefer requestedAt ordering; if your data is mixed, Firestore still returns results;
-    // If you ever get an index error in console, build the suggested index.
     return StreamBuilder<QuerySnapshot>(
       stream: baseQuery.orderBy('requestedAt', descending: true).snapshots(),
       builder: (context, snap) {
@@ -350,7 +470,6 @@ class _MinistresPageState extends State<MinistresPage> {
       },
     );
   }
-
 
   // -------------------- BUILD --------------------
 
@@ -431,7 +550,7 @@ class _MinistresPageState extends State<MinistresPage> {
                         return _buildMinistryLists(myMinistries, otherMinistries);
                       }
 
-                      // Non-admin: split by membership names
+                      // Non-admin: split by membership names (reactive)
                       return StreamBuilder<DocumentSnapshot>(
                         stream: FirebaseFirestore.instance.collection('members').doc(memberId).snapshots(),
                         builder: (context, memberSnapshot) {
@@ -439,6 +558,9 @@ class _MinistresPageState extends State<MinistresPage> {
 
                           final memberData = memberSnapshot.data!.data() as Map<String, dynamic>? ?? {};
                           final userMinistries = List<String>.from(memberData['ministries'] ?? []);
+
+                          // Keep local cache updated so Join button state is correct
+                          myMinistryNames = userMinistries.toSet();
 
                           final myMinistries = allMinistries.where((m) => userMinistries.contains(m.name)).toList();
                           final otherMinistries = allMinistries.where((m) => !userMinistries.contains(m.name)).toList();

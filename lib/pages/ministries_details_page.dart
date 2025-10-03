@@ -8,8 +8,8 @@ import '../core/firestore_paths.dart';
 import 'ministry_feed_page.dart';
 
 class MinistryDetailsPage extends StatefulWidget {
-  final String ministryId;
-  final String ministryName;
+  final String ministryId;   // ministries/{docId}
+  final String ministryName; // ministry NAME (used in rules/joins)
 
   const MinistryDetailsPage({
     super.key,
@@ -98,8 +98,7 @@ class _OverviewTab extends StatelessWidget {
               ),
               if (description.isNotEmpty) ...[
                 const SizedBox(height: 8),
-                const Text('About',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text('About', style: TextStyle(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 6),
                 Text(description),
               ],
@@ -123,8 +122,8 @@ class _OverviewTab extends StatelessWidget {
 
 // ------------------------------ Members Tab ------------------------------
 class _MembersTab extends StatefulWidget {
-  final String ministryName;
-  final String? ministryId;
+  final String ministryName; // ⚠️ name (used in rules & join_requests.ministryId)
+  final String? ministryId;  // ministries/{docId} for details/feed loading
 
   const _MembersTab({
     super.key,
@@ -220,14 +219,11 @@ class _MembersTabState extends State<_MembersTab> {
       final data = doc.data();
       return {
         'id': doc.id,
-        'name':
-        ('${data['firstName'] ?? ''} ${data['lastName'] ?? ''}').trim(),
+        'name': ('${data['firstName'] ?? ''} ${data['lastName'] ?? ''}').trim(),
         'email': data['email'] ?? '',
         'ministries': List<String>.from(data['ministries'] ?? []),
-        'leadershipMinistries':
-        List<String>.from(data['leadershipMinistries'] ?? []),
-        'isLeader':
-        (data['leadershipMinistries'] ?? []).contains(widget.ministryName),
+        'leadershipMinistries': List<String>.from(data['leadershipMinistries'] ?? []),
+        'isLeader': (data['leadershipMinistries'] ?? []).contains(widget.ministryName),
       };
     }).toList();
 
@@ -239,10 +235,8 @@ class _MembersTabState extends State<_MembersTab> {
   // ---------------- Fetch Join Requests ----------------
   Future<Map<String, dynamic>?> fetchMemberByMemberId(String memberId) async {
     try {
-      final memberDoc = await FirebaseFirestore.instance
-          .collection('members')
-          .doc(memberId)
-          .get();
+      final memberDoc =
+      await FirebaseFirestore.instance.collection('members').doc(memberId).get();
       if (!memberDoc.exists) return null;
       return memberDoc.data();
     } catch (e) {
@@ -255,7 +249,7 @@ class _MembersTabState extends State<_MembersTab> {
     try {
       final snapshot = await FirebaseFirestore.instance
           .collection('join_requests')
-          .where('ministryId', isEqualTo: widget.ministryName)
+          .where('ministryId', isEqualTo: widget.ministryName) // ⚠️ ministry NAME
           .where('status', isEqualTo: 'pending')
           .orderBy('requestedAt', descending: true)
           .get();
@@ -316,8 +310,7 @@ class _MembersTabState extends State<_MembersTab> {
 
       // Find matching user doc
       final userId = await _getUserIdByMemberId(memberId);
-      final userRef =
-      (userId != null) ? db.collection('users').doc(userId) : null;
+      final userRef = (userId != null) ? db.collection('users').doc(userId) : null;
 
       // Batch: add ministry to leadership arrays
       final batch = db.batch();
@@ -327,8 +320,7 @@ class _MembersTabState extends State<_MembersTab> {
       if (userRef != null) {
         batch.update(userRef, {
           'roles': FieldValue.arrayUnion(['leader']),
-          'leadershipMinistries':
-          FieldValue.arrayUnion([widget.ministryName]),
+          'leadershipMinistries': FieldValue.arrayUnion([widget.ministryName]),
         });
       }
       await batch.commit();
@@ -345,10 +337,7 @@ class _MembersTabState extends State<_MembersTab> {
     } catch (e) {
       debugPrint('❌ Promote error: $e');
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error promoting: $e'),
-          backgroundColor: Colors.red,
-        ),
+        SnackBar(content: Text('Error promoting: $e'), backgroundColor: Colors.red),
       );
     } finally {
       setState(() => _processingMembers.remove(memberId));
@@ -366,8 +355,7 @@ class _MembersTabState extends State<_MembersTab> {
 
       // Find matching user doc
       final userId = await _getUserIdByMemberId(memberId);
-      final userRef =
-      (userId != null) ? db.collection('users').doc(userId) : null;
+      final userRef = (userId != null) ? db.collection('users').doc(userId) : null;
 
       // Read current user's leaderships to decide if we should remove "leader" role
       List<String> userLeaderships = [];
@@ -381,21 +369,18 @@ class _MembersTabState extends State<_MembersTab> {
       }
 
       // After removal, will they have others left?
-      final remaining = userLeaderships
-          .where((m) => m != widget.ministryName)
-          .toList(growable: false);
+      final remaining =
+      userLeaderships.where((m) => m != widget.ministryName).toList(growable: false);
 
       final batch = db.batch();
       batch.update(memberRef, {
-        'leadershipMinistries':
-        FieldValue.arrayRemove([widget.ministryName]),
+        'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
       });
 
       if (userRef != null) {
         // Always remove this ministry from user's leadershipMinistries
         batch.update(userRef, {
-          'leadershipMinistries':
-          FieldValue.arrayRemove([widget.ministryName]),
+          'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
         });
 
         // If no remaining leaderships (after this demotion), drop 'leader' role.
@@ -420,10 +405,7 @@ class _MembersTabState extends State<_MembersTab> {
     } catch (e) {
       debugPrint('❌ Demote error: $e');
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error demoting: $e'),
-          backgroundColor: Colors.red,
-        ),
+        SnackBar(content: Text('Error demoting: $e'), backgroundColor: Colors.red),
       );
     } finally {
       setState(() => _processingMembers.remove(memberId));
@@ -434,68 +416,111 @@ class _MembersTabState extends State<_MembersTab> {
   Future<void> _approveJoinRequest(String requestId, String memberId) async {
     setState(() => _processingRequests.add(requestId));
     try {
-      final jrRef =
-      FirebaseFirestore.instance.collection('join_requests').doc(requestId);
-      final jrSnap = await jrRef.get();
-      if (!jrSnap.exists) throw Exception('Join request not found.');
+      final db = FirebaseFirestore.instance;
+      final jrRef = db.collection('join_requests').doc(requestId);
+      final memberRef = db.collection('members').doc(memberId);
 
-      final memberRef =
-      FirebaseFirestore.instance.collection('members').doc(memberId);
-      final memberSnap = await memberRef.get();
-      if (!memberSnap.exists) throw Exception('Member not found.');
+      await db.runTransaction((tx) async {
+        final jrSnap = await tx.get(jrRef);
+        if (!jrSnap.exists) {
+          throw Exception('Join request not found.');
+        }
+        final jr = jrSnap.data() as Map<String, dynamic>;
+        final status = (jr['status'] ?? 'pending').toString();
+        final ministryName = (jr['ministryId'] ?? '').toString();
 
-      await jrRef.update({
-        'status': 'approved',
-        'updatedAt': FieldValue.serverTimestamp(),
+        // Hard-guard: must match this page’s ministry and still be pending
+        if (ministryName != widget.ministryName) {
+          throw Exception('This request is for a different ministry.');
+        }
+        if (status != 'pending') {
+          throw Exception('Request already processed.');
+        }
+
+        final memSnap = await tx.get(memberRef);
+        if (!memSnap.exists) {
+          throw Exception('Member not found.');
+        }
+        final md = memSnap.data() as Map<String, dynamic>;
+        final currentMins = List<String>.from(md['ministries'] ?? const <String>[]);
+
+        // If already a member, we still mark request approved, but avoid duplicate write
+        final needsAdd = !currentMins.contains(widget.ministryName);
+
+        // Update member first (if needed), then the request
+        if (needsAdd) {
+          tx.update(memberRef, {
+            'ministries': FieldValue.arrayUnion([widget.ministryName]),
+          });
+        }
+
+        tx.update(jrRef, {
+          'status': 'approved',
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
       });
 
-      await memberRef.update({
-        'ministries': FieldValue.arrayUnion([widget.ministryName]),
-      });
+      // Success UI
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('✅ Request approved')),
+        );
+        setState(() {
+          joinRequestsFuture = _fetchJoinRequests();
+          membersFuture = _fetchMembers();
+        });
+      }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('✅ Request approved')),
-      );
+      // NOTE:
+      // - Your client NotificationCenter will notify the requester (status != 'pending').
+      // - Your Cloud Function (if enabled) can send FCM/inbox to both sides.
 
-      setState(() {
-        joinRequestsFuture = _fetchJoinRequests();
-        membersFuture = _fetchMembers();
-      });
     } catch (e) {
       debugPrint('❌ Error approving join request: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text('Error approving request: $e'),
-            backgroundColor: Colors.red),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error approving request: $e'), backgroundColor: Colors.red),
+        );
+      }
     } finally {
-      setState(() => _processingRequests.remove(requestId));
+      if (mounted) setState(() => _processingRequests.remove(requestId));
     }
   }
 
   Future<void> _rejectJoinRequest(String requestId) async {
     setState(() => _processingRequests.add(requestId));
     try {
-      await FirebaseFirestore.instance
-          .collection('join_requests')
-          .doc(requestId)
-          .update({
-        'status': 'rejected',
-        'updatedAt': FieldValue.serverTimestamp(),
+      final db = FirebaseFirestore.instance;
+      final jrRef = db.collection('join_requests').doc(requestId);
+
+      await db.runTransaction((tx) async {
+        final jrSnap = await tx.get(jrRef);
+        if (!jrSnap.exists) throw Exception('Join request not found.');
+        final jr = jrSnap.data() as Map<String, dynamic>;
+        final status = (jr['status'] ?? 'pending').toString();
+        if (status != 'pending') {
+          throw Exception('Request already processed.');
+        }
+        tx.update(jrRef, {
+          'status': 'rejected',
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
       });
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('✅ Request rejected')),
-      );
-      setState(() => joinRequestsFuture = _fetchJoinRequests());
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('✅ Request rejected')),
+        );
+        setState(() => joinRequestsFuture = _fetchJoinRequests());
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text('Error rejecting request: $e'),
-            backgroundColor: Colors.red),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error rejecting request: $e'), backgroundColor: Colors.red),
+        );
+      }
     } finally {
-      setState(() => _processingRequests.remove(requestId));
+      if (mounted) setState(() => _processingRequests.remove(requestId));
     }
   }
 
@@ -533,16 +558,13 @@ class _MembersTabState extends State<_MembersTab> {
         children: [
           if (isAdminOrLeaderOfThisMinistry()) ...[
             const Text('Join Requests',
-                style:
-                TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 10),
             FutureBuilder<List<Map<String, dynamic>>>(
               future: joinRequestsFuture,
               builder: (context, snapshot) {
-                if (snapshot.connectionState ==
-                    ConnectionState.waiting) {
-                  return const Center(
-                      child: CircularProgressIndicator());
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
                 }
                 final requests = snapshot.data ?? [];
                 if (requests.isEmpty) {
@@ -556,31 +578,25 @@ class _MembersTabState extends State<_MembersTab> {
                         subtitle: Text(
                           'Requested at: ${DateFormat.yMMMd().format(request['requestedAt'])}',
                         ),
-                        trailing: _processingRequests
-                            .contains(request['id'])
+                        trailing: _processingRequests.contains(request['id'])
                             ? const SizedBox(
                           height: 24,
                           width: 24,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2),
+                          child: CircularProgressIndicator(strokeWidth: 2),
                         )
                             : Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             IconButton(
-                              icon: const Icon(Icons.check_circle,
-                                  color: Colors.green),
+                              icon: const Icon(Icons.check_circle, color: Colors.green),
                               onPressed: () => _approveJoinRequest(
                                 request['id'],
                                 request['memberId'],
                               ),
                             ),
                             IconButton(
-                              icon: const Icon(Icons.cancel,
-                                  color: Colors.red),
-                              onPressed: () =>
-                                  _rejectJoinRequest(
-                                      request['id']),
+                              icon: const Icon(Icons.cancel, color: Colors.red),
+                              onPressed: () => _rejectJoinRequest(request['id']),
                             ),
                           ],
                         ),
@@ -595,8 +611,7 @@ class _MembersTabState extends State<_MembersTab> {
           Row(
             children: [
               const Text('Members',
-                  style: TextStyle(
-                      fontSize: 18, fontWeight: FontWeight.bold)),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               const Spacer(),
               DropdownButton<String>(
                 value: _filterType,
@@ -609,10 +624,8 @@ class _MembersTabState extends State<_MembersTab> {
                 },
                 items: const [
                   DropdownMenuItem(value: 'All', child: Text('All')),
-                  DropdownMenuItem(
-                      value: 'Leaders', child: Text('Leaders')),
-                  DropdownMenuItem(
-                      value: 'Members', child: Text('Members')),
+                  DropdownMenuItem(value: 'Leaders', child: Text('Leaders')),
+                  DropdownMenuItem(value: 'Members', child: Text('Members')),
                 ],
               ),
             ],
@@ -655,8 +668,7 @@ class _MembersTabState extends State<_MembersTab> {
                           ? const SizedBox(
                         height: 24,
                         width: 24,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2),
+                        child: CircularProgressIndicator(strokeWidth: 2),
                       )
                           : Row(
                         mainAxisSize: MainAxisSize.min,
@@ -665,26 +677,22 @@ class _MembersTabState extends State<_MembersTab> {
                             Tooltip(
                               message: 'Promote to Leader',
                               child: IconButton(
-                                icon: const Icon(
-                                    Icons.arrow_circle_up),
-                                onPressed: () =>
-                                    _promoteToLeader(
-                                      memberId: memberId,
-                                      memberName: memberName,
-                                    ),
+                                icon: const Icon(Icons.arrow_circle_up),
+                                onPressed: () => _promoteToLeader(
+                                  memberId: memberId,
+                                  memberName: memberName,
+                                ),
                               ),
                             ),
                           if (isLeader)
                             Tooltip(
                               message: 'Demote from Leader',
                               child: IconButton(
-                                icon: const Icon(
-                                    Icons.arrow_circle_down),
-                                onPressed: () =>
-                                    _demoteFromLeader(
-                                      memberId: memberId,
-                                      memberName: memberName,
-                                    ),
+                                icon: const Icon(Icons.arrow_circle_down),
+                                onPressed: () => _demoteFromLeader(
+                                  memberId: memberId,
+                                  memberName: memberName,
+                                ),
                               ),
                             ),
                         ],
