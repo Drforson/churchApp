@@ -1,10 +1,10 @@
 // lib/services/notification_center.dart
 //
-// Real-time notification hub.
-// - Writes notifications for: ministry feed posts, my join-request status,
-//   and leader pending join-requests.
-// - Exposes a stream<NotificationState> your UI can render.
-// - Supports markChannelSeen() to mark notifications as read by channel.
+// Unified real-time notification hub.
+// - Reads bell items from /inbox/{uid}/events (Cloud Functions + local).
+// - Locally adds "feed post" notifications into /inbox/{uid}/events.
+// - Exposes a Stream<NotificationState>.
+// - markChannelSeen() marks events in a channel as read.
 
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -35,39 +35,60 @@ class AppNotification {
     this.payload = const {},
   });
 
-  static NotificationChannel _parseChannel(dynamic v) {
+  static NotificationChannel _parseChannel(dynamic v, {String? type}) {
+    // Prefer explicit channel; fall back to type mapping
     final s = (v ?? '').toString();
-    switch (s) {
-      case 'feeds':
-        return NotificationChannel.feeds;
-      case 'joinreq':
-        return NotificationChannel.joinreq;
-      case 'leader_joinreq':
+    if (s.isNotEmpty) {
+      switch (s) {
+        case 'feeds':
+          return NotificationChannel.feeds;
+        case 'joinreq':
+          return NotificationChannel.joinreq;
+        case 'leader_joinreq':
+          return NotificationChannel.leader_joinreq;
+      }
+    }
+    switch ((type ?? '').toString()) {
+      case 'join_request_created':
         return NotificationChannel.leader_joinreq;
+      case 'join_request_status':
+        return NotificationChannel.joinreq;
       default:
         return NotificationChannel.feeds;
     }
   }
 
-  factory AppNotification.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+  factory AppNotification.fromDoc(
+      DocumentSnapshot<Map<String, dynamic>> doc,
+      ) {
     final d = doc.data() ?? {};
     final ts = d['createdAt'];
     DateTime when;
     if (ts is Timestamp) {
       when = ts.toDate();
+    } else if (ts is DateTime) {
+      when = ts;
     } else {
       when = DateTime.fromMillisecondsSinceEpoch(0);
     }
+
     final payload = Map<String, dynamic>.from(d['payload'] ?? {});
+    final type = (d['type'] ?? '').toString();
+
+    final ministryId =
+    (payload['ministryId'] ?? d['ministryId'])?.toString();
+    final ministryName =
+    (payload['ministryName'] ?? d['ministryName'])?.toString();
+
     return AppNotification(
       id: doc.id,
       title: (d['title'] ?? '').toString(),
       body: (d['body'] ?? '').toString(),
-      channel: _parseChannel(d['channel']),
+      channel: _parseChannel(d['channel'], type: type),
       createdAt: when,
       read: d['read'] == true,
-      ministryId: (payload['ministryId'] ?? d['ministryId'])?.toString(),
-      ministryName: (payload['ministryName'] ?? d['ministryName'])?.toString(),
+      ministryId: ministryId?.isEmpty == true ? null : ministryId,
+      ministryName: ministryName?.isEmpty == true ? null : ministryName,
       payload: payload,
     );
   }
@@ -79,8 +100,14 @@ class NotificationState {
 
   const NotificationState({this.items = const [], this.unread = 0});
 
-  NotificationState copyWith({List<AppNotification>? items, int? unread}) =>
-      NotificationState(items: items ?? this.items, unread: unread ?? this.unread);
+  NotificationState copyWith({
+    List<AppNotification>? items,
+    int? unread,
+  }) =>
+      NotificationState(
+        items: items ?? this.items,
+        unread: unread ?? this.unread,
+      );
 }
 
 class NotificationCenter {
@@ -93,7 +120,6 @@ class NotificationCenter {
   // --------------- public stream ---------------
   final _stateCtrl = StreamController<NotificationState>.broadcast();
   NotificationState _state = const NotificationState();
-
   Stream<NotificationState> get stream => _stateCtrl.stream;
 
   void _emit(NotificationState s) {
@@ -106,9 +132,8 @@ class NotificationCenter {
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _userDocSub;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _memberDocSub;
 
-  final List<StreamSubscription<QuerySnapshot<Map<String, dynamic>>>> _feedPostSubs = [];
-  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _myJoinReqSub;
-  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _leaderJoinReqSub;
+  final List<StreamSubscription<QuerySnapshot<Map<String, dynamic>>>>
+  _feedPostSubs = [];
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _inboxSub;
 
   String? _uid;
@@ -140,30 +165,36 @@ class NotificationCenter {
     _sessionStart = DateTime.now();
     _uid = uid;
 
-    // Listen to inbox (notifications/{uid}/items) to feed the UI state
+    // Listen to inbox (inbox/{uid}/events) to feed the UI state
     _bindInbox(uid);
 
-    // Listen to users doc for roles/member links
-    _userDocSub = _db.collection('users').doc(uid).snapshots().listen((snap) async {
-      final data = snap.data() ?? {};
-      final leadFromUsers = List<String>.from(data['leadershipMinistries'] ?? const <String>[]);
-      final memberId = data['memberId'] as String?;
-      _leadMinistryNames = leadFromUsers.toSet();
+    // Listen to users doc for roles/member links and follow-through
+    _userDocSub = _db.collection('users').doc(uid).snapshots().listen(
+          (snap) async {
+        final data = snap.data() ?? {};
+        final leadFromUsers = List<String>.from(
+          data['leadershipMinistries'] ?? const <String>[],
+        );
+        final memberId = data['memberId'] as String?;
+        _leadMinistryNames = leadFromUsers.toSet();
 
-      if (_memberId != memberId) {
-        _memberId = memberId;
-        await _bindMemberDoc();
-      }
+        if (_memberId != memberId) {
+          _memberId = memberId;
+          await _bindMemberDoc();
+        }
 
-      await _refreshAll();
-    });
+        await _refreshAll();
+      },
+      onError: (e, st) {
+        // ignore: avoid_print
+        print('[NotificationCenter] userDocSub error: $e\n$st');
+      },
+    );
   }
 
   Future<void> stop() async {
     await _userDocSub?.cancel();
     await _memberDocSub?.cancel();
-    await _myJoinReqSub?.cancel();
-    await _leaderJoinReqSub?.cancel();
     await _inboxSub?.cancel();
     for (final s in _feedPostSubs) {
       await s.cancel();
@@ -190,8 +221,11 @@ class NotificationCenter {
     if (uid == null) return;
 
     final channelKey = _channelKey(channel);
-    final col = _db.collection('notifications').doc(uid).collection('items');
-    final qs = await col.where('channel', isEqualTo: channelKey).where('read', isEqualTo: false).get();
+    final col = _db.collection('inbox').doc(uid).collection('events');
+    final qs = await col
+        .where('channel', isEqualTo: channelKey)
+        .where('read', isEqualTo: false)
+        .get();
     final batch = _db.batch();
     for (final d in qs.docs) {
       batch.update(d.reference, {'read': true});
@@ -212,10 +246,15 @@ class NotificationCenter {
       return;
     }
 
-    _memberDocSub = _db.collection('members').doc(memberId).snapshots().listen((snap) async {
+    _memberDocSub = _db
+        .collection('members')
+        .doc(memberId)
+        .snapshots()
+        .listen((snap) async {
       final md = snap.data() ?? {};
       final mins = List<String>.from(md['ministries'] ?? const <String>[]);
-      final leads = List<String>.from(md['leadershipMinistries'] ?? const <String>[]);
+      final leads =
+      List<String>.from(md['leadershipMinistries'] ?? const <String>[]);
       _memberMinistryNames = mins.toSet();
       _leadMinistryNames = {..._leadMinistryNames, ...leads};
       await _refreshAll();
@@ -224,27 +263,43 @@ class NotificationCenter {
 
   Future<void> _refreshAll() async {
     await _bindFeedPostListeners();
-    await _bindMyJoinRequestsListener();
-    await _bindLeaderJoinRequestsListener();
+    // NOTE:
+    // - Join request *status* + leader join-request *created* are handled by Cloud Functions
+    //   writing into /inbox/{uid}/events. No extra client listeners needed.
   }
 
   void _bindInbox(String uid) {
     _inboxSub?.cancel();
     _inboxSub = _db
-        .collection('notifications')
+        .collection('inbox')
         .doc(uid)
-        .collection('items')
+        .collection('events')
         .orderBy('createdAt', descending: true)
-        .limit(100)
+        .limit(200)
         .snapshots()
-        .listen((qs) {
-      final items = qs.docs.map(AppNotification.fromDoc).toList();
-      final unread = items.where((n) => !n.read).length;
-      _emit(NotificationState(items: items, unread: unread));
-    });
+        .listen(
+          (qs) {
+        final items = qs.docs.map(AppNotification.fromDoc).toList();
+        final unread = items.where((n) => !n.read).length;
+        _emit(NotificationState(items: items, unread: unread));
+      },
+      onError: (e, st) {
+        // ignore: avoid_print
+        print('[NotificationCenter] inboxSub error: $e\n$st');
+      },
+    );
+
+    // Update "lastSeenAt" top doc (handy for other features)
+    _db
+        .collection('inbox')
+        .doc(uid)
+        .set({'lastSeenAt': FieldValue.serverTimestamp()},
+        SetOptions(merge: true))
+        .catchError((_) {});
   }
 
   Future<void> _bindFeedPostListeners() async {
+    // Tear down previous post listeners
     for (final s in _feedPostSubs) {
       await s.cancel();
     }
@@ -257,16 +312,21 @@ class NotificationCenter {
     const chunk = 10;
     for (var i = 0; i < names.length; i += chunk) {
       final part = names.sublist(i, (i + chunk).clamp(0, names.length));
-      final idsSnap = await _db.collection('ministries').where('name', whereIn: part).get();
+      final idsSnap = await _db
+          .collection('ministries')
+          .where('name', whereIn: part)
+          .get();
 
       for (final m in idsSnap.docs) {
         final minId = m.id;
         final mname = (m.data()['name'] ?? 'Ministry').toString();
+
         final sub = _db
             .collection('ministries')
             .doc(minId)
             .collection('posts')
-            .where('createdAt', isGreaterThan: Timestamp.fromDate(_sessionStart))
+            .where('createdAt',
+            isGreaterThan: Timestamp.fromDate(_sessionStart))
             .orderBy('createdAt', descending: true)
             .limit(5)
             .snapshots()
@@ -275,102 +335,27 @@ class NotificationCenter {
             if (ch.type == DocumentChangeType.added) {
               final d = ch.doc.data() ?? {};
               final author = (d['authorName'] ?? 'Someone').toString();
-              await _addNotification(
+
+              await _addEventToInbox(
                 channel: NotificationChannel.feeds,
+                type: 'ministry_post',
                 title: 'New post in $mname',
                 body: '$author posted an update.',
                 route: '/view-ministry',
                 payload: {
                   'ministryId': minId,
                   'ministryName': mname,
+                  'postId': ch.doc.id,
                 },
                 dedupeKey: 'post_${ch.doc.id}',
               );
             }
           }
         });
+
         _feedPostSubs.add(sub);
       }
     }
-  }
-
-  Future<void> _bindMyJoinRequestsListener() async {
-    await _myJoinReqSub?.cancel();
-    _myJoinReqSub = null;
-    if (_memberId == null || _uid == null) return;
-
-    _myJoinReqSub = _db
-        .collection('join_requests')
-        .where('memberId', isEqualTo: _memberId)
-        .snapshots()
-        .listen((qs) async {
-      for (final ch in qs.docChanges) {
-        if (ch.type == DocumentChangeType.added || ch.type == DocumentChangeType.modified) {
-          final d = ch.doc.data() ?? {};
-          final status = (d['status'] ?? 'pending').toString();
-          if (status == 'pending') continue;
-          final ministryName = (d['ministryId'] ?? '').toString();
-
-          await _addNotification(
-            channel: NotificationChannel.joinreq,
-            title: status == 'approved' ? 'Join request approved' : 'Join request ${status.toLowerCase()}',
-            body: 'Your request to join "$ministryName" was $status.',
-            route: '/view-ministry',
-            payload: {'ministryName': ministryName},
-            dedupeKey: 'jr_me_${ch.doc.id}_$status',
-          );
-        }
-      }
-    });
-  }
-
-  Future<void> _bindLeaderJoinRequestsListener() async {
-    await _leaderJoinReqSub?.cancel();
-    _leaderJoinReqSub = null;
-    if (_leadMinistryNames.isEmpty || _uid == null) return;
-
-    // chunk whereIn
-    final names = _leadMinistryNames.toList();
-    final queries = <Query<Map<String, dynamic>>>[];
-    const chunk = 10;
-    for (var i = 0; i < names.length; i += chunk) {
-      final part = names.sublist(i, (i + chunk).clamp(0, names.length));
-      queries.add(_db.collection('join_requests').where('ministryId', whereIn: part).where('status', isEqualTo: 'pending'));
-    }
-
-    if (queries.isEmpty) return;
-
-    _leaderJoinReqSub = _mergeQueries(queries).listen((qs) async {
-      for (final ch in qs.docChanges) {
-        if (ch.type == DocumentChangeType.added) {
-          final d = ch.doc.data() ?? {};
-          final ministryName = (d['ministryId'] ?? 'Ministry').toString();
-
-          // resolve memberName (memberId is members/{id})
-          var requester = 'A member';
-          final mid = (d['memberId'] ?? '').toString();
-          if (mid.isNotEmpty) {
-            final mem = await _db.collection('members').doc(mid).get();
-            final md = mem.data();
-            if (md != null) {
-              final fn = (md['firstName'] ?? '').toString().trim();
-              final ln = (md['lastName'] ?? '').toString().trim();
-              final nm = '$fn $ln'.trim();
-              if (nm.isNotEmpty) requester = nm;
-            }
-          }
-
-          await _addNotification(
-            channel: NotificationChannel.leader_joinreq,
-            title: 'New join request',
-            body: '$requester requested to join "$ministryName".',
-            route: '/view-ministry',
-            payload: {'ministryName': ministryName},
-            dedupeKey: 'jr_leader_${ch.doc.id}',
-          );
-        }
-      }
-    });
   }
 
   // ----------------- helpers -----------------
@@ -386,9 +371,10 @@ class NotificationCenter {
     }
   }
 
-  /// Adds a notification doc into notifications/{uid}/items (with channel).
-  Future<void> _addNotification({
+  /// Writes/Upserts into /inbox/{uid}/events. Honors dedupeKey for idempotency.
+  Future<void> _addEventToInbox({
     required NotificationChannel channel,
+    required String type,
     required String title,
     required String body,
     required String route,
@@ -397,8 +383,10 @@ class NotificationCenter {
   }) async {
     final uid = _uid;
     if (uid == null) return;
-    final col = _db.collection('notifications').doc(uid).collection('items');
+
+    final col = _db.collection('inbox').doc(uid).collection('events');
     final data = {
+      'type': type, // e.g., 'ministry_post', 'join_request_created', 'join_request_status'
       'title': title,
       'body': body,
       'route': route,
@@ -412,28 +400,9 @@ class NotificationCenter {
       final ref = col.doc(dedupeKey);
       final exists = await ref.get();
       if (exists.exists) return;
-      await ref.set(data);
+      await ref.set(data, SetOptions(merge: false));
     } else {
       await col.add(data);
     }
-  }
-
-  /// Merge multiple queries into one stream by forwarding each snapshot.
-  Stream<QuerySnapshot<Map<String, dynamic>>> _mergeQueries(
-      List<Query<Map<String, dynamic>>> queries) {
-    final controller = StreamController<QuerySnapshot<Map<String, dynamic>>>.broadcast();
-    final subs = <StreamSubscription<QuerySnapshot<Map<String, dynamic>>>>[];
-
-    for (final q in queries) {
-      final sub = q.snapshots().listen(controller.add, onError: controller.addError);
-      subs.add(sub);
-    }
-
-    controller.onCancel = () async {
-      for (final s in subs) {
-        await s.cancel();
-      }
-    };
-    return controller.stream;
   }
 }

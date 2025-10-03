@@ -126,8 +126,7 @@ Future<void> main() async {
   // 🔑 Stripe (replace with your real key)
   Stripe.publishableKey = 'pk_test_your_publishable_key';
 
-  // ✅ Ensure in-app Firestore listeners start/stop with auth changes
-  // (so real-time updates work even if the bell icon hasn't built yet)
+  // ✅ Start NotificationCenter early so it attaches listeners with auth changes
   NotificationCenter.instance.bindToAuth();
 
   // 🔔 OS-level notifications
@@ -256,7 +255,8 @@ class RoleGate extends StatelessWidget {
                   return const Scaffold(
                       body: Center(child: CircularProgressIndicator()));
                 }
-                final md = memSnap.data?.data() as Map<String, dynamic>?;
+                final md =
+                memSnap.data?.data() as Map<String, dynamic>?;
                 final leads = List<String>.from(
                     md?['leadershipMinistries'] ?? const <String>[]);
                 if (leads.isNotEmpty) {
