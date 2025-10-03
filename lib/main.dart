@@ -5,7 +5,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
-
+import 'package:firebase_app_check/firebase_app_check.dart';
+import 'package:flutter/foundation.dart' show kReleaseMode;
 // ✅ Add these
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -122,6 +123,16 @@ Future<void> _initMessaging() async {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await FirebaseAppCheck.instance.activate(
+    androidProvider: kReleaseMode
+        ? AndroidProvider.playIntegrity   // ✅ real protection in prod
+        : AndroidProvider.debug,          // ✅ easy dev
+    appleProvider: AppleProvider.deviceCheck, // or .appAttest if you've set it up
+    webProvider: ReCaptchaV3Provider('YOUR_RECAPTCHA_V3_SITE_KEY'),
+  );
+
+// Optional but recommended so tokens refresh automatically:
+  await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
 
   // 🔑 Stripe (replace with your real key)
   Stripe.publishableKey = 'pk_test_your_publishable_key';
