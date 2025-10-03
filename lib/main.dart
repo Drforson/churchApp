@@ -5,9 +5,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
-import 'package:firebase_app_check/firebase_app_check.dart';
-import 'package:flutter/foundation.dart' show kReleaseMode;
-// ✅ Add these
+
+// ✅ Push notifications
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
@@ -61,9 +60,8 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 }
 
 Future<void> _initLocalNotifications() async {
-  // Android: create channel
-  final androidImpl = _fln.resolvePlatformSpecificImplementation<
-      AndroidFlutterLocalNotificationsPlugin>();
+  final androidImpl =
+  _fln.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
   await androidImpl?.createNotificationChannel(_androidChannel);
 
   const initSettings = InitializationSettings(
@@ -89,14 +87,14 @@ Future<void> _initMessaging() async {
     provisional: false,
   );
 
-  // Show alerts while app is foreground (iOS)
+  // Foreground presentation (iOS)
   await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
     alert: true,
     badge: true,
     sound: true,
   );
 
-  // Foreground notifications -> show a local banner
+  // Foreground notifications → local banner
   FirebaseMessaging.onMessage.listen((RemoteMessage m) {
     final n = m.notification;
     _fln.show(
@@ -123,11 +121,13 @@ Future<void> _initMessaging() async {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  await FirebaseAppCheck.instance.activate(
-    androidProvider: kReleaseMode ? AndroidProvider.playIntegrity : AndroidProvider.debug,
-    appleProvider: kReleaseMode ? AppleProvider.deviceCheck : AppleProvider.debug,
-  );
-  await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
+
+  // 🛑 App Check disabled for now — no activate() calls here.
+
+  // Set Auth language (avoids "X-Firebase-Locale … null" warning)
+  try {
+    await FirebaseAuth.instance.setLanguageCode('en-GB');
+  } catch (_) {}
 
   // 🔑 Stripe (replace with your real key)
   Stripe.publishableKey = 'pk_test_your_publishable_key';
@@ -186,7 +186,8 @@ class _RoleLoaderState extends State<RoleLoader> {
     if (effectiveRole == 'member' && memberId != null) {
       final mem = await _db.collection('members').doc(memberId).get();
       final ms = List<String>.from(
-          (mem.data() ?? const {})['leadershipMinistries'] ?? const <String>[]);
+        (mem.data() ?? const {})['leadershipMinistries'] ?? const <String>[],
+      );
       if (ms.isNotEmpty) effectiveRole = 'leader';
     }
 
@@ -210,78 +211,87 @@ class _RoleLoaderState extends State<RoleLoader> {
   }
 }
 
-// Gate to decide initial page after login
-class RoleGate extends StatelessWidget {
+// ✅ Gate to decide initial page after login (robust + reactive)
+class RoleGate extends StatefulWidget {
   const RoleGate({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final auth = FirebaseAuth.instance;
-    final db = FirebaseFirestore.instance;
+  State<RoleGate> createState() => _RoleGateState();
+}
 
+class _RoleGateState extends State<RoleGate> {
+  final _auth = FirebaseAuth.instance;
+  final _db = FirebaseFirestore.instance;
+  late final DateTime _start;
+
+  @override
+  void initState() {
+    super.initState();
+    _start = DateTime.now();
+  }
+
+  bool _timeout() => DateTime.now().difference(_start) > const Duration(seconds: 3);
+
+  @override
+  Widget build(BuildContext context) {
     return StreamBuilder<User?>(
-      stream: auth.authStateChanges(),
+      stream: _auth.userChanges(), // more robust after sign-in
       builder: (context, authSnap) {
-        // Not signed in → Login
-        if (authSnap.connectionState == ConnectionState.active &&
-            !authSnap.hasData) {
+        if (authSnap.connectionState == ConnectionState.active && !authSnap.hasData) {
           return LoginPage();
         }
         if (!authSnap.hasData) {
-          return const Scaffold(
-            body: Center(child: CircularProgressIndicator()),
-          );
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
         }
 
-        // Signed in → stream the user doc (reactive)
         final uid = authSnap.data!.uid;
+
+        // Stream the user doc; if it errors/missing/slow, fall back gracefully
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          stream: db.collection('users').doc(uid).snapshots(),
+          stream: _db.collection('users').doc(uid).snapshots(),
           builder: (context, userSnap) {
+            if (userSnap.hasError) {
+              debugPrint('[RoleGate] user doc error: ${userSnap.error}');
+              return const HomeDashboardPage();
+            }
             if (userSnap.connectionState == ConnectionState.waiting) {
-              return const Scaffold(
-                body: Center(child: CircularProgressIndicator()),
-              );
+              if (_timeout()) return const HomeDashboardPage();
+              return const Scaffold(body: Center(child: CircularProgressIndicator()));
             }
 
             final userExists = userSnap.data?.exists ?? false;
-            final userData = userSnap.data?.data() ?? <String, dynamic>{};
+            final userData = userSnap.data?.data() ?? const <String, dynamic>{};
 
-            // If user doc is missing on first login, default to member home
-            if (!userExists) {
-              return const HomeDashboardPage();
-            }
+            if (!userExists) return const HomeDashboardPage();
 
             final roles = List<String>.from(userData['roles'] ?? const <String>[]);
             final memberId = userData['memberId'] as String?;
 
-            // Admins/leaders straight to AdminDashboard
             if (roles.contains('admin') || roles.contains('leader')) {
               return const AdminDashboardPage();
             }
 
-            // No member link yet → member home
-            if (memberId == null) {
-              return const HomeDashboardPage();
-            }
+            if (memberId == null) return const HomeDashboardPage();
 
-            // Otherwise, stream member doc to see if they lead anything
+            // Stream member doc to detect runtime leadership
             return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-              stream: db.collection('members').doc(memberId).snapshots(),
+              stream: _db.collection('members').doc(memberId).snapshots(),
               builder: (context, memSnap) {
+                if (memSnap.hasError) {
+                  debugPrint('[RoleGate] member doc error: ${memSnap.error}');
+                  return const HomeDashboardPage();
+                }
                 if (memSnap.connectionState == ConnectionState.waiting) {
-                  return const Scaffold(
-                    body: Center(child: CircularProgressIndicator()),
-                  );
+                  if (_timeout()) return const HomeDashboardPage();
+                  return const Scaffold(body: Center(child: CircularProgressIndicator()));
                 }
-                final md = memSnap.data?.data();
+
+                final md = memSnap.data?.data() ?? const <String, dynamic>{};
                 final leads = List<String>.from(
-                  (md ?? const <String, dynamic>{})['leadershipMinistries'] ??
-                      const <String>[],
+                  md['leadershipMinistries'] ?? const <String>[],
                 );
-                if (leads.isNotEmpty) {
-                  return const AdminDashboardPage();
-                }
+
+                if (leads.isNotEmpty) return const AdminDashboardPage();
                 return const HomeDashboardPage();
               },
             );
