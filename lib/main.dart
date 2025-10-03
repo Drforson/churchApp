@@ -124,14 +124,9 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   await FirebaseAppCheck.instance.activate(
-    androidProvider: kReleaseMode
-        ? AndroidProvider.playIntegrity   // ✅ real protection in prod
-        : AndroidProvider.debug,          // ✅ easy dev
-    appleProvider: AppleProvider.deviceCheck, // or .appAttest if you've set it up
-    webProvider: ReCaptchaV3Provider('YOUR_RECAPTCHA_V3_SITE_KEY'),
+    androidProvider: kReleaseMode ? AndroidProvider.playIntegrity : AndroidProvider.debug,
+    appleProvider: kReleaseMode ? AppleProvider.deviceCheck : AppleProvider.debug,
   );
-
-// Optional but recommended so tokens refresh automatically:
   await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
 
   // 🔑 Stripe (replace with your real key)
@@ -227,49 +222,63 @@ class RoleGate extends StatelessWidget {
     return StreamBuilder<User?>(
       stream: auth.authStateChanges(),
       builder: (context, authSnap) {
-        if (!authSnap.hasData) return LoginPage();
+        // Not signed in → Login
+        if (authSnap.connectionState == ConnectionState.active &&
+            !authSnap.hasData) {
+          return LoginPage();
+        }
+        if (!authSnap.hasData) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
 
+        // Signed in → stream the user doc (reactive)
         final uid = authSnap.data!.uid;
-        return FutureBuilder<DocumentSnapshot>(
-          future: db.collection('users').doc(uid).get(),
+        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: db.collection('users').doc(uid).snapshots(),
           builder: (context, userSnap) {
             if (userSnap.connectionState == ConnectionState.waiting) {
               return const Scaffold(
-                  body: Center(child: CircularProgressIndicator()));
+                body: Center(child: CircularProgressIndicator()),
+              );
             }
 
-            final userData =
-                (userSnap.data?.data() as Map<String, dynamic>?) ?? {};
-            final roles =
-            List<String>.from(userData['roles'] ?? const <String>[]);
+            final userExists = userSnap.data?.exists ?? false;
+            final userData = userSnap.data?.data() ?? <String, dynamic>{};
+
+            // If user doc is missing on first login, default to member home
+            if (!userExists) {
+              return const HomeDashboardPage();
+            }
+
+            final roles = List<String>.from(userData['roles'] ?? const <String>[]);
             final memberId = userData['memberId'] as String?;
 
-            String effectiveRole = 'member';
-            if (roles.contains('admin')) {
-              effectiveRole = 'admin';
-            } else if (roles.contains('leader')) {
-              effectiveRole = 'leader';
-            }
-
-            if (effectiveRole == 'admin' || effectiveRole == 'leader') {
+            // Admins/leaders straight to AdminDashboard
+            if (roles.contains('admin') || roles.contains('leader')) {
               return const AdminDashboardPage();
             }
 
+            // No member link yet → member home
             if (memberId == null) {
               return const HomeDashboardPage();
             }
 
-            return StreamBuilder<DocumentSnapshot>(
+            // Otherwise, stream member doc to see if they lead anything
+            return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
               stream: db.collection('members').doc(memberId).snapshots(),
               builder: (context, memSnap) {
                 if (memSnap.connectionState == ConnectionState.waiting) {
                   return const Scaffold(
-                      body: Center(child: CircularProgressIndicator()));
+                    body: Center(child: CircularProgressIndicator()),
+                  );
                 }
-                final md =
-                memSnap.data?.data() as Map<String, dynamic>?;
+                final md = memSnap.data?.data();
                 final leads = List<String>.from(
-                    md?['leadershipMinistries'] ?? const <String>[]);
+                  (md ?? const <String, dynamic>{})['leadershipMinistries'] ??
+                      const <String>[],
+                );
                 if (leads.isNotEmpty) {
                   return const AdminDashboardPage();
                 }
