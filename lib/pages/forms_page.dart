@@ -1,86 +1,92 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 
 class FormsPage extends StatelessWidget {
-  final _formKeys = {
-    'Visitor Registration': GlobalKey<FormState>(),
-    'Prayer Request': GlobalKey<FormState>(),
-    'Baptism Interest': GlobalKey<FormState>(),
-    'Volunteer Signup': GlobalKey<FormState>(),
-  };
-
-  final _controllers = {
-    'name': TextEditingController(),
-    'email': TextEditingController(),
-    'message': TextEditingController(),
-  };
-
-  void _submitForm(BuildContext context, String formType) async {
-    if (_formKeys[formType]!.currentState!.validate()) {
-      await FirebaseFirestore.instance.collection('forms').add({
-        'type': formType,
-        'name': _controllers['name']!.text,
-        'email': _controllers['email']!.text,
-        'message': _controllers['message']!.text,
-        'timestamp': Timestamp.now(),
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$formType submitted')));
-      _controllers.forEach((key, controller) => controller.clear());
-    }
-  }
-
-  Widget _buildFormCard(BuildContext context, String title) {
-    return Card(
-      elevation: 3,
-      margin: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-      child: ExpansionTile(
-        title: Text(title),
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Form(
-              key: _formKeys[title],
-              child: Column(
-                children: [
-                  TextFormField(
-                    controller: _controllers['name'],
-                    decoration: const InputDecoration(labelText: 'Name'),
-                    validator: (value) => value!.isEmpty ? 'Enter your name' : null,
-                  ),
-                  TextFormField(
-                    controller: _controllers['email'],
-                    decoration: const InputDecoration(labelText: 'Email'),
-                    validator: (value) => value!.isEmpty ? 'Enter your email' : null,
-                  ),
-                  TextFormField(
-                    controller: _controllers['message'],
-                    decoration: const InputDecoration(labelText: 'Message / Reason'),
-                    maxLines: 3,
-                    validator: (value) => value!.isEmpty ? 'Enter your message' : null,
-                  ),
-                  const SizedBox(height: 10),
-                  ElevatedButton(
-                    onPressed: () => _submitForm(context, title),
-                    child: const Text('Submit'),
-                  )
-                ],
-              ),
-            ),
-          )
-        ],
-      ),
-    );
-  }
+  const FormsPage({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final formTitles = _formKeys.keys.toList();
+    final items = <_ActionItem>[
+      _ActionItem('Prayer Request', Icons.volunteer_activism_rounded, '/form-prayer-request'),
+      _ActionItem('Baptism Request', Icons.water_drop_rounded, '/form-baptism-interest'),
+      _ActionItem('Volunteer Signup', Icons.handshake_rounded, '/form-volunteer-signup'),
+    ];
 
     return Scaffold(
       appBar: AppBar(title: const Text('Forms & Sign-Ups')),
-      body: ListView(
-        children: formTitles.map((title) => _buildFormCard(context, title)).toList(),
+      body: LayoutBuilder(
+        builder: (context, c) {
+          final columns = c.maxWidth >= 900 ? 3 : (c.maxWidth >= 600 ? 2 : 1);
+          return GridView.builder(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: columns,
+              crossAxisSpacing: 12,
+              mainAxisSpacing: 12,
+              childAspectRatio: 1.15,
+            ),
+            itemCount: items.length,
+            itemBuilder: (context, i) => _ActionCard(item: items[i]),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _ActionItem {
+  final String label;
+  final IconData icon;
+  final String route;
+  const _ActionItem(this.label, this.icon, this.route);
+}
+
+class _ActionCard extends StatelessWidget {
+  final _ActionItem item;
+  const _ActionCard({required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: () => Navigator.pushNamed(context, item.route),
+      borderRadius: BorderRadius.circular(16),
+      child: Ink(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.05),
+              blurRadius: 10,
+              offset: const Offset(0, 6),
+            )
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              const SizedBox(height: 8),
+              CircleAvatar(
+                radius: 28,
+                backgroundColor: const Color(0xFFE8ECF3),
+                child: Icon(item.icon, size: 28, color: Colors.indigo),
+              ),
+              const Spacer(),
+              Text(
+                item.label,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              const Align(
+                alignment: Alignment.bottomRight,
+                child: Icon(Icons.chevron_right),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

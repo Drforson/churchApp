@@ -14,6 +14,9 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'pages/login_page.dart';
 import 'pages/signup1.dart';
 import 'pages/signup2.dart';
+import 'pages/prayer_request_manage_page.dart';
+import 'pages/baptism_manage_page.dart';
+
 import 'pages/admin_dashboard_page.dart';
 import 'pages/admin_upload_page.dart';
 import 'pages/home_dashboard_page.dart';
@@ -30,6 +33,9 @@ import 'pages/upload_excel_page.dart';
 import 'pages/debadmintestpage.dart';
 import 'pages/profilepage.dart';
 import 'pages/successpage.dart';
+
+// ✅ NEW: Pastor dashboard
+import 'pages/pastor_home_dashboard_page.dart';
 
 // Services
 import 'services/theme_provider.dart';
@@ -122,9 +128,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
-  // 🛑 App Check disabled for now — no activate() calls here.
-
-  // Set Auth language (avoids "X-Firebase-Locale … null" warning)
+  // Set Auth language
   try {
     await FirebaseAuth.instance.setLanguageCode('en-GB');
   } catch (_) {}
@@ -132,10 +136,8 @@ Future<void> main() async {
   // 🔑 Stripe (replace with your real key)
   Stripe.publishableKey = 'pk_test_your_publishable_key';
 
-  // ✅ Start NotificationCenter early so it attaches listeners with auth changes
+  // Notifications
   NotificationCenter.instance.bindToAuth();
-
-  // 🔔 OS-level notifications
   await _initLocalNotifications();
   await _initMessaging();
 
@@ -149,7 +151,7 @@ Future<void> main() async {
   );
 }
 
-// 🌟 RoleLoader => Loads user role theme first, then starts app (routing is below)
+// 🌟 RoleLoader => Loads user role theme first, then starts app (routing below)
 class RoleLoader extends StatefulWidget {
   const RoleLoader({super.key});
 
@@ -173,15 +175,22 @@ class _RoleLoaderState extends State<RoleLoader> {
 
     final doc = await _db.collection('users').doc(user.uid).get();
     final data = doc.data() ?? {};
-    final roles = List<String>.from(data['roles'] ?? const <String>[]);
+    final rolesRaw = List<String>.from(data['roles'] ?? const <String>[]);
 
+    // 🔡 normalize to lowercase
+    final roles = rolesRaw.map((e) => e.toLowerCase()).toList();
+
+    // 👇 precedence: admin > pastor > leader > member
     String effectiveRole = 'member';
     if (roles.contains('admin')) {
       effectiveRole = 'admin';
+    } else if (roles.contains('pastor')) {
+      effectiveRole = 'pastor';
     } else if (roles.contains('leader')) {
       effectiveRole = 'leader';
     }
 
+    // Allow runtime leader via member doc if no explicit role & they lead ministries
     final memberId = data['memberId'] as String?;
     if (effectiveRole == 'member' && memberId != null) {
       final mem = await _db.collection('members').doc(memberId).get();
@@ -189,6 +198,13 @@ class _RoleLoaderState extends State<RoleLoader> {
         (mem.data() ?? const {})['leadershipMinistries'] ?? const <String>[],
       );
       if (ms.isNotEmpty) effectiveRole = 'leader';
+      // If member has explicit pastor role/flag, prefer pastor theme too
+      final mRoles = (mem.data()?['roles'] as List<dynamic>? ?? const [])
+          .map((e) => e.toString().toLowerCase())
+          .toSet();
+      if (mRoles.contains('pastor') || mem.data()?['isPastor'] == true) {
+        effectiveRole = 'pastor';
+      }
     }
 
     if (!mounted) return;
@@ -211,7 +227,7 @@ class _RoleLoaderState extends State<RoleLoader> {
   }
 }
 
-// ✅ Gate to decide initial page after login (robust + reactive)
+// ✅ Gate to decide initial page after login (admin / pastor / leader / member)
 class RoleGate extends StatefulWidget {
   const RoleGate({super.key});
 
@@ -235,7 +251,7 @@ class _RoleGateState extends State<RoleGate> {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
-      stream: _auth.userChanges(), // more robust after sign-in
+      stream: _auth.userChanges(),
       builder: (context, authSnap) {
         if (authSnap.connectionState == ConnectionState.active && !authSnap.hasData) {
           return LoginPage();
@@ -246,7 +262,6 @@ class _RoleGateState extends State<RoleGate> {
 
         final uid = authSnap.data!.uid;
 
-        // Stream the user doc; if it errors/missing/slow, fall back gracefully
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
           stream: _db.collection('users').doc(uid).snapshots(),
           builder: (context, userSnap) {
@@ -264,16 +279,33 @@ class _RoleGateState extends State<RoleGate> {
 
             if (!userExists) return const HomeDashboardPage();
 
-            final roles = List<String>.from(userData['roles'] ?? const <String>[]);
+            // 🔡 Normalize roles to lowercase
+            final userRoles = (userData['roles'] as List<dynamic>? ?? const [])
+                .map((e) => e.toString().toLowerCase())
+                .toSet();
+
             final memberId = userData['memberId'] as String?;
 
-            if (roles.contains('admin') || roles.contains('leader')) {
+            // 👇 precedence: admin > pastor > leader > member (users doc)
+            if (userRoles.contains('admin')) {
+              debugPrint('[RoleGate] routing=ADMIN (users.roles=$userRoles)');
+              return const AdminDashboardPage();
+            }
+            if (userRoles.contains('pastor')) {
+              debugPrint('[RoleGate] routing=PASTOR (users.roles=$userRoles)');
+              return const PastorHomeDashboardPage();
+            }
+            if (userRoles.contains('leader')) {
+              debugPrint('[RoleGate] routing=LEADER (users.roles=$userRoles)');
               return const AdminDashboardPage();
             }
 
-            if (memberId == null) return const HomeDashboardPage();
+            if (memberId == null) {
+              debugPrint('[RoleGate] routing=MEMBER(no memberId) -> Home');
+              return const HomeDashboardPage();
+            }
 
-            // Stream member doc to detect runtime leadership
+            // Second pass: also consider members/{id}.roles + leadershipMinistries + isPastor
             return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
               stream: _db.collection('members').doc(memberId).snapshots(),
               builder: (context, memSnap) {
@@ -287,11 +319,26 @@ class _RoleGateState extends State<RoleGate> {
                 }
 
                 final md = memSnap.data?.data() ?? const <String, dynamic>{};
-                final leads = List<String>.from(
-                  md['leadershipMinistries'] ?? const <String>[],
-                );
+                final memberRoles = (md['roles'] as List<dynamic>? ?? const [])
+                    .map((e) => e.toString().toLowerCase())
+                    .toSet();
+                final leads =
+                List<String>.from(md['leadershipMinistries'] ?? const <String>[]);
 
-                if (leads.isNotEmpty) return const AdminDashboardPage();
+                if (memberRoles.contains('admin')) {
+                  debugPrint('[RoleGate] routing=ADMIN (members.roles=$memberRoles)');
+                  return const AdminDashboardPage();
+                }
+                if (memberRoles.contains('pastor') || (md['isPastor'] == true)) {
+                  debugPrint('[RoleGate] routing=PASTOR (members.roles=$memberRoles isPastor=${md['isPastor']})');
+                  return const PastorHomeDashboardPage();
+                }
+                if (memberRoles.contains('leader') || leads.isNotEmpty) {
+                  debugPrint('[RoleGate] routing=LEADER (leads=${leads.length})');
+                  return const AdminDashboardPage();
+                }
+
+                debugPrint('[RoleGate] routing=MEMBER -> Home');
                 return const HomeDashboardPage();
               },
             );
@@ -319,6 +366,9 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
 
     case '/admin-dashboard':
       return MaterialPageRoute(builder: (_) => const AdminDashboardPage());
+
+    case '/pastor-dashboard': // ✅ route
+      return MaterialPageRoute(builder: (_) => const PastorHomeDashboardPage());
 
     case '/admin-upload':
       return MaterialPageRoute(builder: (_) => const AdminUploadPage());
@@ -352,6 +402,11 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
 
     case '/view-ministry':
       return MaterialPageRoute(builder: (_) => const MinistresPage());
+    case '/manage-prayer-requests':
+      return MaterialPageRoute(builder: (_) => const PrayerRequestManagePage());
+
+    case '/manage-baptism':
+      return MaterialPageRoute(builder: (_) => const BaptismManagePage());
 
     case '/uploadExcel':
       return MaterialPageRoute(builder: (_) => const ExcelDatabaseUploader());

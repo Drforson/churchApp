@@ -429,7 +429,6 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
       setState(() => _searching = false);
     }
   }
-
   Future<void> _setPastorRoleOnMember(_MemberResult m, {required bool makePastor}) async {
     if (!_isAdminNow) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -439,27 +438,47 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
     }
 
     try {
-      // Prefer Cloud Function for secure privilege escalation
+      // 1) Try Cloud Function (preferred: centralized auth + audit)
+      bool cfWorked = false;
       try {
         final callable = FirebaseFunctions.instance.httpsCallable(
           'setMemberPastorRole',
           options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
         );
-        await callable.call(<String, dynamic>{
-          'memberId': m.id,
-          'makePastor': makePastor,
-        });
+        await callable.call(<String, dynamic>{'memberId': m.id, 'makePastor': makePastor});
+        cfWorked = true;
       } on FirebaseFunctionsException catch (e) {
-        // If CF not deployed / permission denied, fall back to client write
         debugPrint('[PastorRole] CF failed: ${e.code} ${e.message} — trying client write.');
+      }
+
+      // 2) Client-side fallback if CF not available (make sure Firestore rules allow admin)
+      if (!cfWorked) {
         await FirebaseFirestore.instance.collection('members').doc(m.id).update({
+          'roles': makePastor
+              ? FieldValue.arrayUnion(['pastor'])
+              : FieldValue.arrayRemove(['pastor']),
+          // Optional legacy boolean your app might read:
+          'isPastor': makePastor,
+        });
+      }
+
+      // 3) Keep users/{uid} in sync if that member is linked to a user
+      final usersQ = await FirebaseFirestore.instance
+          .collection('users')
+          .where('memberId', isEqualTo: m.id)
+          .limit(1)
+          .get();
+
+      if (usersQ.docs.isNotEmpty) {
+        final uRef = usersQ.docs.first.reference;
+        await uRef.update({
           'roles': makePastor
               ? FieldValue.arrayUnion(['pastor'])
               : FieldValue.arrayRemove(['pastor']),
         });
       }
 
-      // Update local result list visually
+      // 4) Update the local list UI
       setState(() {
         final i = _searchResults.indexWhere((r) => r.id == m.id);
         if (i != -1) {
@@ -482,6 +501,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
       );
     }
   }
+
 
   // ===== UI =====
 

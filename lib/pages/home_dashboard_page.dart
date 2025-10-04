@@ -571,6 +571,7 @@ class _QuickActions extends StatelessWidget {
       _ActionItem('Giving', Icons.card_giftcard, '/giving'),
       _ActionItem('Events', Icons.event, '/events'),
       _ActionItem('Profile', Icons.person, '/profile'),
+      _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
       if (role == 'admin' || role == 'leader') _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin'),
     ];
 
