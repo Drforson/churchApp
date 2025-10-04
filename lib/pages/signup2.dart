@@ -21,7 +21,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
   final _firstNameController = TextEditingController();
   final _lastNameController = TextEditingController();
   final _phoneNumberController = TextEditingController();
-  String? _selectedGender;
+  String? _selectedGender; // UI shows Title-case, we store lowercase on write
   DateTime? _selectedDate;
   List<String> _ministries = [];
 
@@ -41,6 +41,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
 
   Future<void> _loadMemberData() async {
     try {
+      // Try preload by email (the page’s identity signal)
       final snapshot = await FirebaseFirestore.instance
           .collection('members')
           .where('email', isEqualTo: widget.email)
@@ -52,10 +53,15 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
         final data = doc.data();
         setState(() {
           _existingMemberId = doc.id;
-          _firstNameController.text = data['firstName'] ?? '';
-          _lastNameController.text = data['lastName'] ?? '';
-          _phoneNumberController.text = data['phoneNumber'] ?? '';
-          _selectedGender = data['gender'];
+          _firstNameController.text = (data['firstName'] ?? '') as String;
+          _lastNameController.text = (data['lastName'] ?? '') as String;
+          _phoneNumberController.text = (data['phoneNumber'] ?? '') as String;
+
+          final g = (data['gender'] ?? '') as String;
+          _selectedGender = g.isNotEmpty
+              ? g[0].toUpperCase() + g.substring(1).toLowerCase()
+              : null; // display Title-case
+
           final dobTimestamp = data['dateOfBirth'];
           if (dobTimestamp != null) {
             _selectedDate = (dobTimestamp as Timestamp).toDate();
@@ -65,7 +71,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
         });
       }
     } catch (e) {
-      print('⚠️ Error preloading member data: $e');
+      debugPrint('⚠️ Error preloading member data: $e');
     } finally {
       setState(() {
         _preloading = false;
@@ -86,11 +92,8 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
       setState(() => _phoneNumberConflict = false);
       return;
     }
-
-    final snapshot = await _authService.checkPhoneNumberExists(phoneNumber);
-    setState(() {
-      _phoneNumberConflict = snapshot;
-    });
+    final exists = await _authService.checkPhoneNumberExists(phoneNumber);
+    setState(() => _phoneNumberConflict = exists);
   }
 
   Future<void> _checkEmailConflict(String email) async {
@@ -111,10 +114,17 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
         break;
       }
     }
+    setState(() => _emailConflict = conflict);
+  }
 
-    setState(() {
-      _emailConflict = conflict;
-    });
+  Future<void> _ensureUserDoc(String uid, String? authEmail) async {
+    await FirebaseFirestore.instance.collection('users').doc(uid).set(
+      {
+        'createdAt': FieldValue.serverTimestamp(),
+        if (authEmail != null && authEmail.isNotEmpty) 'email': authEmail.trim(),
+      },
+      SetOptions(merge: true),
+    );
   }
 
   Future<void> _submit() async {
@@ -122,47 +132,104 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
 
     setState(() => _loading = true);
 
+    final auth = FirebaseAuth.instance;
+    final user = auth.currentUser;
+    final uid = widget.uid;
+    final authEmail = user?.email ?? widget.email; // fallback to widget.email
+
     try {
+      // Always ensure users/{uid} exists before any member write (defensive for rules/helpers)
+      await _ensureUserDoc(uid, authEmail);
+
+      final first = _firstNameController.text.trim();
+      final last = _lastNameController.text.trim();
+      final fullName = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
+      final phone = _phoneNumberController.text.trim();
+      final genderLower = (_selectedGender ?? '').toLowerCase().trim();
+
+      // Allowed profile fields for UPDATE
+      final updatePayload = <String, dynamic>{
+        'firstName': first,
+        'lastName': last,
+        'fullName': fullName,
+        'phoneNumber': phone,
+        'gender': genderLower,
+        'dateOfBirth': Timestamp.fromDate(_selectedDate!),
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+
       if (_isExistingMember && _existingMemberId != null) {
-        await FirebaseFirestore.instance.collection('members').doc(_existingMemberId).update({
-          'firstName': _firstNameController.text.trim(),
-          'lastName': _lastNameController.text.trim(),
-          'phoneNumber': _phoneNumberController.text.trim(),
-          'gender': _selectedGender,
-          'dateOfBirth': Timestamp.fromDate(_selectedDate!),
-        });
+        final memberId = _existingMemberId!;
+        // ✅ RULE-ALIGNED: link first, then update member
+        await FirebaseFirestore.instance.collection('users').doc(uid).set(
+          {
+            'memberId': memberId,
+            'linkedAt': FieldValue.serverTimestamp(),
+          },
+          SetOptions(merge: true),
+        );
 
-        await FirebaseFirestore.instance.collection('users').doc(widget.uid).update({
-          'memberId': _existingMemberId,
-        });
+        await FirebaseFirestore.instance
+            .collection('members')
+            .doc(memberId)
+            .update(updatePayload);
+
       } else {
-        final memberRef = FirebaseFirestore.instance.collection('members').doc();
-        await memberRef.set({
-          'id': memberRef.id,
-          'firstName': _firstNameController.text.trim(),
-          'lastName': _lastNameController.text.trim(),
-          'email': widget.email,
-          'phoneNumber': _phoneNumberController.text.trim(),
-          'gender': _selectedGender,
-          'dateOfBirth': Timestamp.fromDate(_selectedDate!),
-          'ministries': [],
-          'createdAt': FieldValue.serverTimestamp(),
-        });
+        // ✅ RULE-ALIGNED CREATE: no 'id', no 'ministries', no 'email' on CREATE
+        final members = FirebaseFirestore.instance.collection('members');
+        final memberRef = members.doc();
 
-        await FirebaseFirestore.instance.collection('users').doc(widget.uid).update({
-          'memberId': memberRef.id,
-        });
+        final createMap = <String, dynamic>{
+          'firstName': first,
+          'lastName': last,
+          'fullName': fullName,
+          'phoneNumber': phone,
+          'gender': genderLower,
+          'dateOfBirth': Timestamp.fromDate(_selectedDate!),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'createdAt': FieldValue.serverTimestamp(),
+          'createdByUid': uid,
+          'userUid': uid,
+          // (NO email, NO id, NO ministries here)
+        };
+
+        // Create
+        await memberRef.set(createMap);
+
+        // Link user → member (enables self-updates by rules)
+        await FirebaseFirestore.instance.collection('users').doc(uid).set(
+          {
+            'memberId': memberRef.id,
+            'linkedAt': FieldValue.serverTimestamp(),
+          },
+          SetOptions(merge: true),
+        );
+
+        // (Optional) now set email in a separate UPDATE (self update allowed)
+        final typedEmail = widget.email.trim();
+        if (typedEmail.isNotEmpty) {
+          await memberRef.update({
+            'email': typedEmail,
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+        }
+
+        _existingMemberId = memberRef.id;
+        _isExistingMember = true;
       }
 
-      await FirebaseAuth.instance.currentUser?.getIdToken(true);
+      // Token refresh is fine to keep
+      await auth.currentUser?.getIdToken(true);
 
+      if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/success');
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}'), backgroundColor: Colors.red),
+        SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
       );
     } finally {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -174,10 +241,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
       firstDate: DateTime(1900),
       lastDate: now,
     );
-
-    if (picked != null) {
-      setState(() => _selectedDate = picked);
-    }
+    if (picked != null) setState(() => _selectedDate = picked);
   }
 
   Widget buildLoadingOverlay() {
@@ -257,17 +321,11 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                     ),
                     keyboardType: TextInputType.phone,
                     onChanged: (value) {
-                      if (value.length >= 9) {
-                        _checkPhoneNumberConflict(value.trim());
-                      }
+                      if (value.length >= 9) _checkPhoneNumberConflict(value.trim());
                     },
                     validator: (val) {
-                      if (val == null || val.isEmpty) {
-                        return 'Phone number is required';
-                      }
-                      if (_phoneNumberConflict) {
-                        return 'Phone number already in use';
-                      }
+                      if (val == null || val.isEmpty) return 'Phone number is required';
+                      if (_phoneNumberConflict) return 'Phone number already in use';
                       return null;
                     },
                   ),
@@ -306,22 +364,21 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                       children: [
                         const Text('Ministries:', style: TextStyle(fontWeight: FontWeight.bold)),
                         const SizedBox(height: 8),
-                        ..._ministries.map((ministry) => Container(
-                          margin: const EdgeInsets.only(bottom: 6),
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: Colors.blue.shade50,
-                            borderRadius: BorderRadius.circular(10),
+                        ..._ministries.map(
+                              (ministry) => Container(
+                            margin: const EdgeInsets.only(bottom: 6),
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: Colors.blue.shade50,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(ministry, style: const TextStyle(color: Colors.blue)),
                           ),
-                          child: Text(ministry, style: const TextStyle(color: Colors.blue)),
-                        )),
+                        ),
                       ],
                     )
                   else
-                    const Text(
-                      'No ministries assigned yet.',
-                      style: TextStyle(color: Colors.grey),
-                    ),
+                    const Text('No ministries assigned yet.', style: TextStyle(color: Colors.grey)),
                   const SizedBox(height: 24),
                   ElevatedButton(
                     onPressed: _isFormValid && !_loading ? _submit : null,
@@ -337,7 +394,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
             ),
           ),
         ),
-        buildLoadingOverlay(), // 🔥
+        buildLoadingOverlay(),
       ],
     );
   }

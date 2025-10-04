@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'dart:async';
 
 class DebugAdminSetterPage extends StatefulWidget {
   const DebugAdminSetterPage({super.key});
@@ -21,6 +22,13 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
   List<String> _leadershipMinistriesFromMembers = [];
   bool _loading = false;
 
+  // ===== NEW: Pastor role manager state =====
+  final TextEditingController _searchCtrl = TextEditingController();
+  Timer? _debounce;
+  bool _searching = false;
+  String _searchError = '';
+  List<_MemberResult> _searchResults = [];
+
   bool get _isAdminNow =>
       _rolesFromUsers.contains('admin') || _rolesFromMembers.contains('admin');
 
@@ -28,6 +36,21 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
   void initState() {
     super.initState();
     _fetchUserData();
+
+    // Debounce search
+    _searchCtrl.addListener(() {
+      _debounce?.cancel();
+      _debounce = Timer(const Duration(milliseconds: 400), () {
+        _runSearch(_searchCtrl.text.trim());
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _searchCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _fetchUserData() async {
@@ -127,16 +150,15 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
         );
       }
 
-      // ⬅️ NEW: After we load everything, auto-sync leader role/status into users doc
-      // (and optionally members doc via a Cloud Function).
-      await _syncLeaderRole(); // ⬅️ NEW
+      // auto-sync leader role/status into users doc
+      await _syncLeaderRole();
     } else {
       debugPrint('[DEBUG] User document does not exist for UID: $userId');
       setState(() => _loading = false);
     }
   }
 
-  // ⬅️ NEW: Discover leadership ministries from ministries/* where leaderIds contains the current uid
+  // Discover leadership ministries from ministries/* where leaderIds contains the current uid
   Future<Set<String>> _discoverLeadershipFromMinistriesCollection(String uid) async {
     final qs = await FirebaseFirestore.instance
         .collection('ministries')
@@ -154,12 +176,11 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
     return names;
   }
 
-  // ⬅️ NEW: Ensure users/{uid} reflects true leader status; optionally mirror to members/{id} via CF
+  // Ensure users/{uid} reflects true leader status; optionally mirror to members/{id} via CF
   Future<void> _syncLeaderRole() async {
     if (_userId == null) return;
 
     try {
-      // Gather from all sources we have
       final userMin = _leadershipMinistriesFromUsers.toSet();
       final memberMin = _leadershipMinistriesFromMembers.toSet();
       final discovered = await _discoverLeadershipFromMinistriesCollection(_userId!);
@@ -169,35 +190,27 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
       debugPrint('[SYNC] Unified leadership ministries for user $_userId: $unified');
 
       if (unified.isEmpty) {
-        // If user doesn’t lead anything, you may optionally remove 'leader' from users.roles.
-        // Leaving as-is to avoid accidental demotion noise.
         return;
       }
 
-      // 1) Ensure users/{uid}.roles contains 'leader' and leadershipMinistries is up-to-date
       await FirebaseFirestore.instance.collection('users').doc(_userId).set({
         'roles': FieldValue.arrayUnion(['leader']),
         'leadershipMinistries': unified.toList(),
       }, SetOptions(merge: true));
 
-      // Update local view
       setState(() {
         if (!_rolesFromUsers.contains('leader')) _rolesFromUsers = [..._rolesFromUsers, 'leader'];
         _leadershipMinistriesFromUsers = unified.toList();
         _isLeader = true;
       });
 
-      // 2) (Optional) Mirror 'leader' into members/{memberId}.roles via a callable with admin privileges
-      //    This is necessary because client rules do NOT allow users to update members.roles directly.
       if (_linkedMemberId != null) {
         try {
           final callable = FirebaseFunctions.instance.httpsCallable(
-            'ensureMemberLeaderRole', // ⬅️ implement this CF (see below)
+            'ensureMemberLeaderRole',
             options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
           );
-          await callable.call(<String, dynamic>{
-            'memberId': _linkedMemberId,
-          });
+          await callable.call(<String, dynamic>{'memberId': _linkedMemberId});
           debugPrint('[SYNC] ensureMemberLeaderRole called for memberId=$_linkedMemberId');
         } on FirebaseFunctionsException catch (e) {
           debugPrint('[SYNC] ensureMemberLeaderRole failed: ${e.code} ${e.message}');
@@ -238,7 +251,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
       );
       await callable.call(<String, dynamic>{});
 
-      await _fetchUserData(); // refresh local view
+      await _fetchUserData();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -342,6 +355,136 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
     );
   }
 
+  // ===== NEW: Search and Pastor role helpers =====
+
+  Future<void> _runSearch(String query) async {
+    if (!_isAdminNow) return; // safety: only admins can search/manage
+    setState(() {
+      _searching = true;
+      _searchError = '';
+      _searchResults = [];
+    });
+
+    try {
+      final col = FirebaseFirestore.instance.collection('members');
+
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> docs = [];
+
+      if (query.isEmpty) {
+        // Show nothing on empty query
+        docs = [];
+      } else if (query.contains('@')) {
+        // email exact match
+        final qs = await col.where('email', isEqualTo: query).limit(10).get();
+        docs = qs.docs;
+      } else {
+        // Try prefix search on fullNameLower
+        final qLower = query.toLowerCase();
+        try {
+          final qs = await col
+              .orderBy('fullNameLower')
+              .startAt([qLower])
+              .endAt(['$qLower\uf8ff'])
+              .limit(20)
+              .get();
+          docs = qs.docs;
+        } catch (e) {
+          // Fallback: fetch small set and filter client-side
+          final qs = await col.limit(50).get();
+          docs = qs.docs.where((d) {
+            final data = d.data();
+            final first = (data['firstName'] ?? '').toString().toLowerCase();
+            final last = (data['lastName'] ?? '').toString().toLowerCase();
+            final full = ('$first $last').trim();
+            return first.contains(qLower) || last.contains(qLower) || full.contains(qLower);
+          }).toList();
+        }
+      }
+
+      final results = docs.map((d) {
+        final data = d.data();
+        final roles = List<String>.from(data['roles'] ?? const []);
+        final first = (data['firstName'] ?? '').toString();
+        final last = (data['lastName'] ?? '').toString();
+        final full = (('$first $last').trim().isEmpty
+            ? (data['fullName'] ?? '').toString()
+            : ('$first $last').trim())
+            .trim();
+        final email = (data['email'] ?? '').toString();
+        final id = d.id;
+        return _MemberResult(
+          id: id,
+          name: full.isEmpty ? 'Unnamed Member' : full,
+          email: email,
+          roles: roles,
+        );
+      }).toList();
+
+      setState(() {
+        _searchResults = results;
+      });
+    } catch (e) {
+      setState(() => _searchError = 'Search failed: $e');
+    } finally {
+      setState(() => _searching = false);
+    }
+  }
+
+  Future<void> _setPastorRoleOnMember(_MemberResult m, {required bool makePastor}) async {
+    if (!_isAdminNow) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only admins can modify roles.')),
+      );
+      return;
+    }
+
+    try {
+      // Prefer Cloud Function for secure privilege escalation
+      try {
+        final callable = FirebaseFunctions.instance.httpsCallable(
+          'setMemberPastorRole',
+          options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
+        );
+        await callable.call(<String, dynamic>{
+          'memberId': m.id,
+          'makePastor': makePastor,
+        });
+      } on FirebaseFunctionsException catch (e) {
+        // If CF not deployed / permission denied, fall back to client write
+        debugPrint('[PastorRole] CF failed: ${e.code} ${e.message} — trying client write.');
+        await FirebaseFirestore.instance.collection('members').doc(m.id).update({
+          'roles': makePastor
+              ? FieldValue.arrayUnion(['pastor'])
+              : FieldValue.arrayRemove(['pastor']),
+        });
+      }
+
+      // Update local result list visually
+      setState(() {
+        final i = _searchResults.indexWhere((r) => r.id == m.id);
+        if (i != -1) {
+          final updated = List<String>.from(_searchResults[i].roles);
+          if (makePastor) {
+            if (!updated.contains('pastor')) updated.add('pastor');
+          } else {
+            updated.removeWhere((r) => r == 'pastor');
+          }
+          _searchResults[i] = _searchResults[i].copyWith(roles: updated);
+        }
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(makePastor ? '✅ Pastor role granted' : '✅ Pastor role removed')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Update failed: $e')),
+      );
+    }
+  }
+
+  // ===== UI =====
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -361,7 +504,8 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
         padding: const EdgeInsets.all(20),
         child: ListView(
           children: [
-            const Text("🛠️ Debug Info", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
+            const Text("🛠️ Debug Info",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
             const SizedBox(height: 20),
             Text("👤 User ID: ${_userId ?? 'Not logged in'}"),
             Text("🆔 Linked Member ID: ${_linkedMemberId ?? 'Not linked'}"),
@@ -376,8 +520,11 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
             Text(_rolesFromUsers.isEmpty ? 'No roles' : _rolesFromUsers.join(', ')),
 
             const SizedBox(height: 10),
-            const Text("🏆 User Leadership Ministries", style: TextStyle(fontWeight: FontWeight.bold)),
-            Text(_leadershipMinistriesFromUsers.isEmpty ? 'None' : _leadershipMinistriesFromUsers.join(', ')),
+            const Text("🏆 User Leadership Ministries",
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            Text(_leadershipMinistriesFromUsers.isEmpty
+                ? 'None'
+                : _leadershipMinistriesFromUsers.join(', ')),
 
             const Divider(height: 30),
 
@@ -385,12 +532,14 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
             Text(_rolesFromMembers.isEmpty ? 'No roles' : _rolesFromMembers.join(', ')),
 
             const SizedBox(height: 10),
-            const Text("🏆 Member Leadership Ministries", style: TextStyle(fontWeight: FontWeight.bold)),
-            Text(_leadershipMinistriesFromMembers.isEmpty ? 'None' : _leadershipMinistriesFromMembers.join(', ')),
+            const Text("🏆 Member Leadership Ministries",
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            Text(_leadershipMinistriesFromMembers.isEmpty
+                ? 'None'
+                : _leadershipMinistriesFromMembers.join(', ')),
 
             const SizedBox(height: 20),
 
-            // ⬅️ NEW manual sync button
             ElevatedButton.icon(
               icon: const Icon(Icons.sync),
               label: const Text("Sync Leader Role"),
@@ -420,9 +569,112 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage> {
 
             const Divider(),
             _buildQuickLinkButton(context, Icons.group, "Ministries", "/view-ministry"),
+
+            // ===== NEW: Admin-only Pastor Role Manager =====
+            if (_isAdminNow) ...[
+              const SizedBox(height: 30),
+              const Divider(height: 30),
+              const Text(
+                "👤 Pastor Role Manager (Admin)",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _searchCtrl,
+                decoration: InputDecoration(
+                  hintText: 'Search by member name or email...',
+                  prefixIcon: const Icon(Icons.search),
+                  suffixIcon: _searching
+                      ? const Padding(
+                    padding: EdgeInsets.all(10.0),
+                    child: SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                      : (_searchCtrl.text.isNotEmpty
+                      ? IconButton(
+                    icon: const Icon(Icons.clear),
+                    onPressed: () {
+                      _searchCtrl.clear();
+                      setState(() => _searchResults = []);
+                    },
+                  )
+                      : null),
+                  border: const OutlineInputBorder(),
+                ),
+                textInputAction: TextInputAction.search,
+                onSubmitted: (v) => _runSearch(v.trim()),
+              ),
+              if (_searchError.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(_searchError, style: const TextStyle(color: Colors.red)),
+              ],
+              const SizedBox(height: 12),
+              if (_searchResults.isEmpty && _searchCtrl.text.isNotEmpty && !_searching)
+                const Text('No members found.'),
+              ..._searchResults.map((m) => Card(
+                child: ListTile(
+                  leading: CircleAvatar(
+                    child: Text(
+                      (m.name.isNotEmpty ? m.name[0] : '?').toUpperCase(),
+                    ),
+                  ),
+                  title: Text(m.name),
+                  subtitle: Text(m.email.isEmpty ? 'No email' : m.email),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (m.roles.contains('pastor'))
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.remove),
+                          label: const Text('Remove Pastor'),
+                          onPressed: () => _setPastorRoleOnMember(m, makePastor: false),
+                        )
+                      else
+                        ElevatedButton.icon(
+                          icon: const Icon(Icons.add),
+                          label: const Text('Grant Pastor'),
+                          onPressed: () => _setPastorRoleOnMember(m, makePastor: true),
+                        ),
+                    ],
+                  ),
+                ),
+              )),
+            ],
           ],
         ),
       ),
+    );
+  }
+}
+
+// ===== Helper model for search results =====
+class _MemberResult {
+  final String id;
+  final String name;
+  final String email;
+  final List<String> roles;
+
+  _MemberResult({
+    required this.id,
+    required this.name,
+    required this.email,
+    required this.roles,
+  });
+
+  _MemberResult copyWith({
+    String? id,
+    String? name,
+    String? email,
+    List<String>? roles,
+  }) {
+    return _MemberResult(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      email: email ?? this.email,
+      roles: roles ?? this.roles,
     );
   }
 }

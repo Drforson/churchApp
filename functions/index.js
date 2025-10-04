@@ -13,7 +13,6 @@ const { setGlobalOptions } = require("firebase-functions/v2/options");
 // -----------------------------
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
-// (FCM is required lazily where used to avoid load hiccups)
 
 // ----------------------------------------
 // Global options (region, memory if needed)
@@ -33,6 +32,78 @@ const s = (v) => (typeof v === "string" ? v : "");
 const inboxEventRef = (uid) => db.collection("inbox").doc(uid).collection("events").doc();
 const ttlDate = (days) => new Date(Date.now() + days * 24 * 60 * 60 * 1000);
 
+const HttpsError = (code, message) => {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+};
+
+const requireAuth = (request) => {
+  const auth = request.auth;
+  if (!auth) throw HttpsError("unauthenticated", "Sign in required.");
+  return auth;
+};
+
+const requireAdmin = async (uid) => {
+  const snap = await db.collection("users").doc(uid).get();
+  const roles = snap.data()?.roles ?? [];
+  if (!Array.isArray(roles) || !roles.includes("admin")) {
+    throw HttpsError("permission-denied", "Admin role required.");
+  }
+  return true;
+};
+
+const getLinkedUserUidForMember = async (memberId) => {
+  if (!memberId) return null;
+  const q = await db.collection("users").where("memberId", "==", memberId).limit(1).get();
+  return q.empty ? null : q.docs[0].id;
+};
+
+// Convert various client shapes to a JS Date (or null)
+const coerceDate = (v) => {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === "number") return new Date(v); // millis
+  if (typeof v === "string") {
+    const d = new Date(v);
+    return isNaN(d) ? null : d;
+  }
+  if (typeof v === "object" && typeof v._seconds === "number") {
+    const ms = v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6);
+    return new Date(ms);
+  }
+  return null;
+};
+
+// Whitelist for create payload
+const ALLOWED_CREATE_FIELDS = new Set([
+  "firstName",
+  "lastName",
+  "fullName",
+  "email", // server may set email safely at create-time
+  "phoneNumber",
+  "gender",
+  "address",
+  "emergencyContactName",
+  "emergencyContactNumber",
+  "maritalStatus",
+  "dateOfBirth",
+]);
+
+const pickAllowed = (data) => {
+  const out = {};
+  for (const k of Object.keys(data || {})) {
+    if (!ALLOWED_CREATE_FIELDS.has(k)) continue;
+    if (k === "dateOfBirth") {
+      const d = coerceDate(data[k]);
+      if (d) out[k] = d;
+    } else {
+      out[k] = data[k];
+    }
+  }
+  return out;
+};
+
 // ----------------------------------------
 // Canary callable (health check)
 // ----------------------------------------
@@ -44,16 +115,11 @@ exports.ping = onCall(() => ({ ok: true, pong: true }));
 const ALLOWLIST_EMAILS = [
   "forsonalfred21@gmail.com",
   "carlos@gmail.com",
-  "admin@gmail.com" // update to your real dev/admin emails
+  "admin@gmail.com", // update to your real dev/admin emails
 ];
 
 exports.promoteMeToAdmin = onCall(async (request) => {
-  const auth = request.auth;
-  if (!auth) {
-    const err = new Error("unauthenticated");
-    err.code = "unauthenticated";
-    throw err;
-  }
+  const auth = requireAuth(request);
 
   const email = auth.token.email || "";
   const isEmulator =
@@ -61,18 +127,14 @@ exports.promoteMeToAdmin = onCall(async (request) => {
     !!process.env.FIRESTORE_EMULATOR_HOST;
 
   if (!isEmulator && !ALLOWLIST_EMAILS.includes(email)) {
-    const err = new Error("permission-denied");
-    err.code = "permission-denied";
-    throw err;
+    throw HttpsError("permission-denied", "Not on allowlist.");
   }
 
   const uid = auth.uid;
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
   if (!userSnap.exists) {
-    const err = new Error("failed-precondition: user doc not found");
-    err.code = "failed-precondition";
-    throw err;
+    throw HttpsError("failed-precondition", "User doc not found.");
   }
 
   const memberId = (userSnap.data() || {}).memberId || null;
@@ -87,6 +149,55 @@ exports.promoteMeToAdmin = onCall(async (request) => {
   }
 
   return { ok: true, uid, memberId };
+});
+
+// --------------------------------------------------
+// ✅ NEW: Create & link a member (server-side, atomic)
+// --------------------------------------------------
+exports.createMember = onCall(async (request) => {
+  const auth = requireAuth(request);
+  const uid = auth.uid;
+  const now = FieldValue.serverTimestamp();
+
+  const result = await db.runTransaction(async (tx) => {
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await tx.get(userRef);
+    const userData = userSnap.data() || {};
+
+    // If already linked, just return the existing memberId
+    if (userData.memberId && typeof userData.memberId === "string" && userData.memberId.length) {
+      return { ok: true, memberId: userData.memberId, alreadyLinked: true };
+    }
+
+    const raw = request.data || {};
+    const payload = pickAllowed(raw);
+
+    // Create a fresh member
+    const memberRef = db.collection("members").doc(); // or .doc(uid) if you want 1:1 id=uid
+    tx.set(memberRef, {
+      ...payload,
+      createdAt: now,
+      updatedAt: now,
+      createdByUid: uid,
+      userUid: uid,
+    });
+
+    // Link the user → member
+    tx.set(
+      userRef,
+      {
+        memberId: memberRef.id,
+        linkedAt: now,
+        email: auth.token?.email || userData.email || null,
+        createdAt: userSnap.exists ? userData.createdAt ?? now : now,
+      },
+      { merge: true }
+    );
+
+    return { ok: true, memberId: memberRef.id, alreadyLinked: false };
+  });
+
+  return result;
 });
 
 // --------------------------------------------------
@@ -273,12 +384,11 @@ exports.onJoinRequestStatusChange = onDocumentUpdated("join_requests/{requestId}
 
 // --------------------------------------------------
 // 🧹 Nightly cleanup: delete inbox events older than 60 days
-// (Requires Blaze for scheduled functions. Comment out if on Spark.)
 // --------------------------------------------------
 exports.cleanupOldInboxEvents = onSchedule(
   {
-    schedule: "30 3 * * *",    // 03:30 daily
-    timeZone: "Europe/London", // your TZ
+    schedule: "30 3 * * *",
+    timeZone: "Europe/London",
     region: "europe-west2",
     memory: "256MiB",
   },
@@ -309,3 +419,65 @@ exports.cleanupOldInboxEvents = onSchedule(
     );
   }
 );
+
+// --------------------------------------------------
+// ✅ ensureMemberLeaderRole (admin-only)
+// --------------------------------------------------
+exports.ensureMemberLeaderRole = onCall(async (request) => {
+  const auth = requireAuth(request);
+  await requireAdmin(auth.uid);
+
+  const memberId = s(request.data?.memberId);
+  if (!memberId) throw HttpsError("invalid-argument", "memberId is required.");
+
+  await db.collection("members").doc(memberId).set(
+    { roles: FieldValue.arrayUnion("leader") },
+    { merge: true }
+  );
+
+  const linkedUid = await getLinkedUserUidForMember(memberId);
+  if (linkedUid) {
+    await db.collection("users").doc(linkedUid).set(
+      { roles: FieldValue.arrayUnion("leader") },
+      { merge: true }
+    );
+  }
+
+  return { ok: true, memberId, linkedUid: linkedUid || null };
+});
+
+// --------------------------------------------------
+// ✅ setMemberPastorRole (admin-only)
+// --------------------------------------------------
+exports.setMemberPastorRole = onCall(async (request) => {
+  const auth = requireAuth(request);
+  await requireAdmin(auth.uid);
+
+  const memberId = s(request.data?.memberId);
+  const makePastor = !!request.data?.makePastor;
+
+  if (!memberId) throw HttpsError("invalid-argument", "memberId is required.");
+
+  await db.collection("members").doc(memberId).set(
+    {
+      roles: makePastor
+        ? FieldValue.arrayUnion("pastor")
+        : FieldValue.arrayRemove("pastor"),
+    },
+    { merge: true }
+  );
+
+  const linkedUid = await getLinkedUserUidForMember(memberId);
+  if (linkedUid) {
+    await db.collection("users").doc(linkedUid).set(
+      {
+        roles: makePastor
+          ? FieldValue.arrayUnion("pastor")
+          : FieldValue.arrayRemove("pastor"),
+      },
+      { merge: true }
+    );
+  }
+
+  return { ok: true, memberId, makePastor, linkedUid: linkedUid || null };
+});

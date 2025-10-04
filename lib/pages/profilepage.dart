@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -13,6 +16,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _auth = FirebaseAuth.instance;
   final _db = FirebaseFirestore.instance;
+  late final FirebaseFunctions _functions; // 👈 region-bound functions instance
 
   final _formKey = GlobalKey<FormState>();
 
@@ -20,28 +24,38 @@ class _HomePageState extends State<HomePage> {
   bool _loading = true;
   bool _saving = false;
 
+  bool _bypassMode = false;
+  int _cooldownSecs = 0;
+  Timer? _cooldownTimer;
+
   // Controllers
   final _firstNameCtrl = TextEditingController();
   final _lastNameCtrl = TextEditingController();
   final _emailCtrl = TextEditingController();
   final _phoneCtrl = TextEditingController();
-  final _genderCtrl = TextEditingController(); // simple text; swap to dropdown if you prefer
   final _addressCtrl = TextEditingController();
-
-  // Emergency contact
   final _emergencyNameCtrl = TextEditingController();
   final _emergencyPhoneCtrl = TextEditingController();
 
-  // Marital status
   final List<String> _maritalOptions = const ['single', 'married', 'divorced', 'widowed'];
   String? _maritalStatus;
 
-  // DOB
+  final List<String> _genderOptions = const ['male', 'female', 'other'];
+  String? _genderStatus;
+
   DateTime? _dob;
 
   @override
   void initState() {
     super.initState();
+
+    // ✅ point to your deployed region (you set europe-west2 in index.js)
+    _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
+
+    // If you use the emulator, uncomment ONE of these:
+    // _functions.useFunctionsEmulator('10.0.2.2', 5001); // Android emulator
+    // _functions.useFunctionsEmulator('localhost', 5001); // iOS sim / desktop
+
     _loadProfile();
   }
 
@@ -51,58 +65,80 @@ class _HomePageState extends State<HomePage> {
     _lastNameCtrl.dispose();
     _emailCtrl.dispose();
     _phoneCtrl.dispose();
-    _genderCtrl.dispose();
     _addressCtrl.dispose();
     _emergencyNameCtrl.dispose();
     _emergencyPhoneCtrl.dispose();
+    _cooldownTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _loadProfile() async {
     final user = _auth.currentUser;
     if (user == null) {
-      setState(() {
-        _loading = false;
-      });
+      setState(() => _loading = false);
       return;
     }
 
     try {
-      final u = await _db.collection('users').doc(user.uid).get();
-      final udata = u.data() ?? {};
-      final memberId = udata['memberId'] as String?;
-      if (memberId == null) {
-        if (mounted) {
-          setState(() {
-            _memberId = null;
-            _loading = false;
-          });
+      // Ensure users/{uid} exists (safe for rules/helpers)
+      await _db.collection('users').doc(user.uid).set({
+        'createdAt': FieldValue.serverTimestamp(),
+        if (user.email != null) 'email': user.email!.trim(),
+      }, SetOptions(merge: true));
+
+      if (_emailCtrl.text.trim().isEmpty && user.email != null) {
+        _emailCtrl.text = user.email!;
+      }
+
+      // Check link
+      final uSnap = await _db.collection('users').doc(user.uid).get();
+      String? memberId = (uSnap.data()?['memberId'] as String?)?.trim();
+
+      // Try auto-attach by auth.email if not linked
+      if ((memberId == null || memberId.isEmpty) && user.email != null) {
+        final existing = await _db
+            .collection('members')
+            .where('email', isEqualTo: user.email!.trim())
+            .limit(1)
+            .get();
+        if (existing.docs.isNotEmpty) {
+          final foundId = existing.docs.first.id;
+          await _db.collection('users').doc(user.uid).set({
+            'memberId': foundId,
+            'linkedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+          memberId = foundId;
         }
+      }
+
+      if (memberId == null || memberId.isEmpty) {
+        setState(() {
+          _memberId = null;
+          _loading = false;
+        });
         return;
       }
 
       final m = await _db.collection('members').doc(memberId).get();
       final md = m.data() ?? {};
 
-      // Populate form fields
       _memberId = memberId;
       _firstNameCtrl.text = (md['firstName'] ?? '').toString();
       _lastNameCtrl.text = (md['lastName'] ?? '').toString();
-      _emailCtrl.text = (md['email'] ?? udata['email'] ?? '').toString();
+      _emailCtrl.text = (md['email'] ?? user.email ?? '').toString();
       _phoneCtrl.text = (md['phoneNumber'] ?? md['phone'] ?? '').toString();
-      _genderCtrl.text = (md['gender'] ?? '').toString();
       _addressCtrl.text = (md['address'] ?? '').toString();
       _emergencyNameCtrl.text = (md['emergencyContactName'] ?? '').toString();
       _emergencyPhoneCtrl.text = (md['emergencyContactNumber'] ?? '').toString();
-      final ms = (md['maritalStatus'] ?? '').toString().toLowerCase();
+
+      final g = (md['gender'] ?? '').toString().toLowerCase().trim();
+      _genderStatus = _genderOptions.contains(g) ? g : null;
+
+      final ms = (md['maritalStatus'] ?? '').toString().toLowerCase().trim();
       _maritalStatus = _maritalOptions.contains(ms) ? ms : null;
 
       final ts = md['dateOfBirth'];
-      if (ts is Timestamp) {
-        _dob = ts.toDate();
-      } else {
-        _dob = null;
-      }
+      _dob = ts is Timestamp ? ts.toDate() : null;
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -110,11 +146,7 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-        });
-      }
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -131,72 +163,159 @@ class _HomePageState extends State<HomePage> {
       lastDate: last,
       helpText: 'Select Date of Birth',
     );
-    if (picked != null) {
-      setState(() {
-        _dob = picked;
-      });
-    }
+    if (picked != null) setState(() => _dob = picked);
   }
 
-  Future<void> _save() async {
-    if (_memberId == null) {
+  Future<void> _resendVerificationEmail() async {
+    final user = _auth.currentUser;
+    if (user == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No linked member record found.')),
+        const SnackBar(content: Text('Not signed in.')),
       );
       return;
     }
+    if (_cooldownSecs > 0) return;
 
-    if (!_formKey.currentState!.validate()) return;
+    try {
+      await user.reload();
+      if (_auth.currentUser?.emailVerified == true) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Email already verified. Pull to refresh.')),
+        );
+        return;
+      }
+      await user.sendEmailVerification();
+      _startCooldown(60);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Verification email sent to ${user.email ?? 'your email'}')),
+      );
+    } on FirebaseAuthException catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not send verification: ${e.message ?? e.code}')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not send verification: $e')),
+      );
+    }
+  }
+
+  void _startCooldown(int seconds) {
+    _cooldownTimer?.cancel();
+    setState(() => _cooldownSecs = seconds);
+    _cooldownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) return t.cancel();
+      if (_cooldownSecs <= 1) {
+        t.cancel();
+        setState(() => _cooldownSecs = 0);
+      } else {
+        setState(() => _cooldownSecs -= 1);
+      }
+    });
+  }
+
+  void _enableBypassAndShowForm() {
+    final user = _auth.currentUser;
+    setState(() {
+      _bypassMode = true;
+      if (user?.email != null && _emailCtrl.text.trim().isEmpty) {
+        _emailCtrl.text = user!.email!;
+      }
+    });
+  }
+
+  Future<void> _save() async {
+    // Require at least one name
+    if (_firstNameCtrl.text.trim().isEmpty && _lastNameCtrl.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter at least a first or last name.')),
+      );
+      return;
+    }
 
     final first = _firstNameCtrl.text.trim();
     final last = _lastNameCtrl.text.trim();
     final fullName = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
 
-    // Build an update map with ONLY allowed profile fields (per your rules)
-    final Map<String, dynamic> update = {
+    // For updates (allowed profile fields)
+    final Map<String, dynamic> profilePayload = {
       'firstName': first,
       'lastName': last,
-      'fullName': fullName, // optional convenience
+      'fullName': fullName,
       'email': _emailCtrl.text.trim(),
       'phoneNumber': _phoneCtrl.text.trim(),
-      'gender': _genderCtrl.text.trim(),
+      'gender': (_genderStatus ?? '').trim(),
       'address': _addressCtrl.text.trim(),
       'emergencyContactName': _emergencyNameCtrl.text.trim(),
       'emergencyContactNumber': _emergencyPhoneCtrl.text.trim(),
       'maritalStatus': (_maritalStatus ?? '').trim(),
       'updatedAt': FieldValue.serverTimestamp(),
+      if (_dob != null) 'dateOfBirth': Timestamp.fromDate(_dob!),
+      if (_dob == null) 'dateOfBirth': FieldValue.delete(),
     };
-
-    if (_dob != null) {
-      update['dateOfBirth'] = Timestamp.fromDate(_dob!);
-    } else {
-      update['dateOfBirth'] = FieldValue.delete();
-    }
-
-    // Remove keys with empty string (avoid cluttering doc)
-    update.removeWhere((k, v) => v is String && v.trim().isEmpty);
+    profilePayload.removeWhere((k, v) => v is String && v.trim().isEmpty);
 
     setState(() => _saving = true);
     try {
-      await _db.collection('members').doc(_memberId!).update(update);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('✅ Profile updated')),
-        );
+      if (_memberId == null) {
+        // ---------- CREATE via callable function (server-side) ----------
+        final user = _auth.currentUser;
+        if (user == null) throw Exception('Not signed in.');
+
+        // Ensure users/{uid} exists (harmless; function also merges)
+        await _db.collection('users').doc(user.uid).set({
+          'createdAt': FieldValue.serverTimestamp(),
+          if (user.email != null) 'email': user.email!.trim(),
+        }, SetOptions(merge: true));
+
+        // 👇 Use region-bound instance
+        final callable = _functions.httpsCallable('createMember');
+        final res = await callable.call({
+          'firstName': first,
+          'lastName': last,
+          'fullName': fullName,
+          if (_phoneCtrl.text.trim().isNotEmpty) 'phoneNumber': _phoneCtrl.text.trim(),
+          if ((_genderStatus ?? '').trim().isNotEmpty) 'gender': (_genderStatus ?? '').trim(),
+          if (_addressCtrl.text.trim().isNotEmpty) 'address': _addressCtrl.text.trim(),
+          if (_emergencyNameCtrl.text.trim().isNotEmpty) 'emergencyContactName': _emergencyNameCtrl.text.trim(),
+          if (_emergencyPhoneCtrl.text.trim().isNotEmpty) 'emergencyContactNumber': _emergencyPhoneCtrl.text.trim(),
+          if ((_maritalStatus ?? '').trim().isNotEmpty) 'maritalStatus': (_maritalStatus ?? '').trim(),
+          if (_dob != null) 'dateOfBirth': _dob!.millisecondsSinceEpoch, // millis
+          if (_emailCtrl.text.trim().isNotEmpty) 'email': _emailCtrl.text.trim(),
+        });
+
+        final data = Map<String, dynamic>.from(res.data as Map);
+        final newId = data['memberId'] as String;
+        setState(() => _memberId = newId);
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(data['alreadyLinked'] == true
+                ? '✅ Already linked to your profile'
+                : '✅ Profile created & linked')),
+          );
+        }
+      } else {
+        // ---------- UPDATE (client-side; allowed by rules) ----------
+        await _db.collection('members').doc(_memberId!).update(profilePayload);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('✅ Profile updated')),
+          );
+        }
       }
+    } on FirebaseFunctionsException catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Cloud Function error: ${e.code} – ${e.message}')),
+      );
     } on FirebaseException catch (e) {
-      // Permission errors will show here if rules block a field
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('❌ Save failed: ${e.message ?? e.code}')),
-        );
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Save failed: ${e.message ?? e.code}')),
+      );
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('❌ Save failed: $e')),
-        );
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ Save failed: $e')),
+      );
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -213,8 +332,14 @@ class _HomePageState extends State<HomePage> {
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : _memberId == null
-          ? _NoMemberLinked(onRefresh: _loadProfile)
+          : (_memberId == null && !_bypassMode)
+          ? _NoMemberSection(
+        onRefresh: _loadProfile,
+        onResend: _resendVerificationEmail,
+        onBypass: _enableBypassAndShowForm,
+        email: _auth.currentUser?.email,
+        cooldownSecs: _cooldownSecs,
+      )
           : SafeArea(
         child: Form(
           key: _formKey,
@@ -224,7 +349,6 @@ class _HomePageState extends State<HomePage> {
               _Header(percent: percent),
               const SizedBox(height: 16),
 
-              // Name
               Row(
                 children: [
                   Expanded(
@@ -235,10 +359,6 @@ class _HomePageState extends State<HomePage> {
                         labelText: 'First name',
                         prefixIcon: Icon(Icons.person_outline),
                       ),
-                      validator: (v) {
-                        // Allow last name only too; enforce at least one name later
-                        return null;
-                      },
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -250,14 +370,12 @@ class _HomePageState extends State<HomePage> {
                         labelText: 'Last name',
                         prefixIcon: Icon(Icons.person_outline),
                       ),
-                      validator: (v) => null,
                     ),
                   ),
                 ],
               ),
               const SizedBox(height: 12),
 
-              // Email & Phone
               TextFormField(
                 controller: _emailCtrl,
                 keyboardType: TextInputType.emailAddress,
@@ -279,19 +397,22 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 12),
 
-              // Gender (simple text, keep consistent with your data)
-              TextFormField(
-                controller: _genderCtrl,
-                textInputAction: TextInputAction.next,
+              DropdownButtonFormField<String>(
+                value: _genderStatus,
+                items: _genderOptions
+                    .map((v) => DropdownMenuItem(
+                  value: v,
+                  child: Text(v[0].toUpperCase() + v.substring(1)),
+                ))
+                    .toList(),
                 decoration: const InputDecoration(
-                  labelText: 'Gender',
+                  labelText: 'Select Gender',
                   prefixIcon: Icon(Icons.wc_outlined),
-                  hintText: 'Male / Female / ...',
                 ),
+                onChanged: (v) => setState(() => _genderStatus = v),
               ),
               const SizedBox(height: 12),
 
-              // Marital status
               DropdownButtonFormField<String>(
                 value: _maritalStatus,
                 items: _maritalOptions
@@ -308,7 +429,6 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 12),
 
-              // Address
               TextFormField(
                 controller: _addressCtrl,
                 textInputAction: TextInputAction.next,
@@ -319,7 +439,6 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 12),
 
-              // DOB (display + edit)
               InkWell(
                 borderRadius: BorderRadius.circular(12),
                 onTap: _pickDOB,
@@ -345,7 +464,6 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 12),
 
-              // Emergency contact
               TextFormField(
                 controller: _emergencyNameCtrl,
                 textInputAction: TextInputAction.next,
@@ -368,21 +486,13 @@ class _HomePageState extends State<HomePage> {
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
-                  onPressed: _saving
-                      ? null
-                      : () {
-                    // Require at least one name part
-                    if (_firstNameCtrl.text.trim().isEmpty &&
-                        _lastNameCtrl.text.trim().isEmpty) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Please enter at least a first or last name.')),
-                      );
-                      return;
-                    }
-                    _save();
-                  },
+                  onPressed: _saving ? null : _save,
                   icon: const Icon(Icons.save_outlined),
-                  label: Text(_saving ? 'Saving...' : 'Save changes'),
+                  label: Text(
+                    _saving
+                        ? 'Saving...'
+                        : (_memberId == null ? 'Create profile' : 'Save changes'),
+                  ),
                 ),
               ),
             ],
@@ -393,19 +503,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   double _computeCompletionPercent() {
-    // a light approximation for progress
     int filled = 0;
-    const total = 8; // adjust if you count differently
-
+    const total = 8;
     if (_firstNameCtrl.text.trim().isNotEmpty || _lastNameCtrl.text.trim().isNotEmpty) filled++;
     if (_emailCtrl.text.trim().isNotEmpty) filled++;
     if (_phoneCtrl.text.trim().isNotEmpty) filled++;
-    if (_genderCtrl.text.trim().isNotEmpty) filled++;
+    if (_genderStatus != null && _genderStatus!.isNotEmpty) filled++;
     if (_maritalStatus != null && _maritalStatus!.isNotEmpty) filled++;
     if (_addressCtrl.text.trim().isNotEmpty) filled++;
     if (_emergencyNameCtrl.text.trim().isNotEmpty || _emergencyPhoneCtrl.text.trim().isNotEmpty) filled++;
     if (_dob != null) filled++;
-
     return (filled / total).clamp(0.0, 1.0);
   }
 }
@@ -424,7 +531,13 @@ class _Header extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(14),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 6))],
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.05),
+            blurRadius: 10,
+            offset: const Offset(0, 6),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -448,9 +561,20 @@ class _Header extends StatelessWidget {
   }
 }
 
-class _NoMemberLinked extends StatelessWidget {
+class _NoMemberSection extends StatelessWidget {
   final Future<void> Function() onRefresh;
-  const _NoMemberLinked({required this.onRefresh});
+  final VoidCallback onResend;
+  final VoidCallback onBypass;
+  final String? email;
+  final int cooldownSecs;
+
+  const _NoMemberSection({
+    required this.onRefresh,
+    required this.onResend,
+    required this.onBypass,
+    required this.email,
+    required this.cooldownSecs,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -459,19 +583,48 @@ class _NoMemberLinked extends StatelessWidget {
       child: ListView(
         padding: const EdgeInsets.all(24),
         children: [
-          const SizedBox(height: 60),
-          Icon(Icons.link_off, size: 62, color: Colors.grey.shade600),
+          const SizedBox(height: 40),
+          Icon(Icons.person_search_outlined, size: 62, color: Colors.grey.shade700),
           const SizedBox(height: 16),
           const Text(
-            'No member record linked',
+            'No member profile linked',
             textAlign: TextAlign.center,
-            style: TextStyle(fontWeight: FontWeight.w600, fontSize: 18),
+            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 18),
           ),
           const SizedBox(height: 8),
           Text(
-            'Your account has no linked member profile yet. If you recently signed up, try pulling to refresh.',
+            'If you just signed up, you might need to verify your email and refresh.\n'
+                'Account email: ${email ?? 'unknown'}',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade700),
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: cooldownSecs > 0 ? null : onResend,
+              icon: const Icon(Icons.mark_email_unread_outlined),
+              label: Text(
+                cooldownSecs > 0
+                    ? 'Resend verification (${cooldownSecs}s)'
+                    : 'Resend verification email',
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: onBypass,
+              icon: const Icon(Icons.arrow_forward),
+              label: const Text('Bypass & create profile now'),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Bypass lets you fill out your profile now. We’ll create a member record and link it to your account.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey.shade600),
           ),
         ],
       ),
