@@ -17,6 +17,7 @@ import 'pages/signup2.dart';
 import 'pages/prayer_request_manage_page.dart';
 import 'pages/baptism_manage_page.dart';
 
+// Dashboards & core pages
 import 'pages/admin_dashboard_page.dart';
 import 'pages/admin_upload_page.dart';
 import 'pages/home_dashboard_page.dart';
@@ -36,6 +37,11 @@ import 'pages/successpage.dart';
 
 // ✅ NEW: Pastor dashboard
 import 'pages/pastor_home_dashboard_page.dart';
+
+// ✅ NEW: Dedicated form pages
+import 'pages/prayer_request_form_page.dart';
+import 'pages/baptism_interest_form_page.dart';
+//import 'pages/volunteer_signup_form_page.dart';
 
 // Services
 import 'services/theme_provider.dart';
@@ -322,8 +328,7 @@ class _RoleGateState extends State<RoleGate> {
                 final memberRoles = (md['roles'] as List<dynamic>? ?? const [])
                     .map((e) => e.toString().toLowerCase())
                     .toSet();
-                final leads =
-                List<String>.from(md['leadershipMinistries'] ?? const <String>[]);
+                final leads = List<String>.from(md['leadershipMinistries'] ?? const <String>[]);
 
                 if (memberRoles.contains('admin')) {
                   debugPrint('[RoleGate] routing=ADMIN (members.roles=$memberRoles)');
@@ -402,11 +407,22 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
 
     case '/view-ministry':
       return MaterialPageRoute(builder: (_) => const MinistresPage());
+
     case '/manage-prayer-requests':
       return MaterialPageRoute(builder: (_) => const PrayerRequestManagePage());
 
     case '/manage-baptism':
       return MaterialPageRoute(builder: (_) => const BaptismManagePage());
+
+  // ✅ NEW: dedicated form routes
+    case '/form-prayer-request':
+      return MaterialPageRoute(builder: (_) => const PrayerRequestFormPage());
+
+    case '/form-baptism-interest':
+      return MaterialPageRoute(builder: (_) => const BaptismInterestFormPage());
+
+  //  case '/form-volunteer-signup':
+   //   return MaterialPageRoute(builder: (_) => const VolunteerSignupFormPage());
 
     case '/uploadExcel':
       return MaterialPageRoute(builder: (_) => const ExcelDatabaseUploader());
