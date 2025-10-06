@@ -13,6 +13,13 @@ class DebugAdminSetterPage extends StatefulWidget {
 
 class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     with SingleTickerProviderStateMixin {
+  // Cloud Functions (correct region)
+  final FirebaseFunctions _functions =
+  FirebaseFunctions.instanceFor(region: 'europe-west2');
+
+  // Allowed roles we manage here
+  static const Set<String> _allowedRoles = {'pastor', 'usher', 'media'};
+
   // ======= Existing state (unchanged) =======
   String? _userId;
   String? _linkedMemberId;
@@ -44,6 +51,13 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
   final Set<String> _selectedMemberIds = <String>{};
   final Set<String> _rolesToGrant = <String>{}; // {pastor, usher, media}
   final Set<String> _rolesToRemove = <String>{};
+
+  bool get _canGrant =>
+      _selectedMemberIds.isNotEmpty && _rolesToGrant.isNotEmpty;
+  // NOTE: _canRemove kept for other uses, but actual enabling now considers
+  // roles present on the selection as a fallback (computed inside the builder).
+  bool get _canRemove =>
+      _selectedMemberIds.isNotEmpty && _rolesToRemove.isNotEmpty;
 
   @override
   void initState() {
@@ -121,7 +135,10 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           isLeader = leadershipMinistriesFromMembers.isNotEmpty;
 
           // Merge roles + leadershipMinistries back to users doc
-          final mergedRoles = {...rolesFromUsers, ...rolesFromMembers}.toList();
+          final mergedRoles = {
+            ...rolesFromUsers.map((e) => e.toLowerCase()),
+            ...rolesFromMembers.map((e) => e.toLowerCase())
+          }.toList();
           final mergedMin = {
             ...leadershipMinistriesFromUsers,
             ...leadershipMinistriesFromMembers
@@ -145,8 +162,10 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       setState(() {
         _userId = userId;
         _linkedMemberId = memberId;
-        _rolesFromUsers = rolesFromUsers;
-        _rolesFromMembers = rolesFromMembers;
+        _rolesFromUsers =
+            rolesFromUsers.toSet().map((e) => e.toLowerCase()).toList();
+        _rolesFromMembers =
+            rolesFromMembers.toSet().map((e) => e.toLowerCase()).toList();
         _leadershipMinistriesFromUsers = leadershipMinistriesFromUsers;
         _leadershipMinistriesFromMembers = leadershipMinistriesFromMembers;
         _linkedMemberName =
@@ -210,13 +229,14 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         if (!_rolesFromUsers.contains('leader')) {
           _rolesFromUsers = [..._rolesFromUsers, 'leader'];
         }
+        _rolesFromUsers = _rolesFromUsers.toSet().toList(); // dedup
         _leadershipMinistriesFromUsers = unified.toList();
         _isLeader = true;
       });
 
       if (_linkedMemberId != null) {
         try {
-          final callable = FirebaseFunctions.instance.httpsCallable(
+          final callable = _functions.httpsCallable(
             'ensureMemberLeaderRole',
             options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
           );
@@ -249,7 +269,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
 
     setState(() => _loading = true);
     try {
-      final callable = FirebaseFunctions.instance.httpsCallable(
+      final callable = _functions.httpsCallable(
         'promoteMeToAdmin',
         options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
       );
@@ -389,7 +409,10 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
 
       final results = docs.map((d) {
         final data = d.data();
-        final roles = List<String>.from(data['roles'] ?? const []);
+        final roles = (data['roles'] as List<dynamic>? ?? const [])
+            .map((e) => e.toString().toLowerCase())
+            .toSet()
+            .toList();
         final first = (data['firstName'] ?? '').toString();
         final last = (data['lastName'] ?? '').toString();
         final full = (('$first $last').trim().isEmpty
@@ -400,7 +423,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         final id = d.id;
         return _MemberResult(
           id: id,
-          name: full.isEmpty ? 'Unnamed Member' : full,
+          name: full.isNotEmpty ? full : 'Unnamed Member',
           email: email,
           roles: roles,
         );
@@ -428,7 +451,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     try {
       bool cfWorked = false;
       try {
-        final callable = FirebaseFunctions.instance.httpsCallable(
+        final callable = _functions.httpsCallable(
           'setMemberPastorRole',
           options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
         );
@@ -466,11 +489,14 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         if (i != -1) {
           final updated = List<String>.from(_searchResults[i].roles);
           if (makePastor) {
-            if (!updated.contains('pastor')) updated.add('pastor');
+            if (!updated.map((e) => e.toLowerCase()).contains('pastor')) {
+              updated.add('pastor');
+            }
           } else {
-            updated.removeWhere((r) => r == 'pastor');
+            updated.removeWhere((r) => r.toLowerCase() == 'pastor');
           }
-          _searchResults[i] = _searchResults[i].copyWith(roles: updated);
+          _searchResults[i] =
+              _searchResults[i].copyWith(roles: updated.toSet().toList());
         }
       });
 
@@ -506,24 +532,33 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       return;
     }
 
+    // Avoid adding and removing the same role at once
+    final addSet = add.map((e) => e.toLowerCase()).toSet();
+    final removeSet = remove.map((e) => e.toLowerCase()).toSet();
+    final both = {...addSet}..retainAll(removeSet);
+    addSet.removeAll(both);
+    removeSet.removeAll(both);
+
     try {
-      final callable = FirebaseFunctions.instance.httpsCallable(
+      final callable = _functions.httpsCallable(
         'setMemberRoles',
         options: HttpsCallableOptions(timeout: const Duration(seconds: 30)),
       );
       await callable.call(<String, dynamic>{
         'memberIds': memberIds.toList(),
-        'rolesAdd': add.map((e) => e.toLowerCase()).toList(),
-        'rolesRemove': remove.map((e) => e.toLowerCase()).toList(),
+        'rolesAdd': addSet.toList(),
+        'rolesRemove': removeSet.toList(),
       });
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-                '✅ Updated ${memberIds.length} member(s): +[${add.join(', ')}] -[${remove.join(', ')}]'),
+                '✅ Updated ${memberIds.length} member(s): +[${addSet.join(', ')}] -[${removeSet.join(', ')}]'),
           ),
         );
+        // Refresh list to reflect new roles
+        setState(() {});
       }
     } on FirebaseFunctionsException catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -543,7 +578,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         _rolesToGrant.remove(r);
       } else {
         _rolesToGrant.add(r);
-        _rolesToRemove.remove(r);
+        _rolesToRemove.remove(r); // mutually exclusive
       }
     });
   }
@@ -555,9 +590,70 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         _rolesToRemove.remove(r);
       } else {
         _rolesToRemove.add(r);
-        _rolesToGrant.remove(r);
+        _rolesToGrant.remove(r); // mutually exclusive
       }
     });
+  }
+
+  // Compact, responsive action buttons to avoid overflow
+  Widget _grantRemoveButtons({
+    required bool canRemoveNow,
+    required Set<String> inferredRolesToRemove,
+  }) {
+    final smallPad =
+    const EdgeInsets.symmetric(horizontal: 10, vertical: 8); // smaller
+    final smallMin = const Size(0, 32);
+
+    // When pressing Remove, if no explicit chips were chosen, we fall back to the
+    // roles actually present on the selected members (inferredRolesToRemove).
+    final rolesToRemoveFinal =
+    _rolesToRemove.isNotEmpty ? _rolesToRemove : inferredRolesToRemove;
+
+    return Wrap(
+      spacing: 10,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        ElevatedButton.icon(
+          icon: const Icon(Icons.check, size: 18),
+          label: const Text('Grant selected'),
+          onPressed: _canGrant
+              ? () => _bulkApplyRoles(
+            memberIds: _selectedMemberIds,
+            add: _rolesToGrant,
+            remove: const [],
+          )
+              : null,
+          style: ElevatedButton.styleFrom(
+            padding: smallPad,
+            minimumSize: smallMin,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            visualDensity: VisualDensity.compact,
+          ),
+        ),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.remove_circle_outline, size: 18),
+          label: const Text('Remove selected'),
+          onPressed: canRemoveNow
+              ? () => _bulkApplyRoles(
+            memberIds: _selectedMemberIds,
+            add: const [],
+            remove: rolesToRemoveFinal,
+          )
+              : null,
+          style: OutlinedButton.styleFrom(
+            padding: smallPad,
+            minimumSize: smallMin,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            visualDensity: VisualDensity.compact,
+          ),
+        ),
+        Text(
+          '${_selectedMemberIds.length} selected',
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ],
+    );
   }
 
   // Build a chip toggle row for roles
@@ -597,7 +693,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           selected: _rolesToGrant.contains('media'),
           onTap: () => _toggleRoleToGrant('media'),
         ),
-        const SizedBox(width: 16),
+    /*    const SizedBox(width: 16),
         Text('Remove:', style: Theme.of(context).textTheme.labelLarge),
         chip(
           label: 'Pastor',
@@ -616,7 +712,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           selected: _rolesToRemove.contains('media'),
           onTap: () => _toggleRoleToRemove('media'),
           color: Colors.red,
-        ),
+        ),*/
       ],
     );
   }
@@ -669,6 +765,23 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           return !(mins is List) || mins.isEmpty;
         }).toList();
 
+        // 🔸 Compute roles present on selected members (allowed only)
+        final Set<String> rolesPresentOnSelection = <String>{};
+        for (final m in filtered) {
+          final id = (m['_id'] ?? '').toString();
+          if (!_selectedMemberIds.contains(id)) continue;
+          final rolesList = (m['roles'] is List) ? (m['roles'] as List) : const [];
+          for (final r in rolesList) {
+            final rl = r.toString().toLowerCase();
+            if (_allowedRoles.contains(rl)) rolesPresentOnSelection.add(rl);
+          }
+        }
+
+        // If user selected some members who *already* have roles, enable Remove
+        // even when no "Remove" chips are toggled.
+        final bool canRemoveNow = _selectedMemberIds.isNotEmpty &&
+            (_rolesToRemove.isNotEmpty || rolesPresentOnSelection.isNotEmpty);
+
         // Colors like your ViewMembersPage style
         final colors = [
           Colors.teal.shade200,
@@ -708,37 +821,9 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                   const SizedBox(height: 10),
                   _roleChips(),
                   const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      ElevatedButton.icon(
-                        icon: const Icon(Icons.check),
-                        label: const Text('Grant selected'),
-                        onPressed: _rolesToGrant.isEmpty
-                            ? null
-                            : () => _bulkApplyRoles(
-                          memberIds: _selectedMemberIds,
-                          add: _rolesToGrant,
-                          remove: const [],
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.remove_circle_outline),
-                        label: const Text('Remove selected'),
-                        onPressed: _rolesToRemove.isEmpty
-                            ? null
-                            : () => _bulkApplyRoles(
-                          memberIds: _selectedMemberIds,
-                          add: const [],
-                          remove: _rolesToRemove,
-                        ),
-                      ),
-                      const Spacer(),
-                      Text(
-                        '${_selectedMemberIds.length} selected',
-                        style: const TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                    ],
+                  _grantRemoveButtons(
+                    canRemoveNow: canRemoveNow,
+                    inferredRolesToRemove: rolesPresentOnSelection,
                   ),
                 ],
               ),
@@ -843,18 +928,12 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           final name =
           (('$first $last').trim().isEmpty ? fullName : '$first $last')
               .trim();
-          final hasPastor = (m['roles'] is List) &&
-              (m['roles'] as List)
-                  .map((e) => e.toString().toLowerCase())
-                  .contains('pastor');
-          final hasUsher = (m['roles'] is List) &&
-              (m['roles'] as List)
-                  .map((e) => e.toString().toLowerCase())
-                  .contains('usher');
-          final hasMedia = (m['roles'] is List) &&
-              (m['roles'] as List)
-                  .map((e) => e.toString().toLowerCase())
-                  .contains('media');
+          final rolesList =
+          (m['roles'] is List) ? (m['roles'] as List) : const [];
+          final rset = rolesList.map((e) => e.toString().toLowerCase()).toSet();
+          final hasPastor = rset.contains('pastor');
+          final hasUsher = rset.contains('usher');
+          final hasMedia = rset.contains('media');
 
           return ListTile(
             leading: Checkbox(
@@ -890,7 +969,6 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     return Scaffold(
       appBar: AppBar(
         title: const Text('Debug Admin Setter'),
-        // ✅ FIX: attach the TabController here (remove `const` so it can use the field)
         bottom: TabBar(
           controller: _tabController,
           tabs: const [
@@ -921,8 +999,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                         fontWeight: FontWeight.bold, fontSize: 20)),
                 const SizedBox(height: 20),
                 Text("👤 User ID: ${_userId ?? 'Not logged in'}"),
-                Text(
-                    "🆔 Linked Member ID: ${_linkedMemberId ?? 'Not linked'}"),
+                Text("🆔 Linked Member ID: ${_linkedMemberId ?? 'Not linked'}"),
                 if (_linkedMemberName != null) ...[
                   const SizedBox(height: 8),
                   Text("📛 Member Name: $_linkedMemberName"),

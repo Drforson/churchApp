@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'package:church_management_app/models/join_request_model.dart';
+import 'package:church_management_app/models/ministry_model.dart';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
-import '../models/ministry_model.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'ministries_details_page.dart';
 
 class MinistresPage extends StatefulWidget {
@@ -21,12 +22,18 @@ class _MinistresPageState extends State<MinistresPage> {
   String? currentUserEmail;
   List<String> roles = [];
   bool _loading = true;
-  Set<String> pendingJoinRequests = {}; // set of ministry NAMES with pending requests
-  Set<String> myMinistryNames = {};     // current memberships for this member
+
+  Set<String> pendingJoinRequests = {};
+  Set<String> myMinistryNames = {};
   String _searchQuery = '';
 
-  // 🔹 NEW: live watcher for join_requests to keep both tabs in sync
   StreamSubscription<QuerySnapshot>? _pendingWatcherSub;
+
+  bool _callableChecked = false;
+  bool _callableAvailable = false;
+
+  bool get isAdmin => roles.contains('admin');
+  bool get isLeaderRole => roles.contains('leader');
 
   @override
   void initState() {
@@ -37,6 +44,7 @@ class _MinistresPageState extends State<MinistresPage> {
       currentUserEmail = user.email;
       _fetchUserData();
     }
+    _probeCallableAvailability();
   }
 
   @override
@@ -45,10 +53,26 @@ class _MinistresPageState extends State<MinistresPage> {
     super.dispose();
   }
 
+  Future<void> _probeCallableAvailability() async {
+    try {
+      FirebaseFunctions.instanceFor(region: 'europe-west2')
+          .httpsCallable('requestCreateMinistry');
+      setState(() {
+        _callableChecked = true;
+        _callableAvailable = true;
+      });
+    } catch (_) {
+      setState(() {
+        _callableChecked = true;
+        _callableAvailable = false;
+      });
+    }
+  }
+
   Future<void> _fetchUserData() async {
     if (currentUserId == null) return;
-
     final db = FirebaseFirestore.instance;
+
     final userDoc = await db.collection('users').doc(currentUserId).get();
     if (!userDoc.exists) {
       setState(() {
@@ -69,7 +93,6 @@ class _MinistresPageState extends State<MinistresPage> {
     Set<String> currentMins = {};
 
     if (linkedMemberId != null && linkedMemberId.isNotEmpty) {
-      // current memberships
       final memSnap = await db.collection('members').doc(linkedMemberId).get();
       if (memSnap.exists) {
         currentMins = (List<String>.from(
@@ -77,7 +100,6 @@ class _MinistresPageState extends State<MinistresPage> {
             .toSet();
       }
 
-      // pending requests
       final jrSnap = await db
           .collection('join_requests')
           .where('memberId', isEqualTo: linkedMemberId)
@@ -96,11 +118,9 @@ class _MinistresPageState extends State<MinistresPage> {
       _loading = false;
     });
 
-    // 🔹 Bind live watcher AFTER memberId is known
     _bindPendingRequestsWatcher();
   }
 
-  // 🔹 NEW: live watcher to keep pendingJoinRequests up-to-date everywhere
   void _bindPendingRequestsWatcher() {
     _pendingWatcherSub?.cancel();
     if (memberId == null || memberId!.isEmpty) return;
@@ -110,7 +130,6 @@ class _MinistresPageState extends State<MinistresPage> {
         .where('memberId', isEqualTo: memberId);
 
     _pendingWatcherSub = q.snapshots().listen((snap) {
-      // Rebuild the set from current snapshot: only PENDING remain
       final next = <String>{};
       for (final d in snap.docs) {
         final data = d.data() as Map<String, dynamic>;
@@ -121,15 +140,13 @@ class _MinistresPageState extends State<MinistresPage> {
       }
       if (mounted) {
         setState(() {
-          pendingJoinRequests = next; // ⟵ updates Join buttons instantly
+          pendingJoinRequests = next;
         });
       }
     }, onError: (e) {
       debugPrint('pending watcher error: $e');
     });
   }
-
-  bool get isAdmin => roles.contains('admin');
 
   bool _isLeaderOfMinistry(MinistryModel ministry) {
     return ministry.leaderIds.contains(currentUserId);
@@ -146,12 +163,13 @@ class _MinistresPageState extends State<MinistresPage> {
   Future<void> _sendJoinRequest(String ministryName) async {
     if (memberId == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Link your profile to a member record before joining.')),
+        const SnackBar(
+            content:
+            Text('Link your profile to a member record before joining.')),
       );
       return;
     }
 
-    // Guard: already member?
     if (myMinistryNames.contains(ministryName)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('You are already a member of this ministry.')),
@@ -159,10 +177,9 @@ class _MinistresPageState extends State<MinistresPage> {
       return;
     }
 
-    // Guard: already pending?
     if (pendingJoinRequests.contains(ministryName)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('You already have a pending request for this ministry.')),
+        const SnackBar(content: Text('You already have a pending request.')),
       );
       return;
     }
@@ -170,11 +187,10 @@ class _MinistresPageState extends State<MinistresPage> {
     try {
       final db = FirebaseFirestore.instance;
 
-      // Double-check on server
       final dup = await db
           .collection('join_requests')
           .where('memberId', isEqualTo: memberId)
-          .where('ministryId', isEqualTo: ministryName) // ⚠️ ministry NAME
+          .where('ministryId', isEqualTo: ministryName)
           .where('status', isEqualTo: 'pending')
           .limit(1)
           .get();
@@ -190,16 +206,14 @@ class _MinistresPageState extends State<MinistresPage> {
       await ref.set({
         'id': ref.id,
         'memberId': memberId,
-        'ministryId': ministryName,           // ⚠️ NAME used by rules/listeners
+        'ministryId': ministryName,
         'status': 'pending',
         'requestedAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
-        // helpful extras
         'requestedByUid': currentUserId,
         'requestedByEmail': currentUserEmail,
       });
 
-      // Optimistic UI; watcher will confirm/update as well
       setState(() => pendingJoinRequests.add(ministryName));
 
       ScaffoldMessenger.of(context).showSnackBar(
@@ -238,7 +252,6 @@ class _MinistresPageState extends State<MinistresPage> {
 
       await db.collection('join_requests').doc(query.docs.first.id).delete();
 
-      // Optimistic update; watcher will sync state even if something else changes
       setState(() => pendingJoinRequests.remove(ministryName));
 
       ScaffoldMessenger.of(context).showSnackBar(
@@ -251,15 +264,168 @@ class _MinistresPageState extends State<MinistresPage> {
     }
   }
 
-  Widget _buildMinistryLists(List<MinistryModel> myMinistries, List<MinistryModel> otherMinistries) {
+  // ======== LEADER: Request new ministry ========
+
+  void _openCreateMinistryDialog() {
+    final nameCtrl = TextEditingController();
+    final descCtrl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        bool submitting = false;
+        return StatefulBuilder(
+          builder: (context, setS) => AlertDialog(
+            title: const Text('Request New Ministry'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(labelText: 'Ministry name'),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: descCtrl,
+                  maxLines: 3,
+                  decoration:
+                  const InputDecoration(labelText: 'Description (optional)'),
+                ),
+                const SizedBox(height: 8),
+                if (_callableChecked && !_callableAvailable)
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Backend callable not detected; will create a pending request document.',
+                      style: TextStyle(fontSize: 12, color: Colors.orange),
+                    ),
+                  ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: submitting ? null : () => Navigator.of(context).pop(),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: submitting
+                    ? null
+                    : () async {
+                  final name = nameCtrl.text.trim();
+                  final desc = descCtrl.text.trim();
+                  if (name.isEmpty) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Please enter a name.')),
+                    );
+                    return;
+                  }
+                  setS(() => submitting = true);
+                  try {
+                    await _submitCreateMinistryRequest(
+                      name: name,
+                      description: desc,
+                    );
+                    if (mounted) {
+                      Navigator.of(context).pop();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'Request sent to pastor for approval.',
+                          ),
+                        ),
+                      );
+                    }
+                  } catch (e) {
+                    setS(() => submitting = false);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Failed: $e')),
+                    );
+                  }
+                },
+                child: const Text('Send Request'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _submitCreateMinistryRequest({
+    required String name,
+    required String description,
+  }) async {
+    final db = FirebaseFirestore.instance;
+
+    // Try callable first
+    try {
+      final fn = FirebaseFunctions.instanceFor(region: 'europe-west2')
+          .httpsCallable('requestCreateMinistry');
+      await fn.call({
+        'name': name,
+        'description': description,
+        'requestedByUid': currentUserId,
+        'requestedByMemberId': memberId,
+      });
+      return;
+    } catch (e) {
+      debugPrint('requestCreateMinistry callable failed; fallback. $e');
+      setState(() => _callableAvailable = false);
+    }
+
+    // Fallback to Firestore doc
+    final reqRef = db.collection('ministry_creation_requests').doc();
+    await reqRef.set({
+      'id': reqRef.id,
+      'name': name,
+      'description': description,
+      'status': 'pending', // pending|approved|declined
+      'requestedAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+      'requestedByUid': currentUserId,
+      'requestedByMemberId': memberId,
+      'requesterEmail': currentUserEmail,
+    });
+
+    // Optional: write a generic notification for pastors (your NotificationBell can read)
+    await db.collection('notifications').add({
+      'type': 'ministry_request',
+      'title': 'New ministry creation request',
+      'body': '$name submitted for approval',
+      'createdAt': FieldValue.serverTimestamp(),
+      'read': false,
+      'toRole': 'pastor', // your bell can filter by role OR specific pastor UIDs
+      'fromUid': currentUserId,
+    });
+  }
+
+  // ======= RENDERING =======
+
+  Widget _buildMinistryLists(
+      List<MinistryModel> myMinistries,
+      List<MinistryModel> otherMinistries, {
+        List<_PendingMinistryCardData> pendingGhosts = const [],
+      }) {
+    final existingNames = {
+      ...myMinistries.map((m) => m.name),
+      ...otherMinistries.map((m) => m.name),
+    };
+
+    final ghostCards = pendingGhosts.where((g) => !existingNames.contains(g.name)).toList();
+
     return ListView(
       children: [
         if (myMinistries.isNotEmpty) ...[
           _sectionHeader('My Ministries', myMinistries.length, Colors.blue),
           ...myMinistries.map((m) => _buildMinistryCard(m, true)),
         ],
-        _sectionHeader('Other Ministries', otherMinistries.length, Colors.green),
+        _sectionHeader(
+          'Other Ministries',
+          otherMinistries.length + ghostCards.length,
+          Colors.green,
+        ),
         ...otherMinistries.map((m) => _buildMinistryCard(m, false)),
+        ...ghostCards.map(_buildPendingGhostCard),
       ],
     );
   }
@@ -281,9 +447,15 @@ class _MinistresPageState extends State<MinistresPage> {
     final isLeader = _isLeaderOfMinistry(ministry);
     final hasPendingRequest = pendingJoinRequests.contains(ministry.name);
     final alreadyMember = myMinistryNames.contains(ministry.name);
-    final bool hasAccess = isMember || isAdmin;
 
-    final canJoin = !isAdmin && !alreadyMember && !hasPendingRequest && memberId != null;
+    final approved = ministry.approved;
+    final bool hasAccess = (isMember || isAdmin) && approved;
+
+    final canJoin = !isAdmin &&
+        !alreadyMember &&
+        !hasPendingRequest &&
+        memberId != null &&
+        approved;
 
     return FutureBuilder<int>(
       future: _getMemberCount(ministry.name),
@@ -316,10 +488,12 @@ class _MinistresPageState extends State<MinistresPage> {
                           ),
                         ),
                         const SizedBox(width: 8),
-                        if (!hasAccess)
+                        if (!approved)
+                          const Icon(Icons.lock_outline, size: 20, color: Colors.orange)
+                        else if (!hasAccess)
                           const Icon(Icons.lock_outline, size: 20, color: Colors.grey)
                         else if (isAdmin && !isMember)
-                          const Icon(Icons.lock_open, size: 20, color: Colors.green),
+                            const Icon(Icons.lock_open, size: 20, color: Colors.green),
                       ],
                     ),
                   ),
@@ -344,11 +518,15 @@ class _MinistresPageState extends State<MinistresPage> {
               subtitle: Padding(
                 padding: const EdgeInsets.only(top: 8.0),
                 child: Text(
-                  '${ministry.description}\nMembers: $memberCount',
+                  approved
+                      ? '${ministry.description}\nMembers: $memberCount'
+                      : 'Pending pastor approval\n${ministry.description.isNotEmpty ? ministry.description : ''}',
                   style: TextStyle(height: 1.5, color: hasAccess ? Colors.black54 : Colors.grey),
                 ),
               ),
-              trailing: isAdmin
+              trailing: !approved
+                  ? const Text('Pending', style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold))
+                  : isAdmin
                   ? null
                   : alreadyMember
                   ? const Text('Member', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold))
@@ -359,14 +537,12 @@ class _MinistresPageState extends State<MinistresPage> {
               )
                   : ElevatedButton(
                 onPressed: canJoin ? () => _sendJoinRequest(ministry.name) : null,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: canJoin ? null : Colors.grey,
-                ),
+                style: ElevatedButton.styleFrom(backgroundColor: canJoin ? null : Colors.grey),
                 child: const Text('Join'),
               ),
               isThreeLine: true,
               onTap: () {
-                if (hasAccess) {
+                if (approved && hasAccess) {
                   Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -376,18 +552,20 @@ class _MinistresPageState extends State<MinistresPage> {
                       ),
                     ),
                   );
+                } else if (!approved) {
+                  showDialog(
+                    context: context,
+                    builder: (context) => const AlertDialog(
+                      title: Text('Not yet available'),
+                      content: Text('This ministry is awaiting pastor approval.'),
+                    ),
+                  );
                 } else {
                   showDialog(
                     context: context,
-                    builder: (context) => AlertDialog(
-                      title: const Text('Access Denied'),
-                      content: const Text('You must be a member or admin to view details.'),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Navigator.of(context).pop(),
-                          child: const Text('OK'),
-                        ),
-                      ],
+                    builder: (context) => const AlertDialog(
+                      title: Text('Access Denied'),
+                      content: Text('You must be a member or admin to view details.'),
                     ),
                   );
                 }
@@ -399,7 +577,41 @@ class _MinistresPageState extends State<MinistresPage> {
     );
   }
 
-  // -------------------- JOIN REQUESTS TAB --------------------
+  Widget _buildPendingGhostCard(_PendingMinistryCardData g) {
+    return Opacity(
+      opacity: 0.85,
+      child: Card(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        elevation: 3,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+        child: ListTile(
+          contentPadding: const EdgeInsets.all(16),
+          title: Row(
+            children: const [
+              Expanded(
+                child: Text(
+                  'Pending ministry (awaiting approval)',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+              Icon(Icons.lock_outline, size: 20, color: Colors.orange),
+            ],
+          ),
+          subtitle: Text('${g.name}\n${g.description ?? ''}'.trim()),
+          trailing: const Text('Pending', style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
+          onTap: () {
+            showDialog(
+              context: context,
+              builder: (context) => const AlertDialog(
+                title: Text('Not yet available'),
+                content: Text('This ministry will be accessible after pastor approval.'),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
 
   Widget _buildMyJoinRequestsTab() {
     if (memberId == null) {
@@ -471,8 +683,6 @@ class _MinistresPageState extends State<MinistresPage> {
     );
   }
 
-  // -------------------- BUILD --------------------
-
   @override
   Widget build(BuildContext context) {
     if (_loading) {
@@ -495,18 +705,16 @@ class _MinistresPageState extends State<MinistresPage> {
           ),
           actions: [
             const NotificationBell(),
-            if (isAdmin)
+            if (isLeaderRole)
               IconButton(
                 icon: const Icon(Icons.add),
-                onPressed: () {
-                  // TODO: open create ministry flow
-                },
+                tooltip: 'Request new ministry',
+                onPressed: _openCreateMinistryDialog,
               ),
           ],
         ),
         body: TabBarView(
           children: [
-            // TAB 1: Ministries
             Column(
               children: [
                 Padding(
@@ -530,42 +738,75 @@ class _MinistresPageState extends State<MinistresPage> {
                   child: StreamBuilder<QuerySnapshot>(
                     stream: FirebaseFirestore.instance.collection('ministries').snapshots(),
                     builder: (context, snapshot) {
-                      if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+                      if (!snapshot.hasData) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
 
-                      final allMinistries = snapshot.data!.docs.map((doc) {
+                      final approvedMinistries = snapshot.data!.docs.map((doc) {
                         final data = doc.data() as Map<String, dynamic>;
+                        final approved = (data['approved'] as bool?) ?? true;
                         return MinistryModel(
                           id: doc.id,
                           name: data['name'] ?? 'Unnamed Ministry',
                           description: data['description'] ?? '',
                           leaderIds: List<String>.from(data['leaderIds'] ?? []),
                           createdBy: data['createdBy'] ?? '',
+                          approved: approved,
                         );
-                      }).where((m) => m.name.toLowerCase().contains(_searchQuery)).toList();
+                      })
+                          .where((m) => m.name.toLowerCase().contains(_searchQuery))
+                          .toList();
 
-                      // Admin sees all, not segregated into "my"
-                      if (isAdmin || memberId == null) {
-                        final myMinistries = <MinistryModel>[];
-                        final otherMinistries = allMinistries;
-                        return _buildMinistryLists(myMinistries, otherMinistries);
+                      Widget buildApproved(List<_PendingMinistryCardData> pendingGhosts) {
+                        if (isAdmin || memberId == null) {
+                          final myMins = <MinistryModel>[];
+                          final others = approvedMinistries;
+                          return _buildMinistryLists(myMins, others, pendingGhosts: pendingGhosts);
+                        }
+
+                        return StreamBuilder<DocumentSnapshot>(
+                          stream: FirebaseFirestore.instance.collection('members').doc(memberId).snapshots(),
+                          builder: (context, memberSnapshot) {
+                            if (!memberSnapshot.hasData) {
+                              return const Center(child: CircularProgressIndicator());
+                            }
+
+                            final memberData = memberSnapshot.data!.data() as Map<String, dynamic>? ?? {};
+                            final userMinistries = List<String>.from(memberData['ministries'] ?? []);
+                            myMinistryNames = userMinistries.toSet();
+
+                            final myMins = approvedMinistries.where((m) => userMinistries.contains(m.name)).toList();
+                            final others = approvedMinistries.where((m) => !userMinistries.contains(m.name)).toList();
+
+                            return _buildMinistryLists(myMins, others, pendingGhosts: pendingGhosts);
+                          },
+                        );
                       }
 
-                      // Non-admin: split by membership names (reactive)
-                      return StreamBuilder<DocumentSnapshot>(
-                        stream: FirebaseFirestore.instance.collection('members').doc(memberId).snapshots(),
-                        builder: (context, memberSnapshot) {
-                          if (!memberSnapshot.hasData) return const Center(child: CircularProgressIndicator());
-
-                          final memberData = memberSnapshot.data!.data() as Map<String, dynamic>? ?? {};
-                          final userMinistries = List<String>.from(memberData['ministries'] ?? []);
-
-                          // Keep local cache updated so Join button state is correct
-                          myMinistryNames = userMinistries.toSet();
-
-                          final myMinistries = allMinistries.where((m) => userMinistries.contains(m.name)).toList();
-                          final otherMinistries = allMinistries.where((m) => !userMinistries.contains(m.name)).toList();
-
-                          return _buildMinistryLists(myMinistries, otherMinistries);
+                      return StreamBuilder<QuerySnapshot>(
+                        stream: FirebaseFirestore.instance
+                            .collection('ministry_creation_requests')
+                            .where('status', isEqualTo: 'pending')
+                            .snapshots(),
+                        builder: (context, reqSnap) {
+                          final pendingGhosts = <_PendingMinistryCardData>[];
+                          if (reqSnap.hasData) {
+                            for (final d in reqSnap.data!.docs) {
+                              final data = d.data() as Map<String, dynamic>;
+                              final n = (data['name'] ?? '').toString();
+                              if (n.toLowerCase().contains(_searchQuery)) {
+                                pendingGhosts.add(
+                                  _PendingMinistryCardData(
+                                    id: d.id,
+                                    name: n,
+                                    description: (data['description'] ?? '').toString(),
+                                    requestedByUid: (data['requestedByUid'] ?? '').toString(),
+                                  ),
+                                );
+                              }
+                            }
+                          }
+                          return buildApproved(pendingGhosts);
                         },
                       );
                     },
@@ -573,11 +814,23 @@ class _MinistresPageState extends State<MinistresPage> {
                 ),
               ],
             ),
-            // TAB 2: My Join Requests
             _buildMyJoinRequestsTab(),
           ],
         ),
       ),
     );
   }
+}
+
+class _PendingMinistryCardData {
+  final String id;
+  final String name;
+  final String? description;
+  final String? requestedByUid;
+  const _PendingMinistryCardData({
+    required this.id,
+    required this.name,
+    this.description,
+    this.requestedByUid,
+  });
 }

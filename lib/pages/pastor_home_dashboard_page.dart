@@ -6,6 +6,9 @@ import 'package:flutter/services.dart';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:intl/intl.dart';
 
+// ⬇️ NEW: import the approvals page
+import 'pastor_ministry_approvals_page.dart';
+
 class PastorHomeDashboardPage extends StatefulWidget {
   const PastorHomeDashboardPage({super.key});
 
@@ -71,24 +74,20 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
     return Scaffold(
       extendBodyBehindAppBar: true,
       appBar: AppBar(
-    title: const Text('Pastor Dashboard'),
-    backgroundColor: Colors.teal.shade600,             // same tone as Admin
-    foregroundColor: const Color(0xFF111827),
-    elevation: 0,
-    centerTitle: true,
-    scrolledUnderElevation: 0,
-    systemOverlayStyle: SystemUiOverlayStyle.dark,      // dark status bar icons
-    actions: [
-    IconButton(
-    tooltip: 'Logout',
-    onPressed: _logout,
-    icon: const Icon(Icons.logout),
-    ),
-    NotificationBell(),
-    ],
-    ),
-
-    body: Container(
+        title: const Text('Pastor Dashboard'),
+        backgroundColor: Colors.teal.shade600,             // same tone as Admin
+        foregroundColor: const Color(0xFF111827),
+        elevation: 0,
+        centerTitle: true,
+        scrolledUnderElevation: 0,
+        systemOverlayStyle: SystemUiOverlayStyle.dark,      // dark status bar icons
+        actions: const [
+          // If you prefer: move logout to a menu to avoid accidental taps
+          // IconButton(tooltip: 'Logout', onPressed: _logout, icon: Icon(Icons.logout)),
+          NotificationBell(),
+        ],
+      ),
+      body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             colors: [Color(0xFFF7F8FA), Color(0xFFEEF1F5)],
@@ -110,12 +109,19 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
                 const SizedBox(height: 18),
                 const _PastorSectionTitle('Quick Actions'),
                 const SizedBox(height: 8),
-                const _PastorActionsGrid(),
+                // ⬇️ Grid includes a button that opens the approvals page
+                _PastorActionsGrid(),
                 const SizedBox(height: 8),
               ],
             ),
           ),
         ),
+      ),
+      // Optional: moved logout to a FAB for clarity
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _logout,
+        icon: const Icon(Icons.logout),
+        label: const Text('Logout'),
       ),
     );
   }
@@ -269,7 +275,6 @@ class _PastorStatTile extends StatelessWidget {
       case _PastorStatQuery.ministries:
         return db.collection('ministries').limit(500).snapshots().map((s) => s.size);
       case _PastorStatQuery.upcomingEvents:
-      // Matches Admin: uses 'startDate'
         return db
             .collection('events')
             .where('startDate', isGreaterThanOrEqualTo: Timestamp.now())
@@ -514,7 +519,7 @@ class _PastorNoticeCard extends StatelessWidget {
   }
 }
 
-/* -------------------- Actions (exact set you requested) -------------------- */
+/* -------------------- Actions (with Approvals quick button) -------------------- */
 
 class _PastorSectionTitle extends StatelessWidget {
   final String text;
@@ -524,8 +529,9 @@ class _PastorSectionTitle extends StatelessWidget {
   Widget build(BuildContext context) {
     return Text(
       text,
-      style:
-      Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+        fontWeight: FontWeight.w700,
+      ),
     );
   }
 }
@@ -536,13 +542,22 @@ class _PastorActionsGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = <_PastorActionItem>[
+      // ✅ NEW quick button: open the approvals page directly
+      _PastorActionItem(
+        'Ministry Approvals',
+        Icons.verified_rounded,
+        null,
+        onTap: (ctx) => Navigator.push(
+          ctx,
+          MaterialPageRoute(builder: (_) => const PastorMinistryApprovalsPage()),
+        ),
+      ),
+
       _PastorActionItem('Sunday Follow-Up', Icons.calendar_month_rounded, '/follow-up'),
       _PastorActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _PastorActionItem('Ministry', Icons.church_rounded, '/view-ministry'),
-      // NEW:
       _PastorActionItem('Prayer Requests', Icons.volunteer_activism_rounded, '/manage-prayer-requests'),
       _PastorActionItem('Baptism', Icons.water_drop_rounded, '/manage-baptism'),
-
       _PastorActionItem('Profile', Icons.person_rounded, '/profile'),
       _PastorActionItem('Post Announcement', Icons.campaign_rounded, '/post-announcements'),
     ];
@@ -572,8 +587,9 @@ class _PastorActionsGrid extends StatelessWidget {
 class _PastorActionItem {
   final String label;
   final IconData icon;
-  final String route;
-  _PastorActionItem(this.label, this.icon, this.route);
+  final String? route;
+  final void Function(BuildContext)? onTap;
+  const _PastorActionItem(this.label, this.icon, this.route, {this.onTap});
 }
 
 class _PastorActionCard extends StatelessWidget {
@@ -583,7 +599,13 @@ class _PastorActionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return InkWell(
-      onTap: () => Navigator.pushNamed(context, item.route),
+      onTap: () {
+        if (item.onTap != null) {
+          item.onTap!(context);
+        } else if (item.route != null) {
+          Navigator.pushNamed(context, item.route!);
+        }
+      },
       borderRadius: BorderRadius.circular(16),
       child: Ink(
         decoration: BoxDecoration(

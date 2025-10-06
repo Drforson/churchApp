@@ -26,7 +26,7 @@ initializeApp();
 const db = getFirestore();
 
 // ----------------------------------------
-// Helpers
+// Helpers (existing + new)
 // ----------------------------------------
 const s = (v) => (typeof v === "string" ? v : "");
 const inboxEventRef = (uid) => db.collection("inbox").doc(uid).collection("events").doc();
@@ -44,11 +44,34 @@ const requireAuth = (request) => {
   return auth;
 };
 
-const requireAdmin = async (uid) => {
+const getUserRoles = async (uid) => {
   const snap = await db.collection("users").doc(uid).get();
   const roles = snap.data()?.roles ?? [];
-  if (!Array.isArray(roles) || !roles.map(String).map((r)=>r.toLowerCase()).includes("admin")) {
+  return Array.isArray(roles) ? roles.map((r) => String(r).toLowerCase()) : [];
+};
+
+const hasRole = (roles, role) => Array.isArray(roles) && roles.includes(String(role).toLowerCase());
+
+const requireAdmin = async (uid) => {
+  const roles = await getUserRoles(uid);
+  if (!hasRole(roles, "admin")) {
     throw HttpsError("permission-denied", "Admin role required.");
+  }
+  return true;
+};
+
+const requireLeaderOrAdmin = async (uid) => {
+  const roles = await getUserRoles(uid);
+  if (!hasRole(roles, "leader") && !hasRole(roles, "admin")) {
+    throw HttpsError("permission-denied", "Leader or admin role required.");
+  }
+  return true;
+};
+
+const requirePastorOrAdmin = async (uid) => {
+  const roles = await getUserRoles(uid);
+  if (!hasRole(roles, "pastor") && !hasRole(roles, "admin")) {
+    throw HttpsError("permission-denied", "Pastor or admin role required.");
   }
   return true;
 };
@@ -111,6 +134,16 @@ const computeFullNameLower = (mData = {}) => {
     `${s(mData.firstName)} ${s(mData.lastName)}`.trim();
   return full.trim().toLowerCase();
 };
+
+// NEW: simple notification writer
+async function writeNotification(payload) {
+  // payload: { toUid?, toRole?, title, body, type }
+  await db.collection("notifications").add({
+    ...payload,
+    createdAt: FieldValue.serverTimestamp(),
+    read: false,
+  });
+}
 
 // ----------------------------------------
 // Canary callable
@@ -298,11 +331,6 @@ exports.setMemberPastorRole = onCall(async (request) => {
 
 // --------------------------------------------------
 // ✅ UPDATED: setMemberRoles (admin-only, bulk grant/remove)
-//  - normalizes roles (lowercase, dedupe)
-//  - mirrors to linked users
-//  - sets isPastor/isUsher/isMedia booleans for easy UI filters
-//  - ensures fullNameLower exists (sorting in lists)
-//  - uses tx.get for all reads inside transaction
 // --------------------------------------------------
 exports.setMemberRoles = onCall(async (request) => {
   const auth = requireAuth(request);
@@ -401,4 +429,158 @@ exports.setMemberRoles = onCall(async (request) => {
   }
 
   return { ok: true, updated, memberIds };
+});
+
+/* =========================================================================
+   NEW: Ministry Creation Approval Flow (v2 onCall)
+   ========================================================================= */
+
+// Leaders/Admins submit a request for a new ministry
+exports.requestCreateMinistry = onCall(async (request) => {
+  const auth = requireAuth(request);
+  const uid = auth.uid;
+
+  await requireLeaderOrAdmin(uid);
+
+  const nameRaw = s(request.data?.name).trim();
+  const description = s(request.data?.description);
+  const requestedByUid = s(request.data?.requestedByUid) || uid;
+  const requestedByMemberId = s(request.data?.requestedByMemberId);
+
+  if (!nameRaw) {
+    throw HttpsError("invalid-argument", "name is required.");
+  }
+
+  // Prevent duplicate pending requests with same name
+  const dup = await db.collection("ministry_creation_requests")
+    .where("name", "==", nameRaw)
+    .where("status", "==", "pending")
+    .limit(1).get();
+
+  if (!dup.empty) {
+    return { ok: true, info: "Already pending." };
+  }
+
+  const reqRef = db.collection("ministry_creation_requests").doc();
+
+  await reqRef.set({
+    id: reqRef.id,
+    name: nameRaw,
+    description,
+    status: "pending", // pending | approved | declined
+    requestedAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+    requestedByUid,
+    requestedByMemberId: requestedByMemberId || null,
+    requesterEmail: auth.token?.email || null,
+  });
+
+  // Notify pastors
+  await writeNotification({
+    toRole: "pastor",
+    type: "ministry_request",
+    title: "New ministry creation request",
+    body: `${nameRaw} submitted for approval`,
+  });
+
+  return { ok: true, id: reqRef.id };
+});
+
+// Pastors/Admins approve a request → create ministry + notify requester
+exports.approveMinistryCreation = onCall(async (request) => {
+  const auth = requireAuth(request);
+  const uid = auth.uid;
+
+  await requirePastorOrAdmin(uid);
+
+  const requestId = s(request.data?.requestId);
+  if (!requestId) throw HttpsError("invalid-argument", "requestId required.");
+
+  const reqRef = db.collection("ministry_creation_requests").doc(requestId);
+  const reqSnap = await reqRef.get();
+  if (!reqSnap.exists) throw HttpsError("not-found", "Request not found.");
+
+  const r = reqSnap.data();
+  if (r.status !== "pending") {
+    return { ok: true, info: "Already processed." };
+  }
+
+  const name = s(r.name);
+  const description = s(r.description);
+  const requesterUid = s(r.requestedByUid);
+
+  await db.runTransaction(async (tx) => {
+    // Create new ministry doc
+    const minRef = db.collection("ministries").doc();
+    tx.set(minRef, {
+      name,
+      description,
+      leaderIds: requesterUid ? [requesterUid] : [],
+      createdBy: requesterUid || uid,
+      approved: true,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Mark request approved
+    tx.update(reqRef, {
+      status: "approved",
+      approvedMinistryId: minRef.id,
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    // Notify requester
+    if (requesterUid) {
+      const nRef = db.collection("notifications").doc();
+      tx.set(nRef, {
+        toUid: requesterUid,
+        type: "ministry_request_result",
+        title: "Ministry approved",
+        body: `${name} has been approved.`,
+        createdAt: FieldValue.serverTimestamp(),
+        read: false,
+      });
+    }
+  });
+
+  return { ok: true, requestId };
+});
+
+// Pastors/Admins decline a request → mark declined + notify requester
+exports.declineMinistryCreation = onCall(async (request) => {
+  const auth = requireAuth(request);
+  const uid = auth.uid;
+
+  await requirePastorOrAdmin(uid);
+
+  const requestId = s(request.data?.requestId);
+  const reason = s(request.data?.reason); // optional
+  if (!requestId) throw HttpsError("invalid-argument", "requestId required.");
+
+  const reqRef = db.collection("ministry_creation_requests").doc(requestId);
+  const reqSnap = await reqRef.get();
+  if (!reqSnap.exists) throw HttpsError("not-found", "Request not found.");
+
+  const r = reqSnap.data();
+  if (r.status !== "pending") {
+    return { ok: true, info: "Already processed." };
+  }
+
+  await reqRef.update({
+    status: "declined",
+    declineReason: reason || null,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  const requesterUid = s(r.requestedByUid);
+  if (requesterUid) {
+    await writeNotification({
+      toUid: requesterUid,
+      type: "ministry_request_result",
+      title: "Ministry declined",
+      body: reason ? `${r.name} was declined: ${reason}` : `${r.name} was declined.`,
+    });
+  }
+
+  return { ok: true, requestId };
 });

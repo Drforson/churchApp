@@ -1,12 +1,13 @@
 import 'package:church_management_app/services/notification_center.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
 
-// ✅ Push notifications
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
@@ -37,11 +38,11 @@ import 'pages/debadmintestpage.dart';
 import 'pages/profilepage.dart';
 import 'pages/successpage.dart';
 
-// ✅ Role-specific dashboards
+// Role-specific dashboards
 import 'pages/pastor_home_dashboard_page.dart';
 import 'pages/usher_home_dashboard_page.dart';
 
-// ✅ Dedicated form pages
+// Dedicated form pages
 import 'pages/prayer_request_form_page.dart';
 import 'pages/baptism_interest_form_page.dart';
 
@@ -50,7 +51,7 @@ import 'services/theme_provider.dart';
 import 'firebase_options.dart';
 
 // ---------------------------------------------------------------------------
-// 🔔 Notification wiring (FCM + foreground banners)
+// Notifications wiring
 // ---------------------------------------------------------------------------
 
 final FlutterLocalNotificationsPlugin _fln = FlutterLocalNotificationsPlugin();
@@ -66,11 +67,9 @@ const AndroidNotificationChannel _androidChannel = AndroidNotificationChannel(
   importance: Importance.high,
 );
 
-// Runs in its own isolate on background push
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  // Handle background data if needed.
 }
 
 Future<void> _initLocalNotifications() async {
@@ -90,25 +89,16 @@ Future<void> _initLocalNotifications() async {
 }
 
 Future<void> _initMessaging() async {
-  // Background handler
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
-  // Ask permissions (iOS + Android 13+)
   await FirebaseMessaging.instance.requestPermission(
-    alert: true,
-    badge: true,
-    sound: true,
-    provisional: false,
+    alert: true, badge: true, sound: true, provisional: false,
   );
 
-  // Foreground presentation (iOS)
   await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
-    alert: true,
-    badge: true,
-    sound: true,
+    alert: true, badge: true, sound: true,
   );
 
-  // Foreground notifications → local banner
   FirebaseMessaging.onMessage.listen((RemoteMessage m) {
     final n = m.notification;
     _fln.show(
@@ -117,11 +107,9 @@ Future<void> _initMessaging() async {
       n?.body ?? '',
       const NotificationDetails(
         android: AndroidNotificationDetails(
-          _androidChannelId,
-          _androidChannelName,
+          _androidChannelId, _androidChannelName,
           channelDescription: _androidChannelDescription,
-          importance: Importance.high,
-          priority: Priority.high,
+          importance: Importance.high, priority: Priority.high,
         ),
         iOS: DarwinNotificationDetails(),
       ),
@@ -132,16 +120,42 @@ Future<void> _initMessaging() async {
 
 // ---------------------------------------------------------------------------
 
+Future<void> _activateAppCheckDebug() async {
+  // Activate DEBUG providers for dev builds
+  await FirebaseAppCheck.instance.activate(
+    androidProvider: AndroidProvider.debug,
+    appleProvider: AppleProvider.debug,
+    webProvider: null,
+  );
+
+  // Helpful logs: force a token fetch (will still 403 if not registered,
+  // but helps confirm timing). The actual *debug device token* appears in
+  // Logcat/Xcode as: "App Check debug token: <TOKEN>"
+  try {
+    final t = await FirebaseAppCheck.instance.getToken(true);
+    debugPrint('[AppCheck] Got App Check token (len=${t?.length ?? 0}). '
+        'If you still see 403, add your *debug device token* from logs to '
+        'Firebase Console → App Check → Debug devices.');
+  } catch (e) {
+    debugPrint('[AppCheck] getToken error (expected until debug device is registered): $e');
+  }
+
+  await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
-  // Set Auth language
+  // 🔐 App Check — enable DEBUG providers for Android & Apple
+  await _activateAppCheckDebug();
+
+  // Auth language
   try {
     await FirebaseAuth.instance.setLanguageCode('en-GB');
   } catch (_) {}
 
-  // 🔑 Stripe (replace with your real key)
+  // Stripe
   Stripe.publishableKey = 'pk_test_your_publishable_key';
 
   // Notifications
@@ -151,18 +165,18 @@ Future<void> main() async {
 
   runApp(
     MultiProvider(
-      providers: [
-        ChangeNotifierProvider(create: (_) => ThemeProvider()),
-      ],
+      providers: [ChangeNotifierProvider(create: (_) => ThemeProvider())],
       child: const RoleLoader(),
     ),
   );
 }
 
-// 🌟 RoleLoader => Loads user role theme first, then starts app (routing below)
+// ---------------------------------------------------------------------------
+// RoleLoader / RoleGate
+// ---------------------------------------------------------------------------
+
 class RoleLoader extends StatefulWidget {
   const RoleLoader({super.key});
-
   @override
   State<RoleLoader> createState() => _RoleLoaderState();
 }
@@ -184,11 +198,8 @@ class _RoleLoaderState extends State<RoleLoader> {
     final doc = await _db.collection('users').doc(user.uid).get();
     final data = doc.data() ?? {};
     final rolesRaw = List<String>.from(data['roles'] ?? const <String>[]);
-
-    // 🔡 normalize to lowercase
     final roles = rolesRaw.map((e) => e.toLowerCase()).toList();
 
-    // 👇 precedence: admin > pastor > leader > usher > member
     String effectiveRole = 'member';
     if (roles.contains('admin')) {
       effectiveRole = 'admin';
@@ -200,7 +211,6 @@ class _RoleLoaderState extends State<RoleLoader> {
       effectiveRole = 'usher';
     }
 
-    // Allow runtime leader/usher/pastor via member doc
     final memberId = data['memberId'] as String?;
     if (memberId != null && effectiveRole == 'member') {
       final mem = await _db.collection('members').doc(memberId).get();
@@ -209,7 +219,6 @@ class _RoleLoaderState extends State<RoleLoader> {
           .map((e) => e.toString().toLowerCase())
           .toSet();
       final ms = List<String>.from(mData['leadershipMinistries'] ?? const <String>[]);
-
       if (mRoles.contains('admin')) {
         effectiveRole = 'admin';
       } else if (mRoles.contains('pastor') || (mData['isPastor'] == true)) {
@@ -241,10 +250,8 @@ class _RoleLoaderState extends State<RoleLoader> {
   }
 }
 
-// ✅ Gate to decide initial page after login (admin / pastor / leader / usher / member)
 class RoleGate extends StatefulWidget {
   const RoleGate({super.key});
-
   @override
   State<RoleGate> createState() => _RoleGateState();
 }
@@ -293,44 +300,23 @@ class _RoleGateState extends State<RoleGate> {
 
             if (!userExists) return const HomeDashboardPage();
 
-            // 🔡 Normalize roles to lowercase
             final userRoles = (userData['roles'] as List<dynamic>? ?? const [])
                 .map((e) => e.toString().toLowerCase())
                 .toSet();
 
             final memberId = userData['memberId'] as String?;
 
-            // 👇 precedence on users.roles: admin > pastor > leader > usher > member
-            if (userRoles.contains('admin')) {
-              debugPrint('[RoleGate] routing=ADMIN (users.roles=$userRoles)');
-              return const AdminDashboardPage();
-            }
-            if (userRoles.contains('pastor')) {
-              debugPrint('[RoleGate] routing=PASTOR (users.roles=$userRoles)');
-              return const PastorHomeDashboardPage();
-            }
-            if (userRoles.contains('leader')) {
-              debugPrint('[RoleGate] routing=LEADER (users.roles=$userRoles)');
-              return const AdminDashboardPage();
-            }
-            if (userRoles.contains('usher')) {
-              debugPrint('[RoleGate] routing=USHER (users.roles=$userRoles)');
-              return const UsherHomeDashboardPage();
-            }
+            if (userRoles.contains('admin')) return const AdminDashboardPage();
+            if (userRoles.contains('pastor')) return const PastorHomeDashboardPage();
+            if (userRoles.contains('leader')) return const AdminDashboardPage();
+            if (userRoles.contains('usher')) return const UsherHomeDashboardPage();
 
-            if (memberId == null) {
-              debugPrint('[RoleGate] routing=MEMBER(no memberId) -> Home');
-              return const HomeDashboardPage();
-            }
+            if (memberId == null) return const HomeDashboardPage();
 
-            // Second pass: also consider members/{id}.roles + leadershipMinistries + isPastor
             return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
               stream: _db.collection('members').doc(memberId).snapshots(),
               builder: (context, memSnap) {
-                if (memSnap.hasError) {
-                  debugPrint('[RoleGate] member doc error: ${memSnap.error}');
-                  return const HomeDashboardPage();
-                }
+                if (memSnap.hasError) return const HomeDashboardPage();
                 if (memSnap.connectionState == ConnectionState.waiting) {
                   if (_timeout()) return const HomeDashboardPage();
                   return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -342,24 +328,15 @@ class _RoleGateState extends State<RoleGate> {
                     .toSet();
                 final leads = List<String>.from(md['leadershipMinistries'] ?? const <String>[]);
 
-                if (memberRoles.contains('admin')) {
-                  debugPrint('[RoleGate] routing=ADMIN (members.roles=$memberRoles)');
-                  return const AdminDashboardPage();
-                }
+                if (memberRoles.contains('admin')) return const AdminDashboardPage();
                 if (memberRoles.contains('pastor') || (md['isPastor'] == true)) {
-                  debugPrint('[RoleGate] routing=PASTOR (members.roles=$memberRoles isPastor=${md['isPastor']})');
                   return const PastorHomeDashboardPage();
                 }
                 if (memberRoles.contains('leader') || leads.isNotEmpty) {
-                  debugPrint('[RoleGate] routing=LEADER (leads=${leads.length})');
                   return const AdminDashboardPage();
                 }
-                if (memberRoles.contains('usher')) {
-                  debugPrint('[RoleGate] routing=USHER (members.roles=$memberRoles)');
-                  return const UsherHomeDashboardPage();
-                }
+                if (memberRoles.contains('usher')) return const UsherHomeDashboardPage();
 
-                debugPrint('[RoleGate] routing=MEMBER -> Home');
                 return const HomeDashboardPage();
               },
             );
@@ -370,7 +347,10 @@ class _RoleGateState extends State<RoleGate> {
   }
 }
 
-// 📚 Route Generator — centralized
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 Route<dynamic> _generateRoute(RouteSettings settings) {
   switch (settings.name) {
     case '/login':
@@ -398,7 +378,7 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
       return MaterialPageRoute(builder: (_) => const AdminUploadPage());
 
     case '/forms':
-      return MaterialPageRoute(builder: (_) => const FormsPage());
+      return MaterialPageRoute(builder: (_) => FormsPage());
 
     case '/events':
       return MaterialPageRoute(builder: (_) => AddEventPage());
@@ -433,15 +413,11 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
     case '/manage-baptism':
       return MaterialPageRoute(builder: (_) => const BaptismManagePage());
 
-  // ✅ dedicated form routes
     case '/form-prayer-request':
       return MaterialPageRoute(builder: (_) => const PrayerRequestFormPage());
 
     case '/form-baptism-interest':
       return MaterialPageRoute(builder: (_) => const BaptismInterestFormPage());
-
-    /*case '/form-volunteer-signup':
-      return MaterialPageRoute(builder: (_) => const VolunteerSignupFormPage());*/
 
     case '/uploadExcel':
       return MaterialPageRoute(builder: (_) => const ExcelDatabaseUploader());
