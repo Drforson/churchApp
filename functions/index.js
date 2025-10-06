@@ -29,14 +29,7 @@ const db = getFirestore();
 // Helpers (existing + new)
 // ----------------------------------------
 const s = (v) => (typeof v === "string" ? v : "");
-const inboxEventRef = (uid) => db.collection("inbox").doc(uid).collection("events").doc();
-const ttlDate = (days) => new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-
-const HttpsError = (code, message) => {
-  const err = new Error(message);
-  err.code = code;
-  return err;
-};
+const HttpsError = (code, message) => { const err = new Error(message); err.code = code; return err; };
 
 const requireAuth = (request) => {
   const auth = request.auth;
@@ -54,9 +47,7 @@ const hasRole = (roles, role) => Array.isArray(roles) && roles.includes(String(r
 
 const requireAdmin = async (uid) => {
   const roles = await getUserRoles(uid);
-  if (!hasRole(roles, "admin")) {
-    throw HttpsError("permission-denied", "Admin role required.");
-  }
+  if (!hasRole(roles, "admin")) throw HttpsError("permission-denied", "Admin role required.");
   return true;
 };
 
@@ -100,17 +91,9 @@ const coerceDate = (v) => {
 
 // Whitelist for create payload
 const ALLOWED_CREATE_FIELDS = new Set([
-  "firstName",
-  "lastName",
-  "fullName",
-  "email",
-  "phoneNumber",
-  "gender",
-  "address",
-  "emergencyContactName",
-  "emergencyContactNumber",
-  "maritalStatus",
-  "dateOfBirth",
+  "firstName", "lastName", "fullName", "email", "phoneNumber",
+  "gender", "address", "emergencyContactName", "emergencyContactNumber",
+  "maritalStatus", "dateOfBirth",
 ]);
 
 const pickAllowed = (data) => {
@@ -129,15 +112,13 @@ const pickAllowed = (data) => {
 
 // Convenience: compute fullNameLower for sorting
 const computeFullNameLower = (mData = {}) => {
-  const full =
-    s(mData.fullName) ||
-    `${s(mData.firstName)} ${s(mData.lastName)}`.trim();
+  const full = s(mData.fullName) || `${s(mData.firstName)} ${s(mData.lastName)}`.trim();
   return full.trim().toLowerCase();
 };
 
 // Simple notification writer
 async function writeNotification(payload) {
-  // payload: { toUid?, toRole?, toRequester?, requestId?, title, body, type, route?, ministryId?, ministryName? }
+  // payload: { toUid?, toRole?, toRequester?, requestId?, title, body, type, route?, ministryId?, ministryName?, status? }
   await db.collection("notifications").add({
     ...payload,
     createdAt: FieldValue.serverTimestamp(),
@@ -145,14 +126,29 @@ async function writeNotification(payload) {
   });
 }
 
-// ----------------------------------------
-// Canary callable
-// ----------------------------------------
+// Helpers for join-requests notifications
+async function getMinistryByName(name) {
+  if (!name) return null;
+  const q = await db.collection("ministries").where("name", "==", name).limit(1).get();
+  if (q.empty) return null;
+  return { id: q.docs[0].id, data: q.docs[0].data() || {} };
+}
+async function getMemberDisplay(memberId) {
+  if (!memberId) return { name: "Member", data: {} };
+  const snap = await db.collection("members").doc(memberId).get();
+  const d = snap.data() || {};
+  const name = s(d.fullName) || `${s(d.firstName)} ${s(d.lastName)}`.trim() || "Member";
+  return { name, data: d };
+}
+
+/* ----------------------------------------
+   Canary callable
+---------------------------------------- */
 exports.ping = onCall(() => ({ ok: true, pong: true }));
 
-// ----------------------------------------
-// Promote current signed-in user to Admin
-// ----------------------------------------
+/* ----------------------------------------
+   Promote current signed-in user to Admin
+---------------------------------------- */
 const ALLOWLIST_EMAILS = [
   "forsonalfred21@gmail.com",
   "carlos@gmail.com",
@@ -192,9 +188,9 @@ exports.promoteMeToAdmin = onCall(async (request) => {
   return { ok: true, uid, memberId };
 });
 
-// --------------------------------------------------
-// Create & link a member (server-side)
-// --------------------------------------------------
+/* ----------------------------------------
+   Create & link a member (server-side)
+---------------------------------------- */
 exports.createMember = onCall(async (request) => {
   const auth = requireAuth(request);
   const uid = auth.uid;
@@ -241,184 +237,114 @@ exports.createMember = onCall(async (request) => {
   return result;
 });
 
-// --------------------------------------------------
-// Join Requests triggers (placeholders)
-// --------------------------------------------------
+/* ========================================================================
+   Join Requests: Notifications
+   ======================================================================== */
+
+// When a join request is created → notify ministry leaders
 exports.onJoinRequestCreate = onDocumentCreated("join_requests/{requestId}", async (event) => {
-  // TODO
+  const snap = event.data;
+  if (!snap) return;
+  const jr = snap.data() || {};
+
+  const ministryName = s(jr.ministryId); // NOTE: your app uses 'ministryId' to store the name
+  const memberId = s(jr.memberId);
+
+  // Resolve ministry by name to get leaderIds + an id for deep-link
+  const min = await getMinistryByName(ministryName);
+  const ministryId = min?.id || null;
+  const leaderIds = Array.isArray(min?.data.leaderIds) ? min.data.leaderIds : [];
+
+  // Get requester display name for a friendlier message
+  const member = await getMemberDisplay(memberId);
+
+  if (leaderIds.length === 0) {
+    // No leaders set; nothing to direct notify. (Optionally notify pastors.)
+    await writeNotification({
+      toRole: "pastor",
+      type: "join_request_created",
+      title: "Join request received",
+      body: `${member.name} requested to join ${ministryName}`,
+      route: ministryId ? "/view-ministry" : undefined,
+      ministryId: ministryId || undefined,
+      ministryName,
+    });
+    return;
+  }
+
+  // Notify each leader directly
+  await Promise.all(
+    leaderIds.map((leaderUid) =>
+      writeNotification({
+        toUid: String(leaderUid),
+        type: "join_request_created",
+        title: "New join request",
+        body: `${member.name} requested to join ${ministryName}`,
+        route: ministryId ? "/view-ministry" : undefined,
+        ministryId: ministryId || undefined,
+        ministryName,
+      })
+    )
+  );
 });
+
+// When status changes (pending → approved|declined) → notify requester
 exports.onJoinRequestStatusChange = onDocumentUpdated("join_requests/{requestId}", async (event) => {
-  // TODO
-});
+  const before = event.data?.before?.data() || {};
+  const after = event.data?.after?.data() || {};
 
-// --------------------------------------------------
-// Nightly cleanup (placeholder)
-// --------------------------------------------------
-exports.cleanupOldInboxEvents = onSchedule(
-  {
-    schedule: "30 3 * * *",
-    timeZone: "Europe/London",
-    region: "europe-west2",
-    memory: "256MiB",
-  },
-  async () => {
-    // TODO
-  }
-);
+  const prev = s(before.status || "pending").toLowerCase();
+  const curr = s(after.status || "pending").toLowerCase();
 
-// --------------------------------------------------
-// ensureMemberLeaderRole (placeholder)
-// --------------------------------------------------
-exports.ensureMemberLeaderRole = onCall(async (request) => {
-  // TODO
-});
+  if (prev === curr) return; // no change
 
-// --------------------------------------------------
-// setMemberPastorRole (admin only)
-// --------------------------------------------------
-exports.setMemberPastorRole = onCall(async (request) => {
-  const auth = requireAuth(request);
-  await requireAdmin(auth.uid);
+  const ministryName = s(after.ministryId); // name stored in field
+  const memberId = s(after.memberId);
+  const min = await getMinistryByName(ministryName);
+  const ministryId = min?.id || null;
 
-  const memberId = s(request.data?.memberId);
-  const makePastor = !!request.data?.makePastor;
-  if (!memberId) throw HttpsError("invalid-argument", "memberId required.");
+  // requester uid preference: field from doc, else resolve via memberId→user
+  const requesterUid = s(after.requestedByUid) || (await getLinkedUserUidForMember(memberId));
+  if (!requesterUid) return; // nothing we can do
 
-  await db.runTransaction(async (tx) => {
-    const mRef = db.collection("members").doc(memberId);
-    const mSnap = await tx.get(mRef);
-    if (!mSnap.exists) throw HttpsError("not-found", "Member not found.");
-
-    const mData = mSnap.data() || {};
-    const roles = Array.isArray(mData.roles) ? mData.roles.map(String) : [];
-    const set = new Set(roles.map((r) => r.toLowerCase()));
-
-    if (makePastor) set.add("pastor"); else set.delete("pastor");
-
-    tx.set(
-      mRef,
-      {
-        roles: Array.from(set),
-        isPastor: makePastor,
-        updatedAt: FieldValue.serverTimestamp(),
-        fullNameLower: mData.fullNameLower || computeFullNameLower(mData),
-      },
-      { merge: true }
-    );
-
-    const userQ = await tx.get(
-      db.collection("users").where("memberId", "==", memberId).limit(1)
-    );
-    if (!userQ.empty) {
-      const uRef = userQ.docs[0].ref;
-      const uSnap = userQ.docs[0];
-      const uData = uSnap.data() || {};
-      const uRoles = Array.isArray(uData.roles) ? uData.roles.map(String) : [];
-      const uSet = new Set(uRoles.map((r) => r.toLowerCase()));
-
-      if (makePastor) uSet.add("pastor"); else uSet.delete("pastor");
-
-      tx.set(
-        uRef,
-        { roles: Array.from(uSet), updatedAt: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-    }
-  });
-
-  return { ok: true, memberId, makePastor };
-});
-
-// --------------------------------------------------
-// setMemberRoles (admin-only, bulk grant/remove)
-// --------------------------------------------------
-exports.setMemberRoles = onCall(async (request) => {
-  const auth = requireAuth(request);
-  await requireAdmin(auth.uid);
-
-  const memberIds = Array.isArray(request.data?.memberIds) ? request.data.memberIds : [];
-  const rolesAdd = Array.isArray(request.data?.rolesAdd) ? request.data.rolesAdd : [];
-  const rolesRemove = Array.isArray(request.data?.rolesRemove) ? request.data.rolesRemove : [];
-
-  if (!memberIds.length) {
-    throw HttpsError("invalid-argument", "memberIds is required (non-empty array).");
-  }
-
-  const ALLOWED = new Set(["pastor", "usher", "media"]);
-  const toLower = (arr) => arr.map((r) => String(r).toLowerCase());
-  const rolesAddL = toLower(rolesAdd);
-  const rolesRemL = toLower(rolesRemove);
-
-  const badAdd = rolesAddL.filter((r) => !ALLOWED.has(r));
-  const badRem = rolesRemL.filter((r) => !ALLOWED.has(r));
-  if (badAdd.length || badRem.length) {
-    throw HttpsError("invalid-argument", `Only roles ${Array.from(ALLOWED).join(", ")} are allowed.`);
-  }
-
-  let updated = 0;
-
-  for (const memberIdRaw of memberIds) {
-    const memberId = String(memberIdRaw);
-
-    await db.runTransaction(async (tx) => {
-      const mRef = db.collection("members").doc(memberId);
-      const mSnap = await tx.get(mRef);
-      if (!mSnap.exists) return;
-
-      const mData = mSnap.data() || {};
-      const existing = Array.isArray(mData.roles) ? mData.roles.map(String) : [];
-      const set = new Set(existing.map((r) => r.toLowerCase()));
-
-      for (const r of rolesRemL) set.delete(r);
-      for (const r of rolesAddL) set.add(r);
-
-      const finalRoles = Array.from(set);
-      const flags = {
-        isPastor: set.has("pastor"),
-        isUsher: set.has("usher"),
-        isMedia: set.has("media"),
-      };
-
-      const nameLower = mData.fullNameLower || computeFullNameLower(mData);
-
-      tx.set(
-        mRef,
-        { roles: finalRoles, ...flags, fullNameLower: nameLower, updatedAt: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-
-      const userQ = await tx.get(
-        db.collection("users").where("memberId", "==", memberId).limit(1)
-      );
-      if (!userQ.empty) {
-        const uRef = userQ.docs[0].ref;
-        const uSnap = userQ.docs[0];
-        const uData = uSnap.data() || {};
-        const uExisting = Array.isArray(uData.roles) ? uData.roles.map(String) : [];
-        const uSet = new Set(uExisting.map((r) => r.toLowerCase()));
-
-        for (const r of rolesRemL) uSet.delete(r);
-        for (const r of rolesAddL) uSet.add(r);
-
-        tx.set(
-          uRef,
-          { roles: Array.from(uSet), updatedAt: FieldValue.serverTimestamp() },
-          { merge: true }
-        );
-      }
+  if (curr === "approved") {
+    await writeNotification({
+      toUid: requesterUid,
+      type: "join_request_status",
+      status: "approved",
+      title: "Join request approved",
+      body: `You're approved to join ${ministryName}.`,
+      route: ministryId ? "/view-ministry" : undefined,
+      ministryId: ministryId || undefined,
+      ministryName,
     });
 
-    updated++;
-  }
+    // (Optional) Add the ministry to the member's list here if your leader UI doesn't:
+    // await db.collection("members").doc(memberId).set({
+    //   ministries: FieldValue.arrayUnion(ministryName)
+    // }, { merge: true });
 
-  return { ok: true, updated, memberIds };
+  } else if (curr === "declined") {
+    const reason = s(after.reason) || s(after.declineReason);
+    await writeNotification({
+      toUid: requesterUid,
+      type: "join_request_status",
+      status: "declined",
+      title: "Join request declined",
+      body: reason ? `Your request to join ${ministryName} was declined: ${reason}`
+                   : `Your request to join ${ministryName} was declined.`,
+      route: ministryId ? "/view-ministry" : undefined,
+      ministryId: ministryId || undefined,
+      ministryName,
+    });
+  }
 });
 
-/* =========================================================================
+/* ========================================================================
    Ministry Creation Approval Flow
-   ========================================================================= */
+   ======================================================================== */
 
-// Leaders/Admins submit a request for a new ministry
+// Leaders/Admins submit a request for a new ministry → notify pastors
 exports.requestCreateMinistry = onCall(async (request) => {
   const auth = requireAuth(request);
   const uid = auth.uid;
@@ -458,6 +384,9 @@ exports.requestCreateMinistry = onCall(async (request) => {
     type: "ministry_request",
     title: "New ministry creation request",
     body: `${nameRaw} submitted for approval`,
+    route: "/pastor-approvals", // deep-link for pastors
+    ministryName: nameRaw,
+    requestId: reqRef.id,
   });
 
   return { ok: true, id: reqRef.id };
@@ -508,6 +437,9 @@ exports.approveMinistryCreation = onCall(async (request) => {
         type: "ministry_request_result",
         title: "Ministry approved",
         body: `${name} has been approved.`,
+        route: "/view-ministry",
+        ministryId: minRef.id,
+        ministryName: name,
         createdAt: FieldValue.serverTimestamp(),
         read: false,
       });
@@ -547,6 +479,7 @@ exports.declineMinistryCreation = onCall(async (request) => {
       type: "ministry_request_result",
       title: "Ministry declined",
       body: reason ? `${r.name} was declined: ${reason}` : `${r.name} was declined.`,
+      ministryName: s(r.name),
     });
   }
 
@@ -554,8 +487,8 @@ exports.declineMinistryCreation = onCall(async (request) => {
 });
 
 /* -----------------------------------------------------------------
-   NEW: Cancel ministry creation (owner, pastor, or admin)
-   ----------------------------------------------------------------- */
+   Cancel ministry creation (owner, pastor, or admin)
+----------------------------------------------------------------- */
 exports.cancelMinistryCreation = onCall(async (request) => {
   const auth = requireAuth(request);
   const uid = auth.uid;
@@ -584,8 +517,25 @@ exports.cancelMinistryCreation = onCall(async (request) => {
     type: "ministry_request_cancelled",
     title: "Ministry request cancelled",
     body: `"${s(r.name)}" was cancelled by ${isOwner ? 'the requester' : 'a pastor/admin'}.`,
+    route: "/pastor-approvals",
     requestId,
+    ministryName: s(r.name),
   });
 
   return { ok: true, requestId };
 });
+
+/* --------------------------------------------------
+   Nightly cleanup (placeholder)
+-------------------------------------------------- */
+exports.cleanupOldInboxEvents = onSchedule(
+  {
+    schedule: "30 3 * * *",
+    timeZone: "Europe/London",
+    region: "europe-west2",
+    memory: "256MiB",
+  },
+  async () => {
+    // TODO if you want to prune old inbox items
+  }
+);
