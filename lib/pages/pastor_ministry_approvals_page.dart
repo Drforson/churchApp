@@ -13,7 +13,6 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
     final db = FirebaseFirestore.instance;
     final batch = db.batch();
 
-    // Create ministry doc (id can be auto or slug; we use auto for simplicity)
     final newMinRef = db.collection('ministries').doc();
     batch.set(newMinRef, {
       'name': name,
@@ -25,14 +24,13 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
       'updatedAt': FieldValue.serverTimestamp(),
     });
 
-    // Mark request approved
     batch.update(doc.reference, {
       'status': 'approved',
       'updatedAt': FieldValue.serverTimestamp(),
       'approvedMinistryId': newMinRef.id,
     });
 
-    // Notification to requester
+    // notify requester
     batch.set(db.collection('notifications').doc(), {
       'type': 'ministry_request_result',
       'title': 'Ministry approved',
@@ -86,20 +84,40 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final q = FirebaseFirestore.instance
         .collection('ministry_creation_requests')
-        .where('status', isEqualTo: 'pending')
-        .orderBy('requestedAt', descending: true);
+        .where('status', isEqualTo: 'pending');
+    // NOTE: removed orderBy(requestedAt) to avoid composite index; we sort in code
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Ministry Approvals'),
-      ),
+      appBar: AppBar(title: const Text('Ministry Approvals')),
       body: StreamBuilder<QuerySnapshot>(
         stream: q.snapshots(),
         builder: (context, snap) {
-          if (!snap.hasData) {
+          if (snap.hasError) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Error loading requests:\n${snap.error}',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            );
+          }
+          if (snap.connectionState == ConnectionState.waiting && !snap.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
-          final docs = snap.data!.docs;
+
+          final docs = [...(snap.data?.docs ?? const <QueryDocumentSnapshot>[])];
+
+          // Sort locally by requestedAt desc (handles nulls)
+          docs.sort((a, b) {
+            final ad = (a.data() as Map<String, dynamic>)['requestedAt'];
+            final bd = (b.data() as Map<String, dynamic>)['requestedAt'];
+            final aMs = ad is Timestamp ? ad.millisecondsSinceEpoch : 0;
+            final bMs = bd is Timestamp ? bd.millisecondsSinceEpoch : 0;
+            return bMs.compareTo(aMs);
+          });
+
           if (docs.isEmpty) {
             return const Center(child: Text('No pending requests.'));
           }
@@ -121,12 +139,10 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
                 child: ListTile(
                   contentPadding: const EdgeInsets.all(16),
                   title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                  subtitle: Text(
-                    [
-                      if (email.isNotEmpty) 'Requested by: $email',
-                      if (desc.isNotEmpty) 'Description: $desc',
-                    ].where((s) => s.isNotEmpty).join('\n'),
-                  ),
+                  subtitle: Text([
+                    if (email.isNotEmpty) 'Requested by: $email',
+                    if (desc.isNotEmpty) 'Description: $desc',
+                  ].where((e) => e.isNotEmpty).join('\n')),
                   trailing: Wrap(
                     spacing: 8,
                     children: [
