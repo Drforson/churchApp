@@ -172,7 +172,8 @@ class _MinistresPageState extends State<MinistresPage> {
 
     if (myMinistryNames.contains(ministryName)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('You are already a member of this ministry.')),
+        const SnackBar(
+            content: Text('You are already a member of this ministry.')),
       );
       return;
     }
@@ -221,7 +222,9 @@ class _MinistresPageState extends State<MinistresPage> {
       );
     } on FirebaseException catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to send join request: ${e.message ?? e.code}')),
+        SnackBar(
+            content: Text(
+                'Failed to send join request: ${e.message ?? e.code}')),
       );
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -259,7 +262,9 @@ class _MinistresPageState extends State<MinistresPage> {
       );
     } on FirebaseException catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to cancel request: ${e.message ?? e.code}')),
+        SnackBar(
+            content:
+            Text('Failed to cancel request: ${e.message ?? e.code}')),
       );
     }
   }
@@ -315,7 +320,8 @@ class _MinistresPageState extends State<MinistresPage> {
                   final desc = descCtrl.text.trim();
                   if (name.isEmpty) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Please enter a name.')),
+                      const SnackBar(
+                          content: Text('Please enter a name.')),
                     );
                     return;
                   }
@@ -367,6 +373,19 @@ class _MinistresPageState extends State<MinistresPage> {
         'requestedByUid': currentUserId,
         'requestedByMemberId': memberId,
       });
+
+      // NEW: Also create a best-effort pastor notification even if the callable already does it
+      // (harmless duplicate in worst case; add a simple dedupe key).
+      await db.collection('notifications').add({
+        'type': 'ministry_request',
+        'title': 'New ministry creation request',
+        'body': '$name submitted for approval',
+        'createdAt': FieldValue.serverTimestamp(),
+        'read': false,
+        'toRole': 'pastor',
+        'fromUid': currentUserId,
+        'dedupeKey': 'req:$name:${currentUserId ?? ''}', // simple dedupe hint
+      });
       return;
     } catch (e) {
       debugPrint('requestCreateMinistry callable failed; fallback. $e');
@@ -387,16 +406,69 @@ class _MinistresPageState extends State<MinistresPage> {
       'requesterEmail': currentUserEmail,
     });
 
-    // Optional: write a generic notification for pastors (your NotificationBell can read)
+    // Ensure a notification to pastors exists in fallback too
     await db.collection('notifications').add({
       'type': 'ministry_request',
       'title': 'New ministry creation request',
       'body': '$name submitted for approval',
       'createdAt': FieldValue.serverTimestamp(),
       'read': false,
-      'toRole': 'pastor', // your bell can filter by role OR specific pastor UIDs
+      'toRole': 'pastor',
       'fromUid': currentUserId,
+      'requestId': reqRef.id,
     });
+  }
+
+  // NEW: Allow requester/admin to cancel a pending ministry-creation request
+  Future<void> _cancelCreateMinistryRequest(String requestId) async {
+    final db = FirebaseFirestore.instance;
+    try {
+      final doc = await db.collection('ministry_creation_requests').doc(requestId).get();
+      if (!doc.exists) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('This request no longer exists.')),
+        );
+        return;
+      }
+      final data = doc.data() as Map<String, dynamic>;
+      if ((data['status'] ?? 'pending') != 'pending') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Only pending requests can be cancelled.')),
+        );
+        return;
+      }
+      final ownerUid = (data['requestedByUid'] ?? '').toString();
+      if (!(isAdmin || (currentUserId != null && ownerUid == currentUserId))) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('You cannot cancel this request.')),
+        );
+        return;
+      }
+
+      await db.collection('ministry_creation_requests').doc(requestId).delete();
+
+      // Optional: notify pastors that the request was cancelled
+      await db.collection('notifications').add({
+        'type': 'ministry_request_cancelled',
+        'title': 'Ministry request cancelled',
+        'body': 'A pending ministry creation request was cancelled by its requester.',
+        'createdAt': FieldValue.serverTimestamp(),
+        'read': false,
+        'toRole': 'pastor',
+        'fromUid': currentUserId,
+        'requestId': requestId,
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Request cancelled.')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to cancel: $e')),
+      );
+    }
   }
 
   // ======= RENDERING =======
@@ -411,7 +483,8 @@ class _MinistresPageState extends State<MinistresPage> {
       ...otherMinistries.map((m) => m.name),
     };
 
-    final ghostCards = pendingGhosts.where((g) => !existingNames.contains(g.name)).toList();
+    final ghostCards =
+    pendingGhosts.where((g) => !existingNames.contains(g.name)).toList();
 
     return ListView(
       children: [
@@ -436,8 +509,13 @@ class _MinistresPageState extends State<MinistresPage> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(title, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-          CircleAvatar(backgroundColor: color, child: Text('$count', style: const TextStyle(color: Colors.white))),
+          Text(title,
+              style:
+              const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          CircleAvatar(
+              backgroundColor: color,
+              child: Text('$count',
+                  style: const TextStyle(color: Colors.white))),
         ],
       ),
     );
@@ -467,7 +545,8 @@ class _MinistresPageState extends State<MinistresPage> {
           child: Card(
             margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             elevation: 5,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+            shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
             child: ListTile(
               contentPadding: const EdgeInsets.all(16),
               title: Row(
@@ -483,23 +562,28 @@ class _MinistresPageState extends State<MinistresPage> {
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
                               fontSize: 18,
-                              color: hasAccess ? Colors.black : Colors.grey[700],
+                              color:
+                              hasAccess ? Colors.black : Colors.grey[700],
                             ),
                           ),
                         ),
                         const SizedBox(width: 8),
                         if (!approved)
-                          const Icon(Icons.lock_outline, size: 20, color: Colors.orange)
+                          const Icon(Icons.lock_outline,
+                              size: 20, color: Colors.orange)
                         else if (!hasAccess)
-                          const Icon(Icons.lock_outline, size: 20, color: Colors.grey)
+                          const Icon(Icons.lock_outline,
+                              size: 20, color: Colors.grey)
                         else if (isAdmin && !isMember)
-                            const Icon(Icons.lock_open, size: 20, color: Colors.green),
+                            const Icon(Icons.lock_open,
+                                size: 20, color: Colors.green),
                       ],
                     ),
                   ),
                   if (isLeader)
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 5),
                       decoration: BoxDecoration(
                         color: Colors.blue.shade100,
                         borderRadius: BorderRadius.circular(12),
@@ -521,23 +605,36 @@ class _MinistresPageState extends State<MinistresPage> {
                   approved
                       ? '${ministry.description}\nMembers: $memberCount'
                       : 'Pending pastor approval\n${ministry.description.isNotEmpty ? ministry.description : ''}',
-                  style: TextStyle(height: 1.5, color: hasAccess ? Colors.black54 : Colors.grey),
+                  style: TextStyle(
+                      height: 1.5,
+                      color: hasAccess ? Colors.black54 : Colors.grey),
                 ),
               ),
               trailing: !approved
-                  ? const Text('Pending', style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold))
+                  ? const Text('Pending',
+                  style: TextStyle(
+                      color: Colors.orange, fontWeight: FontWeight.bold))
                   : isAdmin
                   ? null
                   : alreadyMember
-                  ? const Text('Member', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold))
+                  ? const Text('Member',
+                  style: TextStyle(
+                      color: Colors.green,
+                      fontWeight: FontWeight.bold))
                   : hasPendingRequest
                   ? TextButton(
-                onPressed: () => _cancelJoinRequest(ministry.name),
-                child: const Text('Cancel', style: TextStyle(color: Colors.red)),
+                onPressed: () =>
+                    _cancelJoinRequest(ministry.name),
+                child: const Text('Cancel',
+                    style: TextStyle(color: Colors.red)),
               )
                   : ElevatedButton(
-                onPressed: canJoin ? () => _sendJoinRequest(ministry.name) : null,
-                style: ElevatedButton.styleFrom(backgroundColor: canJoin ? null : Colors.grey),
+                onPressed: canJoin
+                    ? () => _sendJoinRequest(ministry.name)
+                    : null,
+                style: ElevatedButton.styleFrom(
+                    backgroundColor:
+                    canJoin ? null : Colors.grey),
                 child: const Text('Join'),
               ),
               isThreeLine: true,
@@ -557,7 +654,8 @@ class _MinistresPageState extends State<MinistresPage> {
                     context: context,
                     builder: (context) => const AlertDialog(
                       title: Text('Not yet available'),
-                      content: Text('This ministry is awaiting pastor approval.'),
+                      content:
+                      Text('This ministry is awaiting pastor approval.'),
                     ),
                   );
                 } else {
@@ -565,7 +663,8 @@ class _MinistresPageState extends State<MinistresPage> {
                     context: context,
                     builder: (context) => const AlertDialog(
                       title: Text('Access Denied'),
-                      content: Text('You must be a member or admin to view details.'),
+                      content: Text(
+                          'You must be a member or admin to view details.'),
                     ),
                   );
                 }
@@ -577,7 +676,10 @@ class _MinistresPageState extends State<MinistresPage> {
     );
   }
 
+  // UPDATED: pending ghost card shows "Cancel" for owner/admin
   Widget _buildPendingGhostCard(_PendingMinistryCardData g) {
+    final iOwnThis = currentUserId != null && g.requestedByUid == currentUserId;
+
     return Opacity(
       opacity: 0.85,
       child: Card(
@@ -587,24 +689,42 @@ class _MinistresPageState extends State<MinistresPage> {
         child: ListTile(
           contentPadding: const EdgeInsets.all(16),
           title: Row(
-            children: const [
-              Expanded(
+            children: [
+              const Expanded(
                 child: Text(
                   'Pending ministry (awaiting approval)',
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
               ),
-              Icon(Icons.lock_outline, size: 20, color: Colors.orange),
+              const Icon(Icons.lock_outline, size: 20, color: Colors.orange),
             ],
           ),
-          subtitle: Text('${g.name}\n${g.description ?? ''}'.trim()),
-          trailing: const Text('Pending', style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
+          subtitle: Padding(
+            padding: const EdgeInsets.only(top: 6.0),
+            child: Text([
+              g.name,
+              if (g.description != null && g.description!.trim().isNotEmpty)
+                g.description!,
+              if (iOwnThis) 'Requested by: You'
+              else if ((g.requestedByUid ?? '').isNotEmpty)
+                'Requested by: ${g.requestedByUid}'
+            ].join('\n')),
+          ),
+          trailing: (iOwnThis || isAdmin)
+              ? TextButton(
+            onPressed: () => _cancelCreateMinistryRequest(g.id),
+            child: const Text('Cancel', style: TextStyle(color: Colors.red)),
+          )
+              : const Text('Pending',
+              style: TextStyle(
+                  color: Colors.orange, fontWeight: FontWeight.bold)),
           onTap: () {
             showDialog(
               context: context,
               builder: (context) => const AlertDialog(
                 title: Text('Not yet available'),
-                content: Text('This ministry will be accessible after pastor approval.'),
+                content: Text(
+                    'This ministry will be accessible after pastor approval.'),
               ),
             );
           },
@@ -618,7 +738,8 @@ class _MinistresPageState extends State<MinistresPage> {
       return const Center(
         child: Padding(
           padding: EdgeInsets.all(24.0),
-          child: Text('Link your profile to a member record to view your join requests.'),
+          child: Text(
+              'Link your profile to a member record to view your join requests.'),
         ),
       );
     }
@@ -644,7 +765,8 @@ class _MinistresPageState extends State<MinistresPage> {
           );
         }
 
-        final requests = docs.map((d) => JoinRequestModel.fromDocument(d)).toList();
+        final requests =
+        docs.map((d) => JoinRequestModel.fromDocument(d)).toList();
 
         return ListView.separated(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -657,22 +779,26 @@ class _MinistresPageState extends State<MinistresPage> {
             final isPending = r.status == 'pending';
 
             return Card(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
               elevation: 2,
               child: ListTile(
-                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                contentPadding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                 title: Text(
                   r.ministryId.isEmpty ? 'Unknown ministry' : r.ministryId,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
-                subtitle: Text('Requested: $whenStr\nStatus: ${r.status[0].toUpperCase()}${r.status.substring(1)}'),
+                subtitle: Text(
+                    'Requested: $whenStr\nStatus: ${r.status[0].toUpperCase()}${r.status.substring(1)}'),
                 isThreeLine: true,
                 trailing: isPending
                     ? TextButton(
                   onPressed: () => _cancelJoinRequest(r.ministryId),
-                  child: const Text('Cancel', style: TextStyle(color: Colors.red)),
+                  child: const Text('Cancel',
+                      style: TextStyle(color: Colors.red)),
                 )
                     : const SizedBox.shrink(),
               ),
@@ -736,49 +862,69 @@ class _MinistresPageState extends State<MinistresPage> {
                 ),
                 Expanded(
                   child: StreamBuilder<QuerySnapshot>(
-                    stream: FirebaseFirestore.instance.collection('ministries').snapshots(),
+                    stream: FirebaseFirestore.instance
+                        .collection('ministries')
+                        .snapshots(),
                     builder: (context, snapshot) {
                       if (!snapshot.hasData) {
                         return const Center(child: CircularProgressIndicator());
                       }
 
-                      final approvedMinistries = snapshot.data!.docs.map((doc) {
+                      final approvedMinistries = snapshot.data!.docs
+                          .map((doc) {
                         final data = doc.data() as Map<String, dynamic>;
-                        final approved = (data['approved'] as bool?) ?? true;
+                        final approved =
+                            (data['approved'] as bool?) ?? true;
                         return MinistryModel(
                           id: doc.id,
                           name: data['name'] ?? 'Unnamed Ministry',
                           description: data['description'] ?? '',
-                          leaderIds: List<String>.from(data['leaderIds'] ?? []),
+                          leaderIds:
+                          List<String>.from(data['leaderIds'] ?? []),
                           createdBy: data['createdBy'] ?? '',
                           approved: approved,
                         );
                       })
-                          .where((m) => m.name.toLowerCase().contains(_searchQuery))
+                          .where((m) =>
+                          m.name.toLowerCase().contains(_searchQuery))
                           .toList();
 
-                      Widget buildApproved(List<_PendingMinistryCardData> pendingGhosts) {
+                      Widget buildApproved(
+                          List<_PendingMinistryCardData> pendingGhosts) {
                         if (isAdmin || memberId == null) {
                           final myMins = <MinistryModel>[];
                           final others = approvedMinistries;
-                          return _buildMinistryLists(myMins, others, pendingGhosts: pendingGhosts);
+                          return _buildMinistryLists(myMins, others,
+                              pendingGhosts: pendingGhosts);
                         }
 
                         return StreamBuilder<DocumentSnapshot>(
-                          stream: FirebaseFirestore.instance.collection('members').doc(memberId).snapshots(),
+                          stream: FirebaseFirestore.instance
+                              .collection('members')
+                              .doc(memberId)
+                              .snapshots(),
                           builder: (context, memberSnapshot) {
                             if (!memberSnapshot.hasData) {
-                              return const Center(child: CircularProgressIndicator());
+                              return const Center(
+                                  child: CircularProgressIndicator());
                             }
 
-                            final memberData = memberSnapshot.data!.data() as Map<String, dynamic>? ?? {};
-                            final userMinistries = List<String>.from(memberData['ministries'] ?? []);
+                            final memberData = memberSnapshot.data!
+                                .data() as Map<String, dynamic>? ??
+                                {};
+                            final userMinistries =
+                            List<String>.from(memberData['ministries'] ?? []);
                             myMinistryNames = userMinistries.toSet();
 
-                            final myMins = approvedMinistries.where((m) => userMinistries.contains(m.name)).toList();
-                            final others = approvedMinistries.where((m) => !userMinistries.contains(m.name)).toList();
+                            final myMins = approvedMinistries
+                                .where((m) => userMinistries.contains(m.name))
+                                .toList();
+                            final others = approvedMinistries
+                                .where((m) => !userMinistries.contains(m.name))
+                                .toList();
 
-                            return _buildMinistryLists(myMins, others, pendingGhosts: pendingGhosts);
+                            return _buildMinistryLists(myMins, others,
+                                pendingGhosts: pendingGhosts);
                           },
                         );
                       }
@@ -792,15 +938,18 @@ class _MinistresPageState extends State<MinistresPage> {
                           final pendingGhosts = <_PendingMinistryCardData>[];
                           if (reqSnap.hasData) {
                             for (final d in reqSnap.data!.docs) {
-                              final data = d.data() as Map<String, dynamic>;
+                              final data =
+                              d.data() as Map<String, dynamic>;
                               final n = (data['name'] ?? '').toString();
                               if (n.toLowerCase().contains(_searchQuery)) {
                                 pendingGhosts.add(
                                   _PendingMinistryCardData(
                                     id: d.id,
                                     name: n,
-                                    description: (data['description'] ?? '').toString(),
-                                    requestedByUid: (data['requestedByUid'] ?? '').toString(),
+                                    description:
+                                    (data['description'] ?? '').toString(),
+                                    requestedByUid:
+                                    (data['requestedByUid'] ?? '').toString(),
                                   ),
                                 );
                               }
