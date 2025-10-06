@@ -549,6 +549,7 @@ class _ActionsGrid extends StatelessWidget {
       _ActionItem('Events', Icons.event, '/events'),
       _ActionItem('Upload Database', Icons.table_view, '/uploadExcel'),
       _ActionItem('Attendance Check-In', Icons.check_circle_outline, '/attendance'),
+      _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
       _ActionItem('Sunday Follow-Up', Icons.person_off, '/follow-up'),
       // NEW: Only for pastors
       if (isPastor) _ActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
