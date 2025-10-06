@@ -10,10 +10,12 @@ import 'package:flutter_stripe/flutter_stripe.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-// Pages
+// Pages (core auth / onboarding)
 import 'pages/login_page.dart';
 import 'pages/signup1.dart';
 import 'pages/signup2.dart';
+
+// Management pages
 import 'pages/prayer_request_manage_page.dart';
 import 'pages/baptism_manage_page.dart';
 
@@ -35,13 +37,13 @@ import 'pages/debadmintestpage.dart';
 import 'pages/profilepage.dart';
 import 'pages/successpage.dart';
 
-// ✅ NEW: Pastor dashboard
+// ✅ Role-specific dashboards
 import 'pages/pastor_home_dashboard_page.dart';
+import 'pages/usher_home_dashboard_page.dart';
 
-// ✅ NEW: Dedicated form pages
+// ✅ Dedicated form pages
 import 'pages/prayer_request_form_page.dart';
 import 'pages/baptism_interest_form_page.dart';
-//import 'pages/volunteer_signup_form_page.dart';
 
 // Services
 import 'services/theme_provider.dart';
@@ -186,7 +188,7 @@ class _RoleLoaderState extends State<RoleLoader> {
     // 🔡 normalize to lowercase
     final roles = rolesRaw.map((e) => e.toLowerCase()).toList();
 
-    // 👇 precedence: admin > pastor > leader > member
+    // 👇 precedence: admin > pastor > leader > usher > member
     String effectiveRole = 'member';
     if (roles.contains('admin')) {
       effectiveRole = 'admin';
@@ -194,22 +196,28 @@ class _RoleLoaderState extends State<RoleLoader> {
       effectiveRole = 'pastor';
     } else if (roles.contains('leader')) {
       effectiveRole = 'leader';
+    } else if (roles.contains('usher')) {
+      effectiveRole = 'usher';
     }
 
-    // Allow runtime leader via member doc if no explicit role & they lead ministries
+    // Allow runtime leader/usher/pastor via member doc
     final memberId = data['memberId'] as String?;
-    if (effectiveRole == 'member' && memberId != null) {
+    if (memberId != null && effectiveRole == 'member') {
       final mem = await _db.collection('members').doc(memberId).get();
-      final ms = List<String>.from(
-        (mem.data() ?? const {})['leadershipMinistries'] ?? const <String>[],
-      );
-      if (ms.isNotEmpty) effectiveRole = 'leader';
-      // If member has explicit pastor role/flag, prefer pastor theme too
-      final mRoles = (mem.data()?['roles'] as List<dynamic>? ?? const [])
+      final mData = mem.data() ?? {};
+      final mRoles = (mData['roles'] as List<dynamic>? ?? const [])
           .map((e) => e.toString().toLowerCase())
           .toSet();
-      if (mRoles.contains('pastor') || mem.data()?['isPastor'] == true) {
+      final ms = List<String>.from(mData['leadershipMinistries'] ?? const <String>[]);
+
+      if (mRoles.contains('admin')) {
+        effectiveRole = 'admin';
+      } else if (mRoles.contains('pastor') || (mData['isPastor'] == true)) {
         effectiveRole = 'pastor';
+      } else if (mRoles.contains('leader') || ms.isNotEmpty) {
+        effectiveRole = 'leader';
+      } else if (mRoles.contains('usher')) {
+        effectiveRole = 'usher';
       }
     }
 
@@ -233,7 +241,7 @@ class _RoleLoaderState extends State<RoleLoader> {
   }
 }
 
-// ✅ Gate to decide initial page after login (admin / pastor / leader / member)
+// ✅ Gate to decide initial page after login (admin / pastor / leader / usher / member)
 class RoleGate extends StatefulWidget {
   const RoleGate({super.key});
 
@@ -292,7 +300,7 @@ class _RoleGateState extends State<RoleGate> {
 
             final memberId = userData['memberId'] as String?;
 
-            // 👇 precedence: admin > pastor > leader > member (users doc)
+            // 👇 precedence on users.roles: admin > pastor > leader > usher > member
             if (userRoles.contains('admin')) {
               debugPrint('[RoleGate] routing=ADMIN (users.roles=$userRoles)');
               return const AdminDashboardPage();
@@ -304,6 +312,10 @@ class _RoleGateState extends State<RoleGate> {
             if (userRoles.contains('leader')) {
               debugPrint('[RoleGate] routing=LEADER (users.roles=$userRoles)');
               return const AdminDashboardPage();
+            }
+            if (userRoles.contains('usher')) {
+              debugPrint('[RoleGate] routing=USHER (users.roles=$userRoles)');
+              return const UsherHomeDashboardPage();
             }
 
             if (memberId == null) {
@@ -342,6 +354,10 @@ class _RoleGateState extends State<RoleGate> {
                   debugPrint('[RoleGate] routing=LEADER (leads=${leads.length})');
                   return const AdminDashboardPage();
                 }
+                if (memberRoles.contains('usher')) {
+                  debugPrint('[RoleGate] routing=USHER (members.roles=$memberRoles)');
+                  return const UsherHomeDashboardPage();
+                }
 
                 debugPrint('[RoleGate] routing=MEMBER -> Home');
                 return const HomeDashboardPage();
@@ -372,14 +388,17 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
     case '/admin-dashboard':
       return MaterialPageRoute(builder: (_) => const AdminDashboardPage());
 
-    case '/pastor-dashboard': // ✅ route
+    case '/pastor-dashboard':
       return MaterialPageRoute(builder: (_) => const PastorHomeDashboardPage());
+
+    case '/usher-dashboard':
+      return MaterialPageRoute(builder: (_) => const UsherHomeDashboardPage());
 
     case '/admin-upload':
       return MaterialPageRoute(builder: (_) => const AdminUploadPage());
 
     case '/forms':
-      return MaterialPageRoute(builder: (_) => FormsPage());
+      return MaterialPageRoute(builder: (_) => const FormsPage());
 
     case '/events':
       return MaterialPageRoute(builder: (_) => AddEventPage());
@@ -414,15 +433,15 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
     case '/manage-baptism':
       return MaterialPageRoute(builder: (_) => const BaptismManagePage());
 
-  // ✅ NEW: dedicated form routes
+  // ✅ dedicated form routes
     case '/form-prayer-request':
       return MaterialPageRoute(builder: (_) => const PrayerRequestFormPage());
 
     case '/form-baptism-interest':
       return MaterialPageRoute(builder: (_) => const BaptismInterestFormPage());
 
-  //  case '/form-volunteer-signup':
-   //   return MaterialPageRoute(builder: (_) => const VolunteerSignupFormPage());
+    /*case '/form-volunteer-signup':
+      return MaterialPageRoute(builder: (_) => const VolunteerSignupFormPage());*/
 
     case '/uploadExcel':
       return MaterialPageRoute(builder: (_) => const ExcelDatabaseUploader());
