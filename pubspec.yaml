@@ -22,6 +22,7 @@ dependencies:
   #firebase_messaging: ^latest
   #flutter_local_notifications: ^latest
   firebase_app_check: ^0.3.0
+  rxdart: ^0.27.7
   fl_chart: ^0.71.0
   font_awesome_flutter: ^10.6.0
   #payment utilities

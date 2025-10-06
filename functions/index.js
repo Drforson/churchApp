@@ -135,9 +135,9 @@ const computeFullNameLower = (mData = {}) => {
   return full.trim().toLowerCase();
 };
 
-// NEW: simple notification writer
+// Simple notification writer
 async function writeNotification(payload) {
-  // payload: { toUid?, toRole?, title, body, type }
+  // payload: { toUid?, toRole?, toRequester?, requestId?, title, body, type, route?, ministryId?, ministryName? }
   await db.collection("notifications").add({
     ...payload,
     createdAt: FieldValue.serverTimestamp(),
@@ -242,17 +242,17 @@ exports.createMember = onCall(async (request) => {
 });
 
 // --------------------------------------------------
-// Join Requests triggers (unchanged placeholders)
+// Join Requests triggers (placeholders)
 // --------------------------------------------------
 exports.onJoinRequestCreate = onDocumentCreated("join_requests/{requestId}", async (event) => {
-  // TODO: implement if needed
+  // TODO
 });
 exports.onJoinRequestStatusChange = onDocumentUpdated("join_requests/{requestId}", async (event) => {
-  // TODO: implement if needed
+  // TODO
 });
 
 // --------------------------------------------------
-// Nightly cleanup (unchanged placeholder)
+// Nightly cleanup (placeholder)
 // --------------------------------------------------
 exports.cleanupOldInboxEvents = onSchedule(
   {
@@ -262,19 +262,19 @@ exports.cleanupOldInboxEvents = onSchedule(
     memory: "256MiB",
   },
   async () => {
-    // TODO: implement if needed
+    // TODO
   }
 );
 
 // --------------------------------------------------
-// ensureMemberLeaderRole (unchanged placeholder)
+// ensureMemberLeaderRole (placeholder)
 // --------------------------------------------------
 exports.ensureMemberLeaderRole = onCall(async (request) => {
-  // TODO: implement if needed
+  // TODO
 });
 
 // --------------------------------------------------
-// setMemberPastorRole (kept for 1-off toggles; ensures isPastor mirror)
+// setMemberPastorRole (admin only)
 // --------------------------------------------------
 exports.setMemberPastorRole = onCall(async (request) => {
   const auth = requireAuth(request);
@@ -330,7 +330,7 @@ exports.setMemberPastorRole = onCall(async (request) => {
 });
 
 // --------------------------------------------------
-// ✅ UPDATED: setMemberRoles (admin-only, bulk grant/remove)
+// setMemberRoles (admin-only, bulk grant/remove)
 // --------------------------------------------------
 exports.setMemberRoles = onCall(async (request) => {
   const auth = requireAuth(request);
@@ -344,7 +344,6 @@ exports.setMemberRoles = onCall(async (request) => {
     throw HttpsError("invalid-argument", "memberIds is required (non-empty array).");
   }
 
-  // Only allow these roles by design (expand if you decide later)
   const ALLOWED = new Set(["pastor", "usher", "media"]);
   const toLower = (arr) => arr.map((r) => String(r).toLowerCase());
   const rolesAddL = toLower(rolesAdd);
@@ -353,10 +352,7 @@ exports.setMemberRoles = onCall(async (request) => {
   const badAdd = rolesAddL.filter((r) => !ALLOWED.has(r));
   const badRem = rolesRemL.filter((r) => !ALLOWED.has(r));
   if (badAdd.length || badRem.length) {
-    throw HttpsError(
-      "invalid-argument",
-      `Only roles ${Array.from(ALLOWED).join(", ")} are allowed.`
-    );
+    throw HttpsError("invalid-argument", `Only roles ${Array.from(ALLOWED).join(", ")} are allowed.`);
   }
 
   let updated = 0;
@@ -373,37 +369,27 @@ exports.setMemberRoles = onCall(async (request) => {
       const existing = Array.isArray(mData.roles) ? mData.roles.map(String) : [];
       const set = new Set(existing.map((r) => r.toLowerCase()));
 
-      // Apply removals first, then adds
       for (const r of rolesRemL) set.delete(r);
       for (const r of rolesAddL) set.add(r);
 
       const finalRoles = Array.from(set);
-
       const flags = {
         isPastor: set.has("pastor"),
         isUsher: set.has("usher"),
         isMedia: set.has("media"),
       };
 
-      // Ensure fullNameLower for sorting (if missing)
       const nameLower = mData.fullNameLower || computeFullNameLower(mData);
 
       tx.set(
         mRef,
-        {
-          roles: finalRoles,
-          ...flags,
-          fullNameLower: nameLower,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
+        { roles: finalRoles, ...flags, fullNameLower: nameLower, updatedAt: FieldValue.serverTimestamp() },
         { merge: true }
       );
 
-      // Mirror to linked user (if any) with *tx.get(query)*
       const userQ = await tx.get(
         db.collection("users").where("memberId", "==", memberId).limit(1)
       );
-
       if (!userQ.empty) {
         const uRef = userQ.docs[0].ref;
         const uSnap = userQ.docs[0];
@@ -416,10 +402,7 @@ exports.setMemberRoles = onCall(async (request) => {
 
         tx.set(
           uRef,
-          {
-            roles: Array.from(uSet),
-            updatedAt: FieldValue.serverTimestamp(),
-          },
+          { roles: Array.from(uSet), updatedAt: FieldValue.serverTimestamp() },
           { merge: true }
         );
       }
@@ -432,7 +415,7 @@ exports.setMemberRoles = onCall(async (request) => {
 });
 
 /* =========================================================================
-   NEW: Ministry Creation Approval Flow (v2 onCall)
+   Ministry Creation Approval Flow
    ========================================================================= */
 
 // Leaders/Admins submit a request for a new ministry
@@ -447,19 +430,14 @@ exports.requestCreateMinistry = onCall(async (request) => {
   const requestedByUid = s(request.data?.requestedByUid) || uid;
   const requestedByMemberId = s(request.data?.requestedByMemberId);
 
-  if (!nameRaw) {
-    throw HttpsError("invalid-argument", "name is required.");
-  }
+  if (!nameRaw) throw HttpsError("invalid-argument", "name is required.");
 
-  // Prevent duplicate pending requests with same name
+  // Avoid duplicate pending by name
   const dup = await db.collection("ministry_creation_requests")
     .where("name", "==", nameRaw)
     .where("status", "==", "pending")
     .limit(1).get();
-
-  if (!dup.empty) {
-    return { ok: true, info: "Already pending." };
-  }
+  if (!dup.empty) return { ok: true, info: "Already pending." };
 
   const reqRef = db.collection("ministry_creation_requests").doc();
 
@@ -475,7 +453,6 @@ exports.requestCreateMinistry = onCall(async (request) => {
     requesterEmail: auth.token?.email || null,
   });
 
-  // Notify pastors
   await writeNotification({
     toRole: "pastor",
     type: "ministry_request",
@@ -486,11 +463,10 @@ exports.requestCreateMinistry = onCall(async (request) => {
   return { ok: true, id: reqRef.id };
 });
 
-// Pastors/Admins approve a request → create ministry + notify requester
+// Pastors/Admins approve → create ministry + notify requester
 exports.approveMinistryCreation = onCall(async (request) => {
   const auth = requireAuth(request);
   const uid = auth.uid;
-
   await requirePastorOrAdmin(uid);
 
   const requestId = s(request.data?.requestId);
@@ -501,16 +477,13 @@ exports.approveMinistryCreation = onCall(async (request) => {
   if (!reqSnap.exists) throw HttpsError("not-found", "Request not found.");
 
   const r = reqSnap.data();
-  if (r.status !== "pending") {
-    return { ok: true, info: "Already processed." };
-  }
+  if (r.status !== "pending") return { ok: true, info: "Already processed." };
 
   const name = s(r.name);
   const description = s(r.description);
   const requesterUid = s(r.requestedByUid);
 
   await db.runTransaction(async (tx) => {
-    // Create new ministry doc
     const minRef = db.collection("ministries").doc();
     tx.set(minRef, {
       name,
@@ -522,14 +495,12 @@ exports.approveMinistryCreation = onCall(async (request) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
-    // Mark request approved
     tx.update(reqRef, {
       status: "approved",
       approvedMinistryId: minRef.id,
       updatedAt: FieldValue.serverTimestamp(),
     });
 
-    // Notify requester
     if (requesterUid) {
       const nRef = db.collection("notifications").doc();
       tx.set(nRef, {
@@ -546,11 +517,10 @@ exports.approveMinistryCreation = onCall(async (request) => {
   return { ok: true, requestId };
 });
 
-// Pastors/Admins decline a request → mark declined + notify requester
+// Pastors/Admins decline → mark declined + notify requester
 exports.declineMinistryCreation = onCall(async (request) => {
   const auth = requireAuth(request);
   const uid = auth.uid;
-
   await requirePastorOrAdmin(uid);
 
   const requestId = s(request.data?.requestId);
@@ -562,9 +532,7 @@ exports.declineMinistryCreation = onCall(async (request) => {
   if (!reqSnap.exists) throw HttpsError("not-found", "Request not found.");
 
   const r = reqSnap.data();
-  if (r.status !== "pending") {
-    return { ok: true, info: "Already processed." };
-  }
+  if (r.status !== "pending") return { ok: true, info: "Already processed." };
 
   await reqRef.update({
     status: "declined",
@@ -581,6 +549,43 @@ exports.declineMinistryCreation = onCall(async (request) => {
       body: reason ? `${r.name} was declined: ${reason}` : `${r.name} was declined.`,
     });
   }
+
+  return { ok: true, requestId };
+});
+
+/* -----------------------------------------------------------------
+   NEW: Cancel ministry creation (owner, pastor, or admin)
+   ----------------------------------------------------------------- */
+exports.cancelMinistryCreation = onCall(async (request) => {
+  const auth = requireAuth(request);
+  const uid = auth.uid;
+
+  const requestId = s(request.data?.requestId);
+  if (!requestId) throw HttpsError("invalid-argument", "requestId required.");
+
+  const reqRef = db.collection("ministry_creation_requests").doc(requestId);
+  const snap = await reqRef.get();
+  if (!snap.exists) throw HttpsError("not-found", "Request not found.");
+
+  const r = snap.data();
+  if (r.status !== "pending") return { ok: true, info: "Already processed." };
+
+  const roles = await getUserRoles(uid);
+  const isOwner = s(r.requestedByUid) === uid;
+  const isPastorOrAdmin = hasRole(roles, "pastor") || hasRole(roles, "admin");
+  if (!isOwner && !isPastorOrAdmin) {
+    throw HttpsError("permission-denied", "Only the requester or a pastor/admin can cancel.");
+  }
+
+  await reqRef.delete();
+
+  await writeNotification({
+    toRole: "pastor",
+    type: "ministry_request_cancelled",
+    title: "Ministry request cancelled",
+    body: `"${s(r.name)}" was cancelled by ${isOwner ? 'the requester' : 'a pastor/admin'}.`,
+    requestId,
+  });
 
   return { ok: true, requestId };
 });
