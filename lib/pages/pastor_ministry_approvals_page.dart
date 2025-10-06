@@ -1,91 +1,97 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 
-class PastorMinistryApprovalsPage extends StatelessWidget {
+class PastorMinistryApprovalsPage extends StatefulWidget {
   const PastorMinistryApprovalsPage({super.key});
 
-  Future<void> _approveRequest(BuildContext context, DocumentSnapshot doc) async {
-    final data = doc.data() as Map<String, dynamic>;
-    final String name = (data['name'] ?? '').toString();
-    final String description = (data['description'] ?? '').toString();
-    final String requesterUid = (data['requestedByUid'] ?? '').toString();
+  @override
+  State<PastorMinistryApprovalsPage> createState() => _PastorMinistryApprovalsPageState();
+}
 
-    final db = FirebaseFirestore.instance;
-    final batch = db.batch();
+class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPage> {
+  final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
+  final Set<String> _busy = {};
 
-    final newMinRef = db.collection('ministries').doc();
-    batch.set(newMinRef, {
-      'name': name,
-      'description': description,
-      'leaderIds': requesterUid.isNotEmpty ? [requesterUid] : <String>[],
-      'createdBy': requesterUid,
-      'approved': true,
-      'createdAt': FieldValue.serverTimestamp(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
-
-    batch.update(doc.reference, {
-      'status': 'approved',
-      'updatedAt': FieldValue.serverTimestamp(),
-      'approvedMinistryId': newMinRef.id,
-    });
-
-    // notify requester
-    batch.set(db.collection('notifications').doc(), {
-      'type': 'ministry_request_result',
-      'title': 'Ministry approved',
-      'body': '$name has been approved.',
-      'createdAt': FieldValue.serverTimestamp(),
-      'read': false,
-      'toUid': requesterUid,
-    });
-
-    await batch.commit();
-
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Approved "$name"')),
-      );
+  Future<void> _approveRequest(BuildContext context, String requestId, String name) async {
+    setState(() => _busy.add(requestId));
+    try {
+      await _functions.httpsCallable('approveMinistryCreation').call({'requestId': requestId});
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Approved "$name"')));
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message ?? 'Failed to approve (permission?).')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy.remove(requestId));
     }
   }
 
-  Future<void> _declineRequest(BuildContext context, DocumentSnapshot doc) async {
-    final data = doc.data() as Map<String, dynamic>;
-    final String name = (data['name'] ?? '').toString();
-    final String requesterUid = (data['requestedByUid'] ?? '').toString();
+  Future<void> _declineRequest(BuildContext context, String requestId, String name) async {
+    final reason = await _askReason(context);
+    if (reason == null) return;
 
-    final db = FirebaseFirestore.instance;
-    final batch = db.batch();
-
-    batch.update(doc.reference, {
-      'status': 'declined',
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
-
-    batch.set(db.collection('notifications').doc(), {
-      'type': 'ministry_request_result',
-      'title': 'Ministry declined',
-      'body': '$name was declined.',
-      'createdAt': FieldValue.serverTimestamp(),
-      'read': false,
-      'toUid': requesterUid,
-    });
-
-    await batch.commit();
-
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Declined "$name"')),
-      );
+    setState(() => _busy.add(requestId));
+    try {
+      await _functions.httpsCallable('declineMinistryCreation').call({
+        'requestId': requestId,
+        'reason': reason.trim().isEmpty ? null : reason.trim(),
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Declined "$name"')));
+      }
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted) {
+        final msg = e.code == 'permission-denied'
+            ? 'Permission denied. Make sure your user has the Pastor or Admin role.'
+            : (e.message ?? 'Failed to decline.');
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _busy.remove(requestId));
     }
+  }
+
+  Future<String?> _askReason(BuildContext context) async {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Decline request'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            labelText: 'Reason (optional)',
+            hintText: 'Optionally provide a reason',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, ctrl.text), child: const Text('Decline')),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final q = FirebaseFirestore.instance
         .collection('ministry_creation_requests')
-        .where('status', isEqualTo: 'pending');
-    // NOTE: removed orderBy(requestedAt) to avoid composite index; we sort in code
+        .where('status', isEqualTo: 'pending'); // sort client-side
 
     return Scaffold(
       appBar: AppBar(title: const Text('Ministry Approvals')),
@@ -96,10 +102,7 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
             return Center(
               child: Padding(
                 padding: const EdgeInsets.all(16),
-                child: Text(
-                  'Error loading requests:\n${snap.error}',
-                  textAlign: TextAlign.center,
-                ),
+                child: Text('Error loading requests:\n${snap.error}', textAlign: TextAlign.center),
               ),
             );
           }
@@ -109,7 +112,7 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
 
           final docs = [...(snap.data?.docs ?? const <QueryDocumentSnapshot>[])];
 
-          // Sort locally by requestedAt desc (handles nulls)
+          // Sort by requestedAt desc (handles nulls)
           docs.sort((a, b) {
             final ad = (a.data() as Map<String, dynamic>)['requestedAt'];
             final bd = (b.data() as Map<String, dynamic>)['requestedAt'];
@@ -129,9 +132,11 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
             itemBuilder: (context, i) {
               final d = docs[i];
               final data = d.data() as Map<String, dynamic>;
+              final id = d.id;
               final name = (data['name'] ?? '').toString();
               final desc = (data['description'] ?? '').toString();
               final email = (data['requesterEmail'] ?? '').toString();
+              final busy = _busy.contains(id);
 
               return Card(
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -148,13 +153,13 @@ class PastorMinistryApprovalsPage extends StatelessWidget {
                     children: [
                       OutlinedButton.icon(
                         icon: const Icon(Icons.close, size: 18),
-                        label: const Text('Decline'),
-                        onPressed: () => _declineRequest(context, d),
+                        label: busy ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Decline'),
+                        onPressed: busy ? null : () => _declineRequest(context, id, name),
                       ),
                       ElevatedButton.icon(
                         icon: const Icon(Icons.check, size: 18),
-                        label: const Text('Approve'),
-                        onPressed: () => _approveRequest(context, d),
+                        label: busy ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Approve'),
+                        onPressed: busy ? null : () => _approveRequest(context, id, name),
                       ),
                     ],
                   ),
