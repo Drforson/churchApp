@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+import '../core/firestore_paths.dart';
 import '../models/join_request_model.dart';
 
 class JoinRequestApprovalPage extends StatefulWidget {
@@ -11,79 +12,98 @@ class JoinRequestApprovalPage extends StatefulWidget {
 }
 
 class _JoinRequestApprovalPageState extends State<JoinRequestApprovalPage> {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final _auth = FirebaseAuth.instance;
+  final _db = FirebaseFirestore.instance;
 
-  String? userId;
-  String userRole = 'member';
+  bool _loadingRole = true;
+  bool _isAdminOrLeader = false;
 
   @override
   void initState() {
     super.initState();
-    userId = _auth.currentUser?.uid;
-    _fetchUserRole();
+    _loadRole();
   }
 
-  Future<void> _fetchUserRole() async {
-    final userDoc = await _db.collection('users').doc(userId).get();
+  Future<void> _loadRole() async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) {
+      setState(() {
+        _loadingRole = false;
+        _isAdminOrLeader = false;
+      });
+      return;
+    }
+    final snap = await _db.collection(FP.users).doc(uid).get();
+    final roles = (snap.data()?['roles'] is List)
+        ? List<String>.from(snap.data()!['roles'])
+        : <String>[];
     setState(() {
-      userRole = userDoc.data()?['role'] ?? 'member';
+      _loadingRole = false;
+      _isAdminOrLeader = roles.contains('admin') || roles.contains('leader');
     });
   }
 
-  Future<List<JoinRequestModel>> _fetchJoinRequests() async {
-    final snapshot = await _db
-        .collection('joinRequests')
-        .where('status', isEqualTo: 'pending')
-        .orderBy('timestamp', descending: true)
-        .get();
-    return snapshot.docs.map((doc) => JoinRequestModel.fromDocument(doc)).toList();
-  }
-
-  Future<void> _updateRequestStatus(String requestId, String newStatus) async {
-    await _db.collection('joinRequests').doc(requestId).update({'status': newStatus});
-    setState(() {});
+  Future<void> _updateStatus(String requestId, String newStatus) async {
+    // Allowed by rules for leaders/admins only.
+    await _db.collection(FP.joinRequests).doc(requestId).update({
+      'status': newStatus,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    if (userRole != 'admin' && userRole != 'leader') {
+    if (_loadingRole) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (!_isAdminOrLeader) {
       return const Scaffold(
-        body: Center(child: Text("Access denied. Only leaders and admins can view this page.")),
+        body: Center(child: Text('Access denied. Only leaders and admins can view this page.')),
       );
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text("Join Requests")),
-      body: FutureBuilder<List<JoinRequestModel>>(
-        future: _fetchJoinRequests(),
+      appBar: AppBar(title: const Text('Join Requests')),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: _db
+            .collection(FP.joinRequests)
+            .where('status', isEqualTo: 'pending')
+            .orderBy('requestedAt', descending: true)
+            .snapshots(),
         builder: (context, snapshot) {
-          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-
-          final requests = snapshot.data!;
-          if (requests.isEmpty) {
-            return const Center(child: Text("No join requests found."));
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
           }
+          final docs = snapshot.data!.docs;
+          if (docs.isEmpty) {
+            return const Center(child: Text('No join requests found.'));
+          }
+
+          final requests = docs
+              .map((d) => JoinRequestModel.fromDocument(d))
+              .toList();
 
           return ListView.builder(
             itemCount: requests.length,
-            itemBuilder: (context, index) {
-              final request = requests[index];
+            itemBuilder: (context, i) {
+              final r = requests[i];
               return Card(
                 margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: ListTile(
-                  title: Text("Member: ${request.memberId}"),
-                  subtitle: Text("Ministry: ${request.ministryId}\nStatus: ${request.status}"),
+                  title: Text('Member: ${r.memberId}'),
+                  subtitle: Text('Ministry: ${r.ministryId}\nStatus: ${r.status}'),
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       IconButton(
-                        icon: const Icon(Icons.check, color: Colors.green),
-                        onPressed: () => _updateRequestStatus(request.id, 'approved'),
+                        tooltip: 'Approve',
+                        icon: const Icon(Icons.check_circle, color: Colors.green),
+                        onPressed: () => _updateStatus(r.id, 'approved'),
                       ),
                       IconButton(
-                        icon: const Icon(Icons.close, color: Colors.red),
-                        onPressed: () => _updateRequestStatus(request.id, 'rejected'),
+                        tooltip: 'Reject',
+                        icon: const Icon(Icons.cancel, color: Colors.red),
+                        onPressed: () => _updateStatus(r.id, 'rejected'),
                       ),
                     ],
                   ),
