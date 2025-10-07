@@ -105,17 +105,17 @@ class _NotificationBellState extends State<NotificationBell> {
   }
 
   Stream<int> _buildUnreadCountStream(String uid, List<String> roles, List<String> reqIds) {
-    // Inbox (personal, server-authored) — canonical source
+    // Inbox (personal, server-authored) — tolerate legacy docs without `read` field
     final inbox$ = _db
         .collection('inbox')
         .doc(uid)
         .collection('events')
-        .where('read', isEqualTo: false)
+        .orderBy('createdAt', descending: true)
         .limit(200)
         .snapshots()
-        .map((s) => s.size);
+        .map((s) => s.docs.where((d) => (d.data()['read'] != true)).length);
 
-    // Direct notifications (legacy collection)
+    // Direct notifications (legacy collection) — keep strict read==false
     final direct$ = _db
         .collection('notifications')
         .where('toUid', isEqualTo: uid)
