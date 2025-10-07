@@ -21,6 +21,20 @@ async function getUserRoles(uid) {
   return arr.map((r) => String(r).toLowerCase().trim()).filter(Boolean);
 }
 
+/** Get memberId for a user (if linked) */
+async function getUserMemberId(uid) {
+  const snap = await db.doc(`users/${uid}`).get();
+  return snap.data()?.memberId || null;
+}
+
+/** Load member doc (if any) */
+async function getMember(uid) {
+  const memberId = await getUserMemberId(uid);
+  if (!memberId) return null;
+  const m = await db.doc(`members/${memberId}`).get();
+  return m.exists ? { id: m.id, ...m.data() } : null;
+}
+
 /** List UIDs who have a role in users.roles (handle casing by querying a few variants) */
 async function listUidsByRole(roleLc) {
   const variants = [roleLc, roleLc.toUpperCase(), roleLc[0].toUpperCase() + roleLc.slice(1)];
@@ -63,7 +77,7 @@ async function listMemberIdsByPastorOrAdmin() {
     qs.docs.forEach((d) => out.add(d.id));
   }
 
-  // leadershipMinistries heuristic — fetch a small window and filter
+  // leadershipMinistries heuristic — fetch window and filter
   {
     const qs = await db.collection('members').where('leadershipMinistries', '!=', null).limit(500).get();
     qs.docs.forEach((d) => {
@@ -93,6 +107,35 @@ async function listPastorAndAdminUids() {
   return Array.from(set);
 }
 
+/** Is this user a pastor/admin?
+ * Checks users.roles, custom claims, and member fallback.
+ */
+async function isUserPastorOrAdmin(uid) {
+  // users.roles
+  const roles = await getUserRoles(uid);
+  if (roles.includes('pastor') || roles.includes('admin')) return true;
+
+  // custom claims
+  try {
+    const rec = await admin.auth().getUser(uid);
+    const c = rec.customClaims || {};
+    if (c.pastor === true || c.admin === true || c.isPastor === true || c.isAdmin === true) {
+      return true;
+    }
+  } catch (_) { /* ignore */ }
+
+  // member fallback
+  const mem = await getMember(uid);
+  if (mem) {
+    const mroles = Array.isArray(mem.roles) ? mem.roles.map((r) => String(r).toLowerCase()) : [];
+    const lead = Array.isArray(mem.leadershipMinistries) ? mem.leadershipMinistries : [];
+    if (mroles.includes('admin')) return true;
+    if (mem.isPastor === true || mroles.includes('pastor')) return true;
+    if (lead.some((s) => String(s).toLowerCase().includes('pastor'))) return true;
+  }
+  return false;
+}
+
 /**
  * Write a personal inbox event.
  * - Marks as unread (read:false)
@@ -116,7 +159,6 @@ async function writeInbox(uid, payload) {
       .where('dedupeKey', '==', payload.dedupeKey)
       .limit(1).get();
     if (!qs.empty) {
-      // Already have one; optionally refresh timestamp:
       await qs.docs[0].ref.update({ createdAt: ts(), read: false });
       return;
     }
@@ -139,37 +181,27 @@ exports.processMinistryApprovalAction = onDocumentCreated(
     const { action, requestId, reason, byUid } = doc.data() || {};
     if (!action || !requestId || !byUid) {
       logger.warn('Invalid payload on approval action', doc.id);
-      await doc.ref.update({ status: 'invalid', processedAt: new Date() });
+      await doc.ref.update({ status: 'invalid', processed: true, processedAt: new Date() });
       return;
     }
 
-    // Authorize actor (defense-in-depth; rules should already enforce)
-    const roles = await getUserRoles(byUid);
-    let allowed = roles.includes('pastor') || roles.includes('admin');
+    // Authorize actor (users.roles, claims, member fallback)
+    const allowed = await isUserPastorOrAdmin(byUid);
     if (!allowed) {
-      try {
-        const userRec = await admin.auth().getUser(byUid);
-        const claims = userRec.customClaims || {};
-        if (claims.pastor === true || claims.admin === true || claims.isPastor === true || claims.isAdmin === true) {
-          allowed = true;
-        }
-      } catch (_) {}
-    }
-    if (!allowed) {
-      logger.warn('Unauthorized approval action by', byUid, roles);
-      await doc.ref.update({ status: 'denied', processedAt: new Date() });
+      logger.warn('Unauthorized approval action by', byUid);
+      await doc.ref.update({ status: 'denied', processed: true, processedAt: new Date() });
       return;
     }
 
     const reqRef = db.doc(`ministry_creation_requests/${requestId}`);
     const reqSnap = await reqRef.get();
     if (!reqSnap.exists) {
-      await doc.ref.update({ status: 'not_found', processedAt: new Date() });
+      await doc.ref.update({ status: 'not_found', processed: true, processedAt: new Date() });
       return;
     }
     const r = reqSnap.data() || {};
     if (S(r.status || 'pending') !== 'pending') {
-      await doc.ref.update({ status: 'already_processed', processedAt: new Date() });
+      await doc.ref.update({ status: 'already_processed', processed: true, processedAt: new Date() });
       return;
     }
 
@@ -223,7 +255,7 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           dedupeKey: `mcr_action_${requestId}_approve_${byUid}`,
         });
 
-        await doc.ref.update({ status: 'ok', processedAt: new Date() });
+        await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
       } else if (action === 'decline') {
         await reqRef.update({
           status: 'declined',
@@ -259,13 +291,18 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           dedupeKey: `mcr_action_${requestId}_decline_${byUid}`,
         });
 
-        await doc.ref.update({ status: 'ok', processedAt: new Date() });
+        await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
       } else {
-        await doc.ref.update({ status: 'unknown_action', processedAt: new Date() });
+        await doc.ref.update({ status: 'unknown_action', processed: true, processedAt: new Date() });
       }
     } catch (e) {
       logger.error('processMinistryApprovalAction error', e);
-      await doc.ref.update({ status: 'error', error: (e && e.message) || String(e), processedAt: new Date() });
+      await doc.ref.update({
+        status: 'error',
+        error: (e && e.message) || String(e),
+        processed: true,
+        processedAt: new Date(),
+      });
     }
   }
 );

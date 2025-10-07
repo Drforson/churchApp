@@ -115,7 +115,7 @@ class _NotificationBellState extends State<NotificationBell> {
         .snapshots()
         .map((s) => s.docs.where((d) => (d.data()['read'] != true)).length);
 
-    // Direct notifications (legacy collection) — keep strict read==false
+    // Direct notifications (legacy collection)
     final direct$ = _db
         .collection('notifications')
         .where('toUid', isEqualTo: uid)
