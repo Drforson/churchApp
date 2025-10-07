@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:intl/intl.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 class PastorMinistryApprovalsPage extends StatefulWidget {
   const PastorMinistryApprovalsPage({super.key});
@@ -11,36 +11,28 @@ class PastorMinistryApprovalsPage extends StatefulWidget {
 }
 
 class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPage> {
-  final FirebaseFunctions _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
   final _db = FirebaseFirestore.instance;
 
-  bool _approveCallableOk = true;
-  bool _declineCallableOk = true;
   final Set<String> _busy = {};
   final Map<String, String> _nameCache = {};
 
-  // --- Approve helpers ---
+  /* =========================
+     Enqueue Approve / Decline
+     ========================= */
   Future<void> _approveRequest(BuildContext context, String requestId, String name) async {
     setState(() => _busy.add(requestId));
     try {
-      if (_approveCallableOk) {
-        try {
-          await _functions.httpsCallable('approveMinistryCreation').call({'requestId': requestId});
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Approved "$name"')));
-          }
-          await _notifyOnApprove(requestId, name);
-          return;
-        } on FirebaseFunctionsException {
-          _approveCallableOk = false;
-        } catch (_) {
-          _approveCallableOk = false;
-        }
-      }
-      // Fallback (may be blocked by rules in prod; kept for dev/emulator)
-      await _approveViaFirestoreFallback(requestId, name);
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      await _db.collection('ministry_approval_actions').add({
+        'action': 'approve',
+        'requestId': requestId,
+        'byUid': uid,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Approved "$name"')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Approval submitted for "$name"')),
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -51,149 +43,37 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     }
   }
 
-  // --- Decline helpers ---
   Future<void> _declineRequest(BuildContext context, String requestId, String name) async {
     final reason = await _showDeclineDialogAndReturnReason(context);
     if (reason == null) return;
 
     setState(() => _busy.add(requestId));
     try {
-      if (_declineCallableOk) {
-        try {
-          await _functions.httpsCallable('declineMinistryCreation').call({
-            'requestId': requestId,
-            'reason': reason.trim().isEmpty ? null : reason.trim(),
-          });
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Declined "$name"')));
-          }
-          await _notifyOnDecline(requestId, name, reason);
-          return;
-        } on FirebaseFunctionsException catch (e) {
-          _declineCallableOk = false;
-          debugPrint('declineMinistryCreation error: ${e.code} ${e.message}');
-        } catch (e) {
-          _declineCallableOk = false;
-          debugPrint('declineMinistryCreation unexpected: $e');
-        }
-      }
-
-      // Fallback (may be blocked by rules in prod; kept for dev/emulator)
-      await _declineViaFirestoreFallback(requestId, name, reason);
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      await _db.collection('ministry_approval_actions').add({
+        'action': 'decline',
+        'requestId': requestId,
+        'reason': reason.trim().isEmpty ? null : reason.trim(),
+        'byUid': uid,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Declined "$name"')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Decline submitted for "$name"')),
+        );
       }
     } catch (e) {
       if (mounted) {
-        final msg = e.toString().contains('PERMISSION_DENIED')
-            ? 'Permission denied. Ensure this account has Pastor/Admin privileges.'
-            : 'Failed to decline: $e';
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to decline: $e')));
       }
     } finally {
       if (mounted) setState(() => _busy.remove(requestId));
     }
   }
 
-  // === Fallback implementations (client) ===
-  Future<void> _approveViaFirestoreFallback(String requestId, String requestName) async {
-    await _db.runTransaction((txn) async {
-      final reqRef = _db.collection('ministry_creation_requests').doc(requestId);
-      final reqSnap = await txn.get(reqRef);
-      if (!reqSnap.exists) throw Exception('Request not found.');
-      final data = reqSnap.data() as Map<String, dynamic>;
-      if ((data['status'] ?? 'pending') != 'pending') throw Exception('Request is not pending.');
-
-      final name = (data['name'] ?? requestName).toString().trim();
-      final desc = (data['description'] ?? '').toString();
-      final requestedByUid = (data['requestedByUid'] ?? '').toString();
-
-      final newMinRef = _db.collection('ministries').doc();
-      txn.set(newMinRef, {
-        'id': newMinRef.id,
-        'name': name,
-        'description': desc,
-        'approved': true,
-        'createdAt': FieldValue.serverTimestamp(),
-        'createdBy': requestedByUid,
-        'leaderIds': requestedByUid.isNotEmpty ? [requestedByUid] : <String>[],
-      });
-
-      txn.update(reqRef, {
-        'status': 'approved',
-        'approvedMinistryId': newMinRef.id,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-    });
-
-    await _notifyOnApprove(requestId, requestName);
-  }
-
-  Future<void> _declineViaFirestoreFallback(String requestId, String requestName, String? reason) async {
-    await _db.runTransaction((txn) async {
-      final reqRef = _db.collection('ministry_creation_requests').doc(requestId);
-      final reqSnap = await txn.get(reqRef);
-      if (!reqSnap.exists) throw Exception('Request not found.');
-      final data = reqSnap.data() as Map<String, dynamic>;
-      if ((data['status'] ?? 'pending') != 'pending') throw Exception('Request is not pending.');
-
-      txn.update(reqRef, {
-        'status': 'declined',
-        'declineReason': (reason ?? '').trim().isEmpty ? null : reason!.trim(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-    });
-
-    await _notifyOnDecline(requestId, requestName, reason);
-  }
-
-  // === Notifications (both paths) ===
-  Future<void> _notifyOnApprove(String requestId, String name) async {
-    await _db.collection('notifications').add({
-      'type': 'ministry_request_approved',
-      'title': 'Ministry approved',
-      'body': '"$name" has been approved',
-      'toRole': 'pastor',
-      'createdAt': FieldValue.serverTimestamp(),
-      'requestId': requestId,
-      'read': false,
-      'route': '/pastor-approvals',
-    });
-    await _db.collection('notifications').add({
-      'type': 'ministry_request_approved',
-      'title': 'Your ministry was approved',
-      'body': '"$name" is now live.',
-      'toRequester': true,
-      'requestId': requestId,
-      'createdAt': FieldValue.serverTimestamp(),
-      'read': false,
-    });
-  }
-
-  Future<void> _notifyOnDecline(String requestId, String name, String? reason) async {
-    final suffix = (reason ?? '').trim().isEmpty ? '' : ': $reason';
-    await _db.collection('notifications').add({
-      'type': 'ministry_request_declined',
-      'title': 'Ministry declined',
-      'body': '"$name" was declined$suffix',
-      'toRole': 'pastor',
-      'createdAt': FieldValue.serverTimestamp(),
-      'requestId': requestId,
-      'read': false,
-      'route': '/pastor-approvals',
-    });
-    await _db.collection('notifications').add({
-      'type': 'ministry_request_declined',
-      'title': 'Your ministry was declined',
-      'body': '"$name" was declined$suffix',
-      'toRequester': true,
-      'requestId': requestId,
-      'createdAt': FieldValue.serverTimestamp(),
-      'read': false,
-    });
-  }
-
-  // === Requester Name lookup ===
+  /* =========================
+     Requester Name lookup
+     ========================= */
   Future<String> _resolveRequesterName(Map<String, dynamic> data) async {
     final memberId = (data['requestedByMemberId'] ?? '').toString();
     final uid = (data['requestedByUid'] ?? '').toString();
@@ -256,7 +136,9 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     );
   }
 
-  // === Dialog that safely returns a reason (hides keyboard, prevents double submit) ===
+  /* =========================
+     Decline dialog (safe submit)
+     ========================= */
   Future<String?> _showDeclineDialogAndReturnReason(BuildContext context) async {
     final ctrl = TextEditingController();
     bool submitting = false;
@@ -303,6 +185,9 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     );
   }
 
+  /* =========================
+     UI
+     ========================= */
   @override
   Widget build(BuildContext context) {
     final q = _db.collection('ministry_creation_requests').where('status', isEqualTo: 'pending');
@@ -502,7 +387,6 @@ class _InfoTag extends StatelessWidget {
 }
 
 /// Press-and-hold to expand the description; release to collapse.
-/// Avoids overflow by truncating when collapsed and allowing multi-line wrap when pressed.
 class _PressHoldDescriptionPill extends StatefulWidget {
   final String text;
   final int collapsedLines;

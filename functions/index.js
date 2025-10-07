@@ -1,541 +1,307 @@
-// functions/index.js
+/* functions/index.js */
+const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore');
+const { setGlobalOptions, logger } = require('firebase-functions/v2');
+const admin = require('firebase-admin');
 
-// -----------------------------
-// Firebase Functions v2 imports
-// -----------------------------
-const { onCall } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
-const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { setGlobalOptions } = require("firebase-functions/v2/options");
+admin.initializeApp();
+const db = admin.firestore();
 
-// -----------------------------
-// Firebase Admin SDK
-// -----------------------------
-const { initializeApp } = require("firebase-admin/app");
-const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+// Adjust region to your deployment region
+setGlobalOptions({ region: 'europe-west2' });
 
-// ----------------------------------------
-// Global options (region, memory if needed)
-// ----------------------------------------
-setGlobalOptions({ region: "europe-west2" });
-
-// ----------------------------------------
-// Admin init
-// ----------------------------------------
-initializeApp();
-const db = getFirestore();
-
-// ----------------------------------------
-// Helpers (existing + new)
-// ----------------------------------------
-const s = (v) => (typeof v === "string" ? v : "");
-const HttpsError = (code, message) => { const err = new Error(message); err.code = code; return err; };
-
-const requireAuth = (request) => {
-  const auth = request.auth;
-  if (!auth) throw HttpsError("unauthenticated", "Sign in required.");
-  return auth;
-};
-
-const getUserRoles = async (uid) => {
-  const snap = await db.collection("users").doc(uid).get();
-  const roles = snap.data()?.roles ?? [];
-  return Array.isArray(roles) ? roles.map((r) => String(r).toLowerCase()) : [];
-};
-
-const hasRole = (roles, role) => Array.isArray(roles) && roles.includes(String(role).toLowerCase());
-
-const requireAdmin = async (uid) => {
-  const roles = await getUserRoles(uid);
-  if (!hasRole(roles, "admin")) throw HttpsError("permission-denied", "Admin role required.");
-  return true;
-};
-
-const requireLeaderOrAdmin = async (uid) => {
-  const roles = await getUserRoles(uid);
-  if (!hasRole(roles, "leader") && !hasRole(roles, "admin")) {
-    throw HttpsError("permission-denied", "Leader or admin role required.");
-  }
-  return true;
-};
-
-const requirePastorOrAdmin = async (uid) => {
-  const roles = await getUserRoles(uid);
-  if (!hasRole(roles, "pastor") && !hasRole(roles, "admin")) {
-    throw HttpsError("permission-denied", "Pastor or admin role required.");
-  }
-  return true;
-};
-
-const getLinkedUserUidForMember = async (memberId) => {
-  if (!memberId) return null;
-  const q = await db.collection("users").where("memberId", "==", memberId).limit(1).get();
-  return q.empty ? null : q.docs[0].id;
-};
-
-// Convert various client shapes to a JS Date (or null)
-const coerceDate = (v) => {
-  if (!v) return null;
-  if (v instanceof Date) return v;
-  if (typeof v === "number") return new Date(v); // millis
-  if (typeof v === "string") {
-    const d = new Date(v);
-    return isNaN(d) ? null : d;
-  }
-  if (typeof v === "object" && typeof v._seconds === "number") {
-    const ms = v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6);
-    return new Date(ms);
-  }
-  return null;
-};
-
-// Whitelist for create payload
-const ALLOWED_CREATE_FIELDS = new Set([
-  "firstName", "lastName", "fullName", "email", "phoneNumber",
-  "gender", "address", "emergencyContactName", "emergencyContactNumber",
-  "maritalStatus", "dateOfBirth",
-]);
-
-const pickAllowed = (data) => {
-  const out = {};
-  for (const k of Object.keys(data || {})) {
-    if (!ALLOWED_CREATE_FIELDS.has(k)) continue;
-    if (k === "dateOfBirth") {
-      const d = coerceDate(data[k]);
-      if (d) out[k] = d;
-    } else {
-      out[k] = data[k];
-    }
-  }
-  return out;
-};
-
-// Convenience: compute fullNameLower for sorting
-const computeFullNameLower = (mData = {}) => {
-  const full = s(mData.fullName) || `${s(mData.firstName)} ${s(mData.lastName)}`.trim();
-  return full.trim().toLowerCase();
-};
-
-// Simple notification writer
-async function writeNotification(payload) {
-  // payload: { toUid?, toRole?, toRequester?, requestId?, title, body, type, route?, ministryId?, ministryName?, status? }
-  await db.collection("notifications").add({
-    ...payload,
-    createdAt: FieldValue.serverTimestamp(),
-    read: false,
-  });
+/* ===========================
+   Helpers
+   =========================== */
+function safeStr(v) {
+  return (v ?? '').toString();
 }
 
-// Helpers for join-requests notifications
-async function getMinistryByName(name) {
-  if (!name) return null;
-  const q = await db.collection("ministries").where("name", "==", name).limit(1).get();
-  if (q.empty) return null;
-  return { id: q.docs[0].id, data: q.docs[0].data() || {} };
-}
-async function getMemberDisplay(memberId) {
-  if (!memberId) return { name: "Member", data: {} };
-  const snap = await db.collection("members").doc(memberId).get();
-  const d = snap.data() || {};
-  const name = s(d.fullName) || `${s(d.firstName)} ${s(d.lastName)}`.trim() || "Member";
-  return { name, data: d };
+async function getUserRoles(uid) {
+  const snap = await db.doc(`users/${uid}`).get();
+  const roles = (snap.data()?.roles) || [];
+  return Array.isArray(roles) ? roles : [];
 }
 
-/* ----------------------------------------
-   Canary callable
----------------------------------------- */
-exports.ping = onCall(() => ({ ok: true, pong: true }));
+async function listPastorUids() {
+  const qs = await db.collection('users').where('roles', 'array-contains', 'pastor').get();
+  return qs.docs.map((d) => d.id);
+}
 
-/* ----------------------------------------
-   Promote current signed-in user to Admin
----------------------------------------- */
-const ALLOWLIST_EMAILS = [
-  "forsonalfred21@gmail.com",
-  "carlos@gmail.com",
-  "admin@gmail.com",
-];
-
-exports.promoteMeToAdmin = onCall(async (request) => {
-  const auth = requireAuth(request);
-
-  const email = auth.token.email || "";
-  const isEmulator =
-    !!process.env.FIREBASE_AUTH_EMULATOR_HOST ||
-    !!process.env.FIRESTORE_EMULATOR_HOST;
-
-  if (!isEmulator && !ALLOWLIST_EMAILS.includes(email)) {
-    throw HttpsError("permission-denied", "Not on allowlist.");
-  }
-
-  const uid = auth.uid;
-  const userRef = db.collection("users").doc(uid);
-  const userSnap = await userRef.get();
-  if (!userSnap.exists) {
-    throw HttpsError("failed-precondition", "User doc not found.");
-  }
-
-  const memberId = (userSnap.data() || {}).memberId || null;
-
-  await userRef.set({ roles: FieldValue.arrayUnion("admin") }, { merge: true });
-
-  if (memberId) {
-    await db.collection("members").doc(memberId).set(
-      { roles: FieldValue.arrayUnion("admin") },
-      { merge: true }
-    );
-  }
-
-  return { ok: true, uid, memberId };
-});
-
-/* ----------------------------------------
-   Create & link a member (server-side)
----------------------------------------- */
-exports.createMember = onCall(async (request) => {
-  const auth = requireAuth(request);
-  const uid = auth.uid;
-  const now = FieldValue.serverTimestamp();
-
-  const result = await db.runTransaction(async (tx) => {
-    const userRef = db.collection("users").doc(uid);
-    const userSnap = await tx.get(userRef);
-    const userData = userSnap.data() || {};
-
-    if (userData.memberId && typeof userData.memberId === "string" && userData.memberId.length) {
-      return { ok: true, memberId: userData.memberId, alreadyLinked: true };
-    }
-
-    const raw = request.data || {};
-    const payload = pickAllowed(raw);
-
-    const memberRef = db.collection("members").doc();
-    const fullNameLower = computeFullNameLower(payload);
-
-    tx.set(memberRef, {
-      ...payload,
-      fullNameLower,
-      createdAt: now,
-      updatedAt: now,
-      createdByUid: uid,
-      userUid: uid,
-    });
-
-    tx.set(
-      userRef,
-      {
-        memberId: memberRef.id,
-        linkedAt: now,
-        email: auth.token?.email || userData.email || null,
-        createdAt: userSnap.exists ? userData.createdAt ?? now : now,
-      },
-      { merge: true }
-    );
-
-    return { ok: true, memberId: memberRef.id, alreadyLinked: false };
-  });
-
-  return result;
-});
-
-/* ========================================================================
-   Join Requests: Notifications
-   ======================================================================== */
-
-// When a join request is created → notify ministry leaders
-exports.onJoinRequestCreate = onDocumentCreated("join_requests/{requestId}", async (event) => {
-  const snap = event.data;
-  if (!snap) return;
-  const jr = snap.data() || {};
-
-  const ministryName = s(jr.ministryId); // NOTE: your app uses 'ministryId' to store the name
-  const memberId = s(jr.memberId);
-
-  // Resolve ministry by name to get leaderIds + an id for deep-link
-  const min = await getMinistryByName(ministryName);
-  const ministryId = min?.id || null;
-  const leaderIds = Array.isArray(min?.data.leaderIds) ? min.data.leaderIds : [];
-
-  // Get requester display name for a friendlier message
-  const member = await getMemberDisplay(memberId);
-
-  if (leaderIds.length === 0) {
-    // No leaders set; nothing to direct notify. (Optionally notify pastors.)
-    await writeNotification({
-      toRole: "pastor",
-      type: "join_request_created",
-      title: "Join request received",
-      body: `${member.name} requested to join ${ministryName}`,
-      route: ministryId ? "/view-ministry" : undefined,
-      ministryId: ministryId || undefined,
-      ministryName,
-    });
-    return;
-  }
-
-  // Notify each leader directly
-  await Promise.all(
-    leaderIds.map((leaderUid) =>
-      writeNotification({
-        toUid: String(leaderUid),
-        type: "join_request_created",
-        title: "New join request",
-        body: `${member.name} requested to join ${ministryName}`,
-        route: ministryId ? "/view-ministry" : undefined,
-        ministryId: ministryId || undefined,
-        ministryName,
-      })
-    )
+async function writeInbox(uid, payload) {
+  // Ensure inbox doc exists (also used for lastSeenAt)
+  await db.collection('inbox').doc(uid).set(
+    { lastSeenAt: admin.firestore.FieldValue.serverTimestamp() },
+    { merge: true },
   );
-});
-
-// When status changes (pending → approved|declined) → notify requester
-exports.onJoinRequestStatusChange = onDocumentUpdated("join_requests/{requestId}", async (event) => {
-  const before = event.data?.before?.data() || {};
-  const after = event.data?.after?.data() || {};
-
-  const prev = s(before.status || "pending").toLowerCase();
-  const curr = s(after.status || "pending").toLowerCase();
-
-  if (prev === curr) return; // no change
-
-  const ministryName = s(after.ministryId); // name stored in field
-  const memberId = s(after.memberId);
-  const min = await getMinistryByName(ministryName);
-  const ministryId = min?.id || null;
-
-  // requester uid preference: field from doc, else resolve via memberId→user
-  const requesterUid = s(after.requestedByUid) || (await getLinkedUserUidForMember(memberId));
-  if (!requesterUid) return; // nothing we can do
-
-  if (curr === "approved") {
-    await writeNotification({
-      toUid: requesterUid,
-      type: "join_request_status",
-      status: "approved",
-      title: "Join request approved",
-      body: `You're approved to join ${ministryName}.`,
-      route: ministryId ? "/view-ministry" : undefined,
-      ministryId: ministryId || undefined,
-      ministryName,
-    });
-
-    // (Optional) Add the ministry to the member's list here if your leader UI doesn't:
-    // await db.collection("members").doc(memberId).set({
-    //   ministries: FieldValue.arrayUnion(ministryName)
-    // }, { merge: true });
-
-  } else if (curr === "declined") {
-    const reason = s(after.reason) || s(after.declineReason);
-    await writeNotification({
-      toUid: requesterUid,
-      type: "join_request_status",
-      status: "declined",
-      title: "Join request declined",
-      body: reason ? `Your request to join ${ministryName} was declined: ${reason}`
-                   : `Your request to join ${ministryName} was declined.`,
-      route: ministryId ? "/view-ministry" : undefined,
-      ministryId: ministryId || undefined,
-      ministryName,
-    });
-  }
-});
-
-/* ========================================================================
-   Ministry Creation Approval Flow
-   ======================================================================== */
-
-// Leaders/Admins submit a request for a new ministry → notify pastors
-exports.requestCreateMinistry = onCall(async (request) => {
-  const auth = requireAuth(request);
-  const uid = auth.uid;
-
-  await requireLeaderOrAdmin(uid);
-
-  const nameRaw = s(request.data?.name).trim();
-  const description = s(request.data?.description);
-  const requestedByUid = s(request.data?.requestedByUid) || uid;
-  const requestedByMemberId = s(request.data?.requestedByMemberId);
-
-  if (!nameRaw) throw HttpsError("invalid-argument", "name is required.");
-
-  // Avoid duplicate pending by name
-  const dup = await db.collection("ministry_creation_requests")
-    .where("name", "==", nameRaw)
-    .where("status", "==", "pending")
-    .limit(1).get();
-  if (!dup.empty) return { ok: true, info: "Already pending." };
-
-  const reqRef = db.collection("ministry_creation_requests").doc();
-
-  await reqRef.set({
-    id: reqRef.id,
-    name: nameRaw,
-    description,
-    status: "pending", // pending | approved | declined
-    requestedAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-    requestedByUid,
-    requestedByMemberId: requestedByMemberId || null,
-    requesterEmail: auth.token?.email || null,
+  // Store event
+  await db.collection('inbox').doc(uid).collection('events').add({
+    ...payload,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+}
 
-  await writeNotification({
-    toRole: "pastor",
-    type: "ministry_request",
-    title: "New ministry creation request",
-    body: `${nameRaw} submitted for approval`,
-    route: "/pastor-approvals", // deep-link for pastors
-    ministryName: nameRaw,
-    requestId: reqRef.id,
-  });
+/* ===========================
+   1) Process Ministry Approval Actions (approve | decline)
+   Client writes to /ministry_approval_actions; server does privileged writes.
+   =========================== */
+exports.processMinistryApprovalAction = onDocumentCreated(
+  'ministry_approval_actions/{id}',
+  async (event) => {
+    const ref = event.data;
+    if (!ref) return;
 
-  return { ok: true, id: reqRef.id };
-});
+    const act = ref.data();
+    const { action, requestId, reason, byUid } = act || {};
 
-// Pastors/Admins approve → create ministry + notify requester
-exports.approveMinistryCreation = onCall(async (request) => {
-  const auth = requireAuth(request);
-  const uid = auth.uid;
-  await requirePastorOrAdmin(uid);
+    if (!action || !requestId || !byUid) {
+      logger.warn('Invalid approval action payload', act);
+      await ref.ref.update({ status: 'invalid', processedAt: new Date() });
+      return;
+    }
 
-  const requestId = s(request.data?.requestId);
-  if (!requestId) throw HttpsError("invalid-argument", "requestId required.");
+    // Authorize actor
+    const roles = await getUserRoles(byUid);
+    const allowed = roles.includes('pastor') || roles.includes('admin');
+    if (!allowed) {
+      logger.warn('Unauthorized approval action by', byUid, roles);
+      await ref.ref.update({ status: 'denied', processedAt: new Date() });
+      return;
+    }
 
-  const reqRef = db.collection("ministry_creation_requests").doc(requestId);
-  const reqSnap = await reqRef.get();
-  if (!reqSnap.exists) throw HttpsError("not-found", "Request not found.");
+    const reqRef = db.doc(`ministry_creation_requests/${requestId}`);
+    const reqSnap = await reqRef.get();
+    if (!reqSnap.exists) {
+      await ref.ref.update({ status: 'not_found', processedAt: new Date() });
+      return;
+    }
+    const r = reqSnap.data();
+    const currentStatus = safeStr(r.status || 'pending');
+    if (currentStatus !== 'pending') {
+      await ref.ref.update({ status: 'already_processed', processedAt: new Date() });
+      return;
+    }
 
-  const r = reqSnap.data();
-  if (r.status !== "pending") return { ok: true, info: "Already processed." };
+    try {
+      if (action === 'approve') {
+        // Prepare a new ministry id so we can include it in notifications
+        const minRef = db.collection('ministries').doc();
 
-  const name = s(r.name);
-  const description = s(r.description);
-  const requesterUid = s(r.requestedByUid);
+        await db.runTransaction(async (txn) => {
+          txn.set(minRef, {
+            id: minRef.id,
+            name: safeStr(r.name),
+            description: safeStr(r.description),
+            approved: true,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            createdBy: safeStr(r.requestedByUid) || byUid,
+            leaderIds: safeStr(r.requestedByUid) ? [safeStr(r.requestedByUid)] : [],
+          });
 
-  await db.runTransaction(async (tx) => {
-    const minRef = db.collection("ministries").doc();
-    tx.set(minRef, {
-      name,
-      description,
-      leaderIds: requesterUid ? [requesterUid] : [],
-      createdBy: requesterUid || uid,
-      approved: true,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+          txn.update(reqRef, {
+            status: 'approved',
+            approvedMinistryId: minRef.id,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            approvedByUid: byUid,
+          });
+        });
 
-    tx.update(reqRef, {
-      status: "approved",
-      approvedMinistryId: minRef.id,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+        // Notify requester (inbox)
+        const requesterUid = safeStr(r.requestedByUid);
+        if (requesterUid) {
+          await writeInbox(requesterUid, {
+            type: 'ministry_request_approved',
+            channel: 'approvals',
+            title: 'Your ministry was approved',
+            body: `"${safeStr(r.name)}" is now live.`,
+            // convenience top-level for your NotificationCenterPage:
+            ministryId: minRef.id,
+            ministryName: safeStr(r.name),
+            // payload for future-proof linking
+            payload: {
+              requestId,
+              ministryId: minRef.id,
+              ministryName: safeStr(r.name),
+            },
+            route: '/pastor-approvals',
+          });
+        }
 
-    if (requesterUid) {
-      const nRef = db.collection("notifications").doc();
-      tx.set(nRef, {
-        toUid: requesterUid,
-        type: "ministry_request_result",
-        title: "Ministry approved",
-        body: `${name} has been approved.`,
-        route: "/view-ministry",
-        ministryId: minRef.id,
-        ministryName: name,
-        createdAt: FieldValue.serverTimestamp(),
-        read: false,
+        await ref.ref.update({ status: 'ok', processedAt: new Date() });
+      } else if (action === 'decline') {
+        await reqRef.update({
+          status: 'declined',
+          declineReason: safeStr(reason) || null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          declinedByUid: byUid,
+        });
+
+        const requesterUid = safeStr(r.requestedByUid);
+        if (requesterUid) {
+          await writeInbox(requesterUid, {
+            type: 'ministry_request_declined',
+            channel: 'approvals',
+            title: 'Your ministry was declined',
+            body: `"${safeStr(r.name)}" was declined${safeStr(reason) ? `: ${safeStr(reason)}` : ''}`,
+            ministryId: null,
+            ministryName: safeStr(r.name),
+            payload: {
+              requestId,
+              ministryId: null,
+              ministryName: safeStr(r.name),
+            },
+            route: '/pastor-approvals',
+          });
+        }
+
+        await ref.ref.update({ status: 'ok', processedAt: new Date() });
+      } else {
+        await ref.ref.update({ status: 'unknown_action', processedAt: new Date() });
+      }
+    } catch (e) {
+      logger.error('processMinistryApprovalAction error', e);
+      await ref.ref.update({
+        status: 'error',
+        error: (e && e.message) || String(e),
+        processedAt: new Date(),
       });
     }
-  });
+  }
+);
 
-  return { ok: true, requestId };
-});
+/* ===========================
+   2) Notify pastors when a new ministry creation request is submitted
+   =========================== */
+exports.onMinistryCreationRequestCreated = onDocumentCreated(
+  'ministry_creation_requests/{id}',
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const r = snap.data();
+    const name = safeStr(r.name);
+    const pastors = await listPastorUids();
 
-// Pastors/Admins decline → mark declined + notify requester
-exports.declineMinistryCreation = onCall(async (request) => {
-  const auth = requireAuth(request);
-  const uid = auth.uid;
-  await requirePastorOrAdmin(uid);
+    await Promise.all(
+      pastors.map((uid) =>
+        writeInbox(uid, {
+          type: 'ministry_request_created',
+          channel: 'approvals',
+          title: 'New ministry creation request',
+          body: name ? `Ministry: ${name}` : 'A new request was submitted',
+          ministryId: null,
+          ministryName: name,
+          payload: { requestId: snap.id, ministryName: name },
+          route: '/pastor-approvals',
+        })
+      )
+    );
+  }
+);
 
-  const requestId = s(request.data?.requestId);
-  const reason = s(request.data?.reason); // optional
-  if (!requestId) throw HttpsError("invalid-argument", "requestId required.");
+/* ===========================
+   3) JOIN REQUESTS: notify leaders when created
+   Each join_requests doc contains { memberId, ministryId (actually name) ... }
+   =========================== */
+exports.onJoinRequestCreated = onDocumentCreated(
+  'join_requests/{id}',
+  async (event) => {
+    const doc = event.data;
+    if (!doc) return;
+    const jr = doc.data();
+    const memberId = safeStr(jr.memberId);
+    const ministryName = safeStr(jr.ministryId);
+    if (!ministryName) return;
 
-  const reqRef = db.collection("ministry_creation_requests").doc(requestId);
-  const reqSnap = await reqRef.get();
-  if (!reqSnap.exists) throw HttpsError("not-found", "Request not found.");
+    // Find ministry doc by name
+    const mins = await db
+      .collection('ministries')
+      .where('name', '==', ministryName)
+      .where('approved', '==', true)
+      .limit(1)
+      .get();
 
-  const r = reqSnap.data();
-  if (r.status !== "pending") return { ok: true, info: "Already processed." };
+    if (mins.empty) return;
+    const ministryDoc = mins.docs[0];
+    const ministry = ministryDoc.data();
+    const leaderIds = Array.isArray(ministry.leaderIds) ? ministry.leaderIds : [];
 
-  await reqRef.update({
-    status: "declined",
-    declineReason: reason || null,
-    updatedAt: FieldValue.serverTimestamp(),
-  });
+    // Resolve requester name (from members/{memberId})
+    let requesterName = 'Member';
+    if (memberId) {
+      const memSnap = await db.doc(`members/${memberId}`).get();
+      if (memSnap.exists) {
+        const m = memSnap.data() || {};
+        const full = safeStr(m.fullName);
+        const fn = safeStr(m.firstName);
+        const ln = safeStr(m.lastName);
+        requesterName = full || [fn, ln].filter(Boolean).join(' ') || 'Member';
+      }
+    }
 
-  const requesterUid = s(r.requestedByUid);
-  if (requesterUid) {
-    await writeNotification({
-      toUid: requesterUid,
-      type: "ministry_request_result",
-      title: "Ministry declined",
-      body: reason ? `${r.name} was declined: ${reason}` : `${r.name} was declined.`,
-      ministryName: s(r.name),
+    await Promise.all(
+      leaderIds.map((uid) =>
+        writeInbox(uid, {
+          type: 'join_request_created',
+          channel: 'joinreq',
+          title: `Join request from ${requesterName}`,
+          body: `Ministry: ${ministryName}`,
+          ministryId: ministryDoc.id,
+          ministryName,
+          payload: {
+            joinRequestId: doc.id,
+            memberId,
+            ministryId: ministryName, // legacy compatibility
+            ministryName,
+            requesterName,
+          },
+          route: '/leader-join-requests',
+        })
+      )
+    );
+  }
+);
+
+/* ===========================
+   4) JOIN REQUESTS: notify requester when status changes
+   Leaders/Admins update join_requests.status. We notify the requester.
+   =========================== */
+exports.onJoinRequestUpdated = onDocumentUpdated(
+  'join_requests/{id}',
+  async (event) => {
+    const before = event.data?.before?.data();
+    const after = event.data?.after?.data();
+    if (!before || !after) return;
+
+    const prev = safeStr(before.status || 'pending');
+    const next = safeStr(after.status || 'pending');
+    if (prev === next) return;
+
+    const memberId = safeStr(after.memberId);
+    const ministryName = safeStr(after.ministryId);
+    let toUid = safeStr(after.requestedByUid);
+
+    // If requestedByUid missing, try resolve via users.memberId
+    if (!toUid && memberId) {
+      const users = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
+      if (!users.empty) toUid = users.docs[0].id;
+    }
+    if (!toUid) return;
+
+    const pretty = next.charAt(0).toUpperCase() + next.slice(1);
+    await writeInbox(toUid, {
+      type: 'join_request_status',
+      channel: 'joinreq',
+      title: `Join request ${pretty}`,
+      body: ministryName ? `Ministry: ${ministryName}` : '',
+      ministryId: null,
+      ministryName,
+      payload: {
+        joinRequestId: event.params.id,
+        memberId,
+        ministryId: ministryName, // legacy
+        ministryName,
+        status: next,
+      },
+      route: '/my-join-requests',
     });
-  }
-
-  return { ok: true, requestId };
-});
-
-/* -----------------------------------------------------------------
-   Cancel ministry creation (owner, pastor, or admin)
------------------------------------------------------------------ */
-exports.cancelMinistryCreation = onCall(async (request) => {
-  const auth = requireAuth(request);
-  const uid = auth.uid;
-
-  const requestId = s(request.data?.requestId);
-  if (!requestId) throw HttpsError("invalid-argument", "requestId required.");
-
-  const reqRef = db.collection("ministry_creation_requests").doc(requestId);
-  const snap = await reqRef.get();
-  if (!snap.exists) throw HttpsError("not-found", "Request not found.");
-
-  const r = snap.data();
-  if (r.status !== "pending") return { ok: true, info: "Already processed." };
-
-  const roles = await getUserRoles(uid);
-  const isOwner = s(r.requestedByUid) === uid;
-  const isPastorOrAdmin = hasRole(roles, "pastor") || hasRole(roles, "admin");
-  if (!isOwner && !isPastorOrAdmin) {
-    throw HttpsError("permission-denied", "Only the requester or a pastor/admin can cancel.");
-  }
-
-  await reqRef.delete();
-
-  await writeNotification({
-    toRole: "pastor",
-    type: "ministry_request_cancelled",
-    title: "Ministry request cancelled",
-    body: `"${s(r.name)}" was cancelled by ${isOwner ? 'the requester' : 'a pastor/admin'}.`,
-    route: "/pastor-approvals",
-    requestId,
-    ministryName: s(r.name),
-  });
-
-  return { ok: true, requestId };
-});
-
-/* --------------------------------------------------
-   Nightly cleanup (placeholder)
--------------------------------------------------- */
-exports.cleanupOldInboxEvents = onSchedule(
-  {
-    schedule: "30 3 * * *",
-    timeZone: "Europe/London",
-    region: "europe-west2",
-    memory: "256MiB",
-  },
-  async () => {
-    // TODO if you want to prune old inbox items
   }
 );
