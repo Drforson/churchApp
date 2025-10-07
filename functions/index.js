@@ -6,15 +6,11 @@ const admin = require('firebase-admin');
 admin.initializeApp();
 const db = admin.firestore();
 
-// Adjust region to your deployment region
+// Match your deployed region
 setGlobalOptions({ region: 'europe-west2' });
 
-/* ===========================
-   Helpers
-   =========================== */
-function safeStr(v) {
-  return (v ?? '').toString();
-}
+/* ========= Helpers ========= */
+const S = (v) => (v ?? '').toString();
 
 async function getUserRoles(uid) {
   const snap = await db.doc(`users/${uid}`).get();
@@ -22,40 +18,42 @@ async function getUserRoles(uid) {
   return Array.isArray(roles) ? roles : [];
 }
 
-async function listPastorUids() {
-  const qs = await db.collection('users').where('roles', 'array-contains', 'pastor').get();
-  return qs.docs.map((d) => d.id);
+async function listUidsByRole(role) {
+  const qs = await db.collection('users').where('roles', 'array-contains', role).get();
+  return qs.docs.map(d => d.id);
+}
+
+async function listPastorAndAdminUids() {
+  const [pastors, admins] = await Promise.all([listUidsByRole('pastor'), listUidsByRole('admin')]);
+  const set = new Set([...pastors, ...admins]); // no dupes
+  return Array.from(set);
 }
 
 async function writeInbox(uid, payload) {
-  // Ensure inbox doc exists (also used for lastSeenAt)
   await db.collection('inbox').doc(uid).set(
     { lastSeenAt: admin.firestore.FieldValue.serverTimestamp() },
-    { merge: true },
+    { merge: true }
   );
-  // Store event
   await db.collection('inbox').doc(uid).collection('events').add({
     ...payload,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
 
-/* ===========================
-   1) Process Ministry Approval Actions (approve | decline)
-   Client writes to /ministry_approval_actions; server does privileged writes.
-   =========================== */
+/* =========================================================
+   1) Process approval actions (approve | decline) – secure
+   Client writes to /ministry_approval_actions; server does the work.
+   ========================================================= */
 exports.processMinistryApprovalAction = onDocumentCreated(
   'ministry_approval_actions/{id}',
   async (event) => {
-    const ref = event.data;
-    if (!ref) return;
+    const doc = event.data;
+    if (!doc) return;
 
-    const act = ref.data();
-    const { action, requestId, reason, byUid } = act || {};
-
+    const { action, requestId, reason, byUid } = doc.data() || {};
     if (!action || !requestId || !byUid) {
-      logger.warn('Invalid approval action payload', act);
-      await ref.ref.update({ status: 'invalid', processedAt: new Date() });
+      logger.warn('Invalid payload on approval action', doc.id);
+      await doc.ref.update({ status: 'invalid', processedAt: new Date() });
       return;
     }
 
@@ -64,39 +62,36 @@ exports.processMinistryApprovalAction = onDocumentCreated(
     const allowed = roles.includes('pastor') || roles.includes('admin');
     if (!allowed) {
       logger.warn('Unauthorized approval action by', byUid, roles);
-      await ref.ref.update({ status: 'denied', processedAt: new Date() });
+      await doc.ref.update({ status: 'denied', processedAt: new Date() });
       return;
     }
 
     const reqRef = db.doc(`ministry_creation_requests/${requestId}`);
     const reqSnap = await reqRef.get();
     if (!reqSnap.exists) {
-      await ref.ref.update({ status: 'not_found', processedAt: new Date() });
+      await doc.ref.update({ status: 'not_found', processedAt: new Date() });
       return;
     }
     const r = reqSnap.data();
-    const currentStatus = safeStr(r.status || 'pending');
-    if (currentStatus !== 'pending') {
-      await ref.ref.update({ status: 'already_processed', processedAt: new Date() });
+    if (S(r.status || 'pending') !== 'pending') {
+      await doc.ref.update({ status: 'already_processed', processedAt: new Date() });
       return;
     }
 
     try {
       if (action === 'approve') {
-        // Prepare a new ministry id so we can include it in notifications
         const minRef = db.collection('ministries').doc();
 
         await db.runTransaction(async (txn) => {
           txn.set(minRef, {
             id: minRef.id,
-            name: safeStr(r.name),
-            description: safeStr(r.description),
+            name: S(r.name),
+            description: S(r.description),
             approved: true,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            createdBy: safeStr(r.requestedByUid) || byUid,
-            leaderIds: safeStr(r.requestedByUid) ? [safeStr(r.requestedByUid)] : [],
+            createdBy: S(r.requestedByUid) || byUid,
+            leaderIds: S(r.requestedByUid) ? [S(r.requestedByUid)] : [],
           });
-
           txn.update(reqRef, {
             status: 'approved',
             approvedMinistryId: minRef.id,
@@ -105,83 +100,99 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           });
         });
 
-        // Notify requester (inbox)
-        const requesterUid = safeStr(r.requestedByUid);
+        // Notify requester in inbox
+        const requesterUid = S(r.requestedByUid);
         if (requesterUid) {
           await writeInbox(requesterUid, {
             type: 'ministry_request_approved',
             channel: 'approvals',
             title: 'Your ministry was approved',
-            body: `"${safeStr(r.name)}" is now live.`,
-            // convenience top-level for your NotificationCenterPage:
+            body: `"${S(r.name)}" is now live.`,
             ministryId: minRef.id,
-            ministryName: safeStr(r.name),
-            // payload for future-proof linking
-            payload: {
-              requestId,
-              ministryId: minRef.id,
-              ministryName: safeStr(r.name),
-            },
+            ministryName: S(r.name),
+            payload: { requestId, ministryId: minRef.id, ministryName: S(r.name) },
             route: '/pastor-approvals',
           });
         }
 
-        await ref.ref.update({ status: 'ok', processedAt: new Date() });
+        // Optional: confirm to approver too
+        await writeInbox(byUid, {
+          type: 'approval_action_processed',
+          channel: 'approvals',
+          title: 'Approved ministry request',
+          body: `"${S(r.name)}" approved.`,
+          ministryId: minRef.id,
+          ministryName: S(r.name),
+          payload: { requestId, action: 'approve' },
+          route: '/pastor-approvals',
+        });
+
+        await doc.ref.update({ status: 'ok', processedAt: new Date() });
       } else if (action === 'decline') {
         await reqRef.update({
           status: 'declined',
-          declineReason: safeStr(reason) || null,
+          declineReason: S(reason) || null,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           declinedByUid: byUid,
         });
 
-        const requesterUid = safeStr(r.requestedByUid);
+        const requesterUid = S(r.requestedByUid);
         if (requesterUid) {
           await writeInbox(requesterUid, {
             type: 'ministry_request_declined',
             channel: 'approvals',
             title: 'Your ministry was declined',
-            body: `"${safeStr(r.name)}" was declined${safeStr(reason) ? `: ${safeStr(reason)}` : ''}`,
+            body: `"${S(r.name)}" was declined${S(reason) ? `: ${S(reason)}` : ''}`,
             ministryId: null,
-            ministryName: safeStr(r.name),
-            payload: {
-              requestId,
-              ministryId: null,
-              ministryName: safeStr(r.name),
-            },
+            ministryName: S(r.name),
+            payload: { requestId, ministryId: null, ministryName: S(r.name) },
             route: '/pastor-approvals',
           });
         }
 
-        await ref.ref.update({ status: 'ok', processedAt: new Date() });
+        await writeInbox(byUid, {
+          type: 'approval_action_processed',
+          channel: 'approvals',
+          title: 'Declined ministry request',
+          body: `"${S(r.name)}" declined${S(reason) ? `: ${S(reason)}` : ''}`,
+          ministryId: null,
+          ministryName: S(r.name),
+          payload: { requestId, action: 'decline' },
+          route: '/pastor-approvals',
+        });
+
+        await doc.ref.update({ status: 'ok', processedAt: new Date() });
       } else {
-        await ref.ref.update({ status: 'unknown_action', processedAt: new Date() });
+        await doc.ref.update({ status: 'unknown_action', processedAt: new Date() });
       }
     } catch (e) {
       logger.error('processMinistryApprovalAction error', e);
-      await ref.ref.update({
-        status: 'error',
-        error: (e && e.message) || String(e),
-        processedAt: new Date(),
-      });
+      await doc.ref.update({ status: 'error', error: (e && e.message) || String(e), processedAt: new Date() });
     }
   }
 );
 
-/* ===========================
-   2) Notify pastors when a new ministry creation request is submitted
-   =========================== */
+/* =========================================================
+   2) Notify pastors & admins when a new ministry request is submitted
+   (fires when leaders create /ministry_creation_requests doc)
+   ========================================================= */
 exports.onMinistryCreationRequestCreated = onDocumentCreated(
   'ministry_creation_requests/{id}',
   async (event) => {
     const snap = event.data;
     if (!snap) return;
     const r = snap.data();
-    const name = safeStr(r.name);
-    const pastors = await listPastorUids();
+    const name = S(r.name);
+
+    // Notify BOTH roles to be safe
+    const approverUids = await listPastorAndAdminUids();
+    if (!approverUids.length) {
+      logger.warn('No pastors/admins to notify for new ministry request');
+      return;
+    }
 
     await Promise.all(
-      pastors.map((uid) =>
+      approverUids.map((uid) =>
         writeInbox(uid, {
           type: 'ministry_request_created',
           channel: 'approvals',
@@ -197,42 +208,39 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated(
   }
 );
 
-/* ===========================
-   3) JOIN REQUESTS: notify leaders when created
-   Each join_requests doc contains { memberId, ministryId (actually name) ... }
-   =========================== */
+/* =========================================================
+   3) JOIN REQUESTS: notify ministry leaders when a join request is created
+   ========================================================= */
 exports.onJoinRequestCreated = onDocumentCreated(
   'join_requests/{id}',
   async (event) => {
     const doc = event.data;
     if (!doc) return;
     const jr = doc.data();
-    const memberId = safeStr(jr.memberId);
-    const ministryName = safeStr(jr.ministryId);
+    const memberId = S(jr.memberId);
+    const ministryName = S(jr.ministryId); // "name" in your schema
     if (!ministryName) return;
 
-    // Find ministry doc by name
-    const mins = await db
-      .collection('ministries')
+    const mins = await db.collection('ministries')
       .where('name', '==', ministryName)
       .where('approved', '==', true)
       .limit(1)
       .get();
-
     if (mins.empty) return;
-    const ministryDoc = mins.docs[0];
-    const ministry = ministryDoc.data();
+
+    const minDoc = mins.docs[0];
+    const ministry = minDoc.data();
     const leaderIds = Array.isArray(ministry.leaderIds) ? ministry.leaderIds : [];
 
-    // Resolve requester name (from members/{memberId})
+    // Requester name
     let requesterName = 'Member';
     if (memberId) {
       const memSnap = await db.doc(`members/${memberId}`).get();
       if (memSnap.exists) {
         const m = memSnap.data() || {};
-        const full = safeStr(m.fullName);
-        const fn = safeStr(m.firstName);
-        const ln = safeStr(m.lastName);
+        const full = S(m.fullName);
+        const fn = S(m.firstName);
+        const ln = S(m.lastName);
         requesterName = full || [fn, ln].filter(Boolean).join(' ') || 'Member';
       }
     }
@@ -244,12 +252,12 @@ exports.onJoinRequestCreated = onDocumentCreated(
           channel: 'joinreq',
           title: `Join request from ${requesterName}`,
           body: `Ministry: ${ministryName}`,
-          ministryId: ministryDoc.id,
+          ministryId: minDoc.id,
           ministryName,
           payload: {
             joinRequestId: doc.id,
             memberId,
-            ministryId: ministryName, // legacy compatibility
+            ministryId: ministryName, // legacy naming in your app
             ministryName,
             requesterName,
           },
@@ -260,10 +268,9 @@ exports.onJoinRequestCreated = onDocumentCreated(
   }
 );
 
-/* ===========================
-   4) JOIN REQUESTS: notify requester when status changes
-   Leaders/Admins update join_requests.status. We notify the requester.
-   =========================== */
+/* =========================================================
+   4) JOIN REQUESTS: notify requester on status change
+   ========================================================= */
 exports.onJoinRequestUpdated = onDocumentUpdated(
   'join_requests/{id}',
   async (event) => {
@@ -271,22 +278,21 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     const after = event.data?.after?.data();
     if (!before || !after) return;
 
-    const prev = safeStr(before.status || 'pending');
-    const next = safeStr(after.status || 'pending');
+    const prev = S(before.status || 'pending');
+    const next = S(after.status || 'pending');
     if (prev === next) return;
 
-    const memberId = safeStr(after.memberId);
-    const ministryName = safeStr(after.ministryId);
-    let toUid = safeStr(after.requestedByUid);
+    const memberId = S(after.memberId);
+    const ministryName = S(after.ministryId);
+    let toUid = S(after.requestedByUid);
 
-    // If requestedByUid missing, try resolve via users.memberId
     if (!toUid && memberId) {
       const users = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
       if (!users.empty) toUid = users.docs[0].id;
     }
     if (!toUid) return;
 
-    const pretty = next.charAt(0).toUpperCase() + next.slice(1);
+    const pretty = next[0]?.toUpperCase() + next.slice(1);
     await writeInbox(toUid, {
       type: 'join_request_status',
       channel: 'joinreq',

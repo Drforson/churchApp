@@ -16,9 +16,6 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
   final Set<String> _busy = {};
   final Map<String, String> _nameCache = {};
 
-  /* =========================
-     Enqueue Approve / Decline
-     ========================= */
   Future<void> _approveRequest(BuildContext context, String requestId, String name) async {
     setState(() => _busy.add(requestId));
     try {
@@ -71,18 +68,14 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     }
   }
 
-  /* =========================
-     Requester Name lookup
-     ========================= */
   Future<String> _resolveRequesterName(Map<String, dynamic> data) async {
     final memberId = (data['requestedByMemberId'] ?? '').toString();
     final uid = (data['requestedByUid'] ?? '').toString();
     final email = (data['requesterEmail'] ?? '').toString();
 
     if (memberId.isNotEmpty) {
-      final key = 'mem:$memberId';
-      final cached = _nameCache[key];
-      if (cached != null) return cached;
+      final k = 'mem:$memberId';
+      if (_nameCache.containsKey(k)) return _nameCache[k]!;
       try {
         final mem = await _db.collection('members').doc(memberId).get();
         if (mem.exists) {
@@ -92,7 +85,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
           final last = (m['lastName'] ?? '').toString().trim();
           final name = full.isNotEmpty ? full : [first, last].where((e) => e.isNotEmpty).join(' ').trim();
           if (name.isNotEmpty) {
-            _nameCache[key] = name;
+            _nameCache[k] = name;
             return name;
           }
         }
@@ -100,22 +93,21 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     }
 
     if (uid.isNotEmpty) {
-      final key = 'uid:$uid';
-      final cached = _nameCache[key];
-      if (cached != null) return cached;
+      final k = 'uid:$uid';
+      if (_nameCache.containsKey(k)) return _nameCache[k]!;
       try {
         final usr = await _db.collection('users').doc(uid).get();
         if (usr.exists) {
           final u = usr.data() ?? {};
           final full = (u['fullName'] ?? '').toString().trim();
           if (full.isNotEmpty) {
-            _nameCache[key] = full;
+            _nameCache[k] = full;
             return full;
           }
           final linkedMemberId = (u['memberId'] ?? '').toString();
           if (linkedMemberId.isNotEmpty) {
             final name = await _resolveRequesterName({'requestedByMemberId': linkedMemberId});
-            _nameCache[key] = name;
+            _nameCache[k] = name;
             return name;
           }
         }
@@ -136,9 +128,6 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     );
   }
 
-  /* =========================
-     Decline dialog (safe submit)
-     ========================= */
   Future<String?> _showDeclineDialogAndReturnReason(BuildContext context) async {
     final ctrl = TextEditingController();
     bool submitting = false;
@@ -185,9 +174,6 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     );
   }
 
-  /* =========================
-     UI
-     ========================= */
   @override
   Widget build(BuildContext context) {
     final q = _db.collection('ministry_creation_requests').where('status', isEqualTo: 'pending');
@@ -252,7 +238,6 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // Header (wrap-safe)
                         Wrap(
                           spacing: 8,
                           runSpacing: 6,
@@ -270,10 +255,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                             if (when.isNotEmpty) _InfoTag(icon: Icons.schedule, text: when),
                           ],
                         ),
-
                         const SizedBox(height: 8),
-
-                        // Meta info: requester NAME + (press-hold) description
                         Wrap(
                           spacing: 8,
                           runSpacing: 6,
@@ -288,10 +270,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                               ),
                           ],
                         ),
-
                         const SizedBox(height: 10),
-
-                        // Actions
                         Row(
                           children: [
                             const Spacer(),
@@ -301,27 +280,17 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                               children: [
                                 OutlinedButton.icon(
                                   icon: busy
-                                      ? const SizedBox(
-                                      width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
                                       : const Icon(Icons.close, size: 18),
                                   label: busy ? const SizedBox.shrink() : const Text('Decline'),
                                   onPressed: busy ? null : () => _declineRequest(context, id, name),
-                                  style: OutlinedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                                    minimumSize: const Size(0, 36),
-                                  ),
                                 ),
                                 ElevatedButton.icon(
                                   icon: busy
-                                      ? const SizedBox(
-                                      width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
                                       : const Icon(Icons.check, size: 18),
                                   label: busy ? const SizedBox.shrink() : const Text('Approve'),
                                   onPressed: busy ? null : () => _approveRequest(context, id, name),
-                                  style: ElevatedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                                    minimumSize: const Size(0, 36),
-                                  ),
                                 ),
                               ],
                             ),
@@ -340,9 +309,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
   }
 }
 
-/* ===========================
-   Small UI helpers
-   =========================== */
+/* ===== UI helpers ===== */
 
 class _InfoTag extends StatelessWidget {
   final IconData icon;
@@ -386,7 +353,6 @@ class _InfoTag extends StatelessWidget {
   }
 }
 
-/// Press-and-hold to expand the description; release to collapse.
 class _PressHoldDescriptionPill extends StatefulWidget {
   final String text;
   final int collapsedLines;
@@ -437,11 +403,7 @@ class _PressHoldDescriptionPillState extends State<_PressHoldDescriptionPill> {
               maxLines: _pressed ? 12 : widget.collapsedLines,
               overflow: _pressed ? TextOverflow.visible : TextOverflow.ellipsis,
               softWrap: true,
-              style: TextStyle(
-                fontSize: 12.5,
-                color: Colors.grey.shade800,
-                height: 1.3,
-              ),
+              style: TextStyle(fontSize: 12.5, color: Colors.grey.shade800, height: 1.3),
             ),
           ),
         ],
