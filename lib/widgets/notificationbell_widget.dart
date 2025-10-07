@@ -1,3 +1,4 @@
+// lib/widgets/notification_bell.dart
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -19,21 +20,60 @@ class _NotificationBellState extends State<NotificationBell> {
   List<String> _roles = const [];
   List<String> _myRequestIds = const [];
 
+  StreamSubscription<User?>? _authSub;
   Stream<int>? _countStream;
+
+  int _bootGen = 0; // generation token to cancel stale async work
 
   @override
   void initState() {
     super.initState();
     _uid = FirebaseAuth.instance.currentUser?.uid;
     _bootstrap();
+
+    // React to auth changes (sign in/out) safely.
+    _authSub = FirebaseAuth.instance.authStateChanges().listen((u) async {
+      _uid = u?.uid;
+      if (_uid == null) {
+        if (!mounted) return;
+        setState(() {
+          _roles = const [];
+          _myRequestIds = const [];
+          _countStream = null;
+        });
+        return;
+      }
+      await _bootstrap();
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    _authSub = null;
+    super.dispose();
   }
 
   Future<void> _bootstrap() async {
-    if (_uid == null) return;
-    _roles = await _loadUserRoles(_uid!);
-    _myRequestIds = await _loadMyRecentRequestIds(_uid!);
+    final uid = _uid;
+    if (uid == null) return;
+
+    // bump generation; capture local copy
+    final myGen = ++_bootGen;
+
+    final roles = await _loadUserRoles(uid);
+    if (!mounted || myGen != _bootGen) return;
+
+    final requestIds = await _loadMyRecentRequestIds(uid);
+    if (!mounted || myGen != _bootGen) return;
+
+    final stream = _buildUnreadCountStream(uid, roles, requestIds);
+    if (!mounted || myGen != _bootGen) return;
+
     setState(() {
-      _countStream = _buildUnreadCountStream(_uid!, _roles, _myRequestIds);
+      _roles = roles;
+      _myRequestIds = requestIds;
+      _countStream = stream;
     });
   }
 
@@ -41,7 +81,10 @@ class _NotificationBellState extends State<NotificationBell> {
     try {
       final doc = await _db.collection('users').doc(uid).get();
       if (!doc.exists) return const [];
-      return List<String>.from((doc.data() ?? const {})['roles'] ?? const <String>[]);
+      final data = doc.data() ?? const {};
+      return (data['roles'] is List)
+          ? List<String>.from(data['roles'])
+          : const <String>[];
     } catch (_) {
       return const [];
     }
@@ -62,49 +105,48 @@ class _NotificationBellState extends State<NotificationBell> {
   }
 
   Stream<int> _buildUnreadCountStream(String uid, List<String> roles, List<String> reqIds) {
-    // Inbox (personal)
+    // Inbox (personal, server-authored) — canonical source
     final inbox$ = _db
         .collection('inbox')
         .doc(uid)
         .collection('events')
-        .orderBy('createdAt', descending: true)
-        .limit(100)
+        .where('read', isEqualTo: false)
+        .limit(200)
         .snapshots()
-        .map((s) => s.docs.where((d) => (d.data()['read'] != true)).length);
+        .map((s) => s.size);
 
-    // Direct notifications
+    // Direct notifications (legacy collection)
     final direct$ = _db
         .collection('notifications')
         .where('toUid', isEqualTo: uid)
-        .orderBy('createdAt', descending: true)
-        .limit(100)
+        .where('read', isEqualTo: false)
+        .limit(200)
         .snapshots()
-    // Some docs may not have `read` -> treat as unread
-        .map((s) => s.docs.where((d) => (d.data()['read'] != true)).length);
+        .map((s) => s.size);
 
-    // Role-based (optional)
+    // Role-based notifications (legacy). Firestore whereIn cap = 10.
     Stream<int> role$ = Stream.value(0);
     if (roles.isNotEmpty) {
       role$ = _db
           .collection('notifications')
           .where('toRole', whereIn: roles.take(10).toList())
-          .orderBy('createdAt', descending: true)
-          .limit(100)
+          .where('read', isEqualTo: false)
+          .limit(200)
           .snapshots()
-          .map((s) => s.docs.where((d) => (d.data()['read'] != true)).length);
+          .map((s) => s.size);
     }
 
-    // Requester notifications (optional)
+    // Requester notifications (legacy) for my recent requests
     Stream<int> requester$ = Stream.value(0);
     if (reqIds.isNotEmpty) {
       requester$ = _db
           .collection('notifications')
           .where('toRequester', isEqualTo: true)
           .where('requestId', whereIn: reqIds.take(10).toList())
-          .orderBy('createdAt', descending: true)
-          .limit(50)
+          .where('read', isEqualTo: false)
+          .limit(200)
           .snapshots()
-          .map((s) => s.docs.where((d) => (d.data()['read'] != true)).length);
+          .map((s) => s.size);
     }
 
     return Rx.combineLatest4<int, int, int, int, int>(
@@ -113,21 +155,19 @@ class _NotificationBellState extends State<NotificationBell> {
       role$,
       requester$,
           (a, b, c, d) => a + b + c + d,
-    );
+    ).distinct();
   }
 
   void _openCenter() {
-    final uid = _uid;
-    if (uid == null) return;
+    if (_uid == null) return;
     Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => NotificationCenterPage(uid: uid)),
+      MaterialPageRoute(builder: (_) => const NotificationCenterPage()),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final uid = _uid;
-    if (uid == null) {
+    if (_uid == null) {
       return IconButton(
         icon: const Icon(Icons.notifications_none),
         onPressed: null,
@@ -136,7 +176,7 @@ class _NotificationBellState extends State<NotificationBell> {
     }
 
     if (_countStream == null) {
-      // Loading roles/my requests
+      // Still loading roles/requests; allow opening center anyway.
       return IconButton(
         icon: const Icon(Icons.notifications_none),
         onPressed: _openCenter,

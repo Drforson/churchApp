@@ -1,7 +1,11 @@
-import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:intl/intl.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import '../core/firestore_paths.dart';
 
 class PastorMinistryApprovalsPage extends StatefulWidget {
   const PastorMinistryApprovalsPage({super.key});
@@ -12,296 +16,318 @@ class PastorMinistryApprovalsPage extends StatefulWidget {
 
 class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPage> {
   final _db = FirebaseFirestore.instance;
+  final _auth = FirebaseAuth.instance;
 
-  final Set<String> _busy = {};
+  bool _loadingRole = true;
+  bool _canModerate = false; // pastor || admin (users doc, claims, or member fallback)
+  String? _uid;
+
+  Map<String, dynamic> _debug = {};
   final Map<String, String> _nameCache = {};
 
-  Future<void> _approveRequest(BuildContext context, String requestId, String name) async {
-    setState(() => _busy.add(requestId));
-    try {
-      final uid = FirebaseAuth.instance.currentUser!.uid;
-      await _db.collection('ministry_approval_actions').add({
-        'action': 'approve',
-        'requestId': requestId,
-        'byUid': uid,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Approval submitted for "$name"')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to approve: $e')));
-      }
-    } finally {
-      if (mounted) setState(() => _busy.remove(requestId));
-    }
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _userSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _wireRoleListener();
   }
 
-  Future<void> _declineRequest(BuildContext context, String requestId, String name) async {
-    final reason = await _showDeclineDialogAndReturnReason(context);
-    if (reason == null) return;
-
-    setState(() => _busy.add(requestId));
-    try {
-      final uid = FirebaseAuth.instance.currentUser!.uid;
-      await _db.collection('ministry_approval_actions').add({
-        'action': 'decline',
-        'requestId': requestId,
-        'reason': reason.trim().isEmpty ? null : reason.trim(),
-        'byUid': uid,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Decline submitted for "$name"')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to decline: $e')));
-      }
-    } finally {
-      if (mounted) setState(() => _busy.remove(requestId));
-    }
+  @override
+  void dispose() {
+    _userSub?.cancel();
+    _userSub = null;
+    super.dispose();
   }
 
-  Future<String> _resolveRequesterName(Map<String, dynamic> data) async {
-    final memberId = (data['requestedByMemberId'] ?? '').toString();
-    final uid = (data['requestedByUid'] ?? '').toString();
-    final email = (data['requesterEmail'] ?? '').toString();
+  // Mirrors RoleGate: users → (else) members fallback; plus custom claims
+  Future<void> _wireRoleListener() async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      setState(() {
+        _uid = null;
+        _loadingRole = false;
+        _canModerate = false;
+        _debug = {'reason': 'no-auth-user'};
+      });
+      return;
+    }
+    _uid = user.uid;
 
-    if (memberId.isNotEmpty) {
-      final k = 'mem:$memberId';
-      if (_nameCache.containsKey(k)) return _nameCache[k]!;
-      try {
-        final mem = await _db.collection('members').doc(memberId).get();
-        if (mem.exists) {
-          final m = mem.data() ?? {};
-          final full = (m['fullName'] ?? '').toString().trim();
-          final first = (m['firstName'] ?? '').toString().trim();
-          final last = (m['lastName'] ?? '').toString().trim();
-          final name = full.isNotEmpty ? full : [first, last].where((e) => e.isNotEmpty).join(' ').trim();
-          if (name.isNotEmpty) {
-            _nameCache[k] = name;
-            return name;
-          }
+    _userSub = _db.collection(FP.users).doc(user.uid).snapshots().listen((snap) async {
+      final data = snap.data() ?? <String, dynamic>{};
+      final rolesLower = <String>{};
+      String? memberId = data['memberId'] as String?;
+
+      // users.roles array
+      if (data['roles'] is List) {
+        for (final v in List.from(data['roles'])) {
+          if (v is String && v.trim().isNotEmpty) rolesLower.add(v.trim().toLowerCase());
         }
-      } catch (_) {}
-    }
+      }
+      // users.role single
+      if (data['role'] is String && (data['role'] as String).trim().isNotEmpty) {
+        rolesLower.add((data['role'] as String).trim().toLowerCase());
+      }
+      // Boolean fallbacks
+      if (data['isPastor'] == true) rolesLower.add('pastor');
+      if (data['isAdmin'] == true) rolesLower.add('admin');
 
-    if (uid.isNotEmpty) {
-      final k = 'uid:$uid';
-      if (_nameCache.containsKey(k)) return _nameCache[k]!;
+      // Custom claims
       try {
-        final usr = await _db.collection('users').doc(uid).get();
-        if (usr.exists) {
-          final u = usr.data() ?? {};
-          final full = (u['fullName'] ?? '').toString().trim();
+        final token = await user.getIdTokenResult(true);
+        final claims = token.claims ?? {};
+        if (claims['pastor'] == true || claims['isPastor'] == true) rolesLower.add('pastor');
+        if (claims['admin'] == true || claims['isAdmin'] == true) rolesLower.add('admin');
+      } catch (_) {}
+
+      var granted = rolesLower.contains('pastor') || rolesLower.contains('admin');
+      Map<String, dynamic> memberData = const {};
+
+      // 🔁 Member fallback (exactly like RoleGate in main.dart)
+      if (!granted && memberId != null && memberId.isNotEmpty) {
+        try {
+          final mem = await _db.collection(FP.members).doc(memberId).get();
+          memberData = mem.data() ?? {};
+          final mRoles = (memberData['roles'] as List<dynamic>? ?? const [])
+              .map((e) => e.toString().toLowerCase())
+              .toSet();
+          final leads = List<String>.from(memberData['leadershipMinistries'] ?? const <String>[]);
+          if (mRoles.contains('admin')) {
+            rolesLower.add('admin');
+          } else if (mRoles.contains('pastor') || (memberData['isPastor'] == true)) {
+            rolesLower.add('pastor');
+          } else if (mRoles.contains('leader') || leads.isNotEmpty) {
+            rolesLower.add('leader');
+          }
+          granted = rolesLower.contains('pastor') || rolesLower.contains('admin');
+        } catch (_) {}
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _canModerate = granted;
+        _loadingRole = false;
+        _debug = {
+          'uid': user.uid,
+          'userDocPath': snap.reference.path,
+          'user.roles': data['roles'],
+          'user.role': data['role'],
+          'user.isPastor': data['isPastor'],
+          'user.isAdmin': data['isAdmin'],
+          'user.memberId': memberId,
+          'member.roles': memberData is Map ? memberData['roles'] : null,
+          'member.isPastor': memberData is Map ? memberData['isPastor'] : null,
+          'member.leadershipMinistries': memberData is Map ? memberData['leadershipMinistries'] : null,
+          'resolvedRolesLower': rolesLower.toList(),
+          'granted': granted,
+        };
+      });
+    });
+  }
+
+  Future<void> _enqueueAction({
+    required String requestId,
+    required String action, // 'approve' | 'decline'
+    String? reason,
+  }) async {
+    if (!_canModerate || _uid == null) return;
+
+    await _db.collection('ministry_approval_actions').add({
+      'action': action,
+      'requestId': requestId,
+      'reason': (reason ?? '').trim().isEmpty ? null : reason!.trim(),
+      'byUid': _uid,
+      'createdAt': FieldValue.serverTimestamp(),
+      'processed': false,
+    });
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(action == 'approve' ? 'Approval queued' : 'Decline queued')),
+    );
+  }
+
+  Future<void> _confirmDecline(String requestId) async {
+    final controller = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Decline request'),
+        content: TextField(
+          controller: controller,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            hintText: 'Optional: add a reason for declining',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Decline')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await _enqueueAction(requestId: requestId, action: 'decline', reason: controller.text);
+    }
+  }
+
+  Future<String> _resolveRequesterName({
+    required String requestedByUid,
+    String? fallbackFullName,
+    String? fallbackEmail,
+  }) async {
+    if (_nameCache.containsKey(requestedByUid)) return _nameCache[requestedByUid]!;
+    if ((fallbackFullName ?? '').trim().isNotEmpty) {
+      _nameCache[requestedByUid] = fallbackFullName!.trim();
+      return _nameCache[requestedByUid]!;
+    }
+    try {
+      final u = await _db.collection(FP.users).doc(requestedByUid).get();
+      final udata = u.data() ?? {};
+      final memberId = (udata['memberId'] ?? '').toString();
+      if (memberId.isNotEmpty) {
+        final m = await _db.collection(FP.members).doc(memberId).get();
+        if (m.exists) {
+          final md = m.data() as Map<String, dynamic>;
+          final fn = (md['firstName'] ?? '').toString().trim();
+          final ln = (md['lastName'] ?? '').toString().trim();
+          final full = [fn, ln].where((s) => s.isNotEmpty).join(' ').trim();
           if (full.isNotEmpty) {
-            _nameCache[k] = full;
+            _nameCache[requestedByUid] = full;
             return full;
           }
-          final linkedMemberId = (u['memberId'] ?? '').toString();
-          if (linkedMemberId.isNotEmpty) {
-            final name = await _resolveRequesterName({'requestedByMemberId': linkedMemberId});
-            _nameCache[k] = name;
-            return name;
-          }
         }
-      } catch (_) {}
+      }
+    } catch (_) {}
+    final fb = (fallbackEmail ?? '').trim();
+    if (fb.isNotEmpty) {
+      _nameCache[requestedByUid] = fb;
+      return fb;
     }
-
-    if (email.isNotEmpty) return email.split('@').first;
-    return 'Requester';
-  }
-
-  Widget _RequesterNamePill(Map<String, dynamic> data) {
-    return FutureBuilder<String>(
-      future: _resolveRequesterName(data),
-      builder: (context, snap) {
-        final text = snap.data ?? 'Requester';
-        return _InfoTag(icon: Icons.person, text: 'Requested by: $text', maxTextWidth: 280);
-      },
-    );
-  }
-
-  Future<String?> _showDeclineDialogAndReturnReason(BuildContext context) async {
-    final ctrl = TextEditingController();
-    bool submitting = false;
-
-    return showDialog<String>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setS) => AlertDialog(
-            title: const Text('Decline request'),
-            content: TextField(
-              controller: ctrl,
-              autofocus: true,
-              maxLines: 3,
-              textInputAction: TextInputAction.done,
-              decoration: const InputDecoration(
-                labelText: 'Reason (optional)',
-                hintText: 'Optionally provide a reason',
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: submitting ? null : () => Navigator.pop(ctx),
-                child: const Text('Cancel'),
-              ),
-              ElevatedButton(
-                onPressed: submitting
-                    ? null
-                    : () async {
-                  setS(() => submitting = true);
-                  FocusScope.of(ctx).unfocus();
-                  await Future.delayed(const Duration(milliseconds: 50));
-                  Navigator.pop(ctx, ctrl.text.trim());
-                },
-                child: submitting
-                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Text('Decline'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
+    _nameCache[requestedByUid] = requestedByUid;
+    return requestedByUid;
   }
 
   @override
   Widget build(BuildContext context) {
-    final q = _db.collection('ministry_creation_requests').where('status', isEqualTo: 'pending');
+    if (_loadingRole) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (!_canModerate) {
+      final pretty = const JsonEncoder().convert(_debug);
+      return Scaffold(
+        appBar: AppBar(title: const Text('Ministry Approvals')),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text(
+                    'Access denied.\nOnly pastors and admins can manage ministry creation requests.',
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  if (kDebugMode) ...[
+                    const Divider(),
+                    Text('Debug info:', style: Theme.of(context).textTheme.titleSmall),
+                    const SizedBox(height: 8),
+                    SelectableText(pretty),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    final query = _db
+        .collection('ministry_creation_requests')
+        .where('status', isEqualTo: 'pending')
+        .orderBy('requestedAt', descending: true);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Ministry Approvals')),
       body: StreamBuilder<QuerySnapshot>(
-        stream: q.snapshots(),
+        stream: query.snapshots(),
         builder: (context, snap) {
-          if (snap.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text('Error loading requests:\n${snap.error}', textAlign: TextAlign.center),
-              ),
-            );
-          }
-          if (snap.connectionState == ConnectionState.waiting && !snap.hasData) {
-            return const Center(child: CircularProgressIndicator());
-          }
+          if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+          final docs = snap.data!.docs;
+          if (docs.isEmpty) return const Center(child: Text('No pending requests.'));
 
-          final docs = [...(snap.data?.docs ?? const <QueryDocumentSnapshot>[])];
-          docs.sort((a, b) {
-            final ad = (a.data() as Map<String, dynamic>)['requestedAt'];
-            final bd = (b.data() as Map<String, dynamic>)['requestedAt'];
-            final aMs = ad is Timestamp ? ad.millisecondsSinceEpoch : 0;
-            final bMs = bd is Timestamp ? bd.millisecondsSinceEpoch : 0;
-            return bMs.compareTo(aMs);
-          });
+          return ListView.separated(
+            padding: const EdgeInsets.all(12),
+            itemCount: docs.length,
+            separatorBuilder: (_, __) => const SizedBox(height: 8),
+            itemBuilder: (context, i) {
+              final d = docs[i];
+              final data = d.data() as Map<String, dynamic>;
+              final id = d.id;
 
-          if (docs.isEmpty) {
-            return const Center(child: Text('No pending requests.'));
-          }
+              final ministryName = (data['name'] ?? data['ministryName'] ?? '').toString();
+              final description = (data['description'] ?? '').toString();
+              final requestedByUid = (data['requestedByUid'] ?? '').toString();
+              final requesterEmail = (data['requesterEmail'] ?? '').toString();
+              final requesterFullName = (data['requesterFullName'] ?? '').toString();
+              final ts = data['requestedAt'];
+              final requestedAt = ts is Timestamp ? ts.toDate() : null;
 
-          return RefreshIndicator(
-            onRefresh: () async {},
-            child: ListView.separated(
-              physics: const AlwaysScrollableScrollPhysics(),
-              padding: const EdgeInsets.all(12),
-              itemCount: docs.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 8),
-              itemBuilder: (context, i) {
-                final d = docs[i];
-                final data = d.data() as Map<String, dynamic>;
-                final id = d.id;
-                final name = (data['name'] ?? '').toString();
-                final desc = (data['description'] ?? '').toString();
-                final requestedAt = data['requestedAt'];
-                final busy = _busy.contains(id);
-
-                String when = '';
-                if (requestedAt is Timestamp) {
-                  final dt = requestedAt.toDate();
-                  when = DateFormat('MMM d, yyyy • HH:mm').format(dt);
-                }
-
-                return Card(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                  elevation: 2,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 6,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          children: [
-                            ConstrainedBox(
-                              constraints: const BoxConstraints(maxWidth: 520),
-                              child: Text(
-                                name.isEmpty ? '(Unnamed ministry)' : name,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
-                              ),
-                            ),
-                            if (when.isNotEmpty) _InfoTag(icon: Icons.schedule, text: when),
-                          ],
+              return Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(ministryName.isEmpty ? 'Unnamed Ministry' : ministryName,
+                          style: Theme.of(context).textTheme.titleLarge),
+                      const SizedBox(height: 6),
+                      if (description.isNotEmpty) Text(description),
+                      const SizedBox(height: 6),
+                      FutureBuilder<String>(
+                        future: _resolveRequesterName(
+                          requestedByUid: requestedByUid,
+                          fallbackFullName: requesterFullName.isNotEmpty ? requesterFullName : null,
+                          fallbackEmail: requesterEmail.isNotEmpty ? requesterEmail : null,
                         ),
-                        const SizedBox(height: 8),
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 6,
-                          children: [
-                            _RequesterNamePill(data),
-                            if (desc.isNotEmpty)
-                              _PressHoldDescriptionPill(
-                                text: desc,
-                                collapsedLines: 1,
-                                collapsedMaxWidth: 420,
-                                expandedMaxWidth: 700,
-                              ),
-                          ],
-                        ),
-                        const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            const Spacer(),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 6,
-                              children: [
-                                OutlinedButton.icon(
-                                  icon: busy
-                                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
-                                      : const Icon(Icons.close, size: 18),
-                                  label: busy ? const SizedBox.shrink() : const Text('Decline'),
-                                  onPressed: busy ? null : () => _declineRequest(context, id, name),
-                                ),
-                                ElevatedButton.icon(
-                                  icon: busy
-                                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
-                                      : const Icon(Icons.check, size: 18),
-                                  label: busy ? const SizedBox.shrink() : const Text('Approve'),
-                                  onPressed: busy ? null : () => _approveRequest(context, id, name),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
+                        builder: (context, nameSnap) {
+                          final name = nameSnap.data ?? '—';
+                          return Wrap(
+                            spacing: 12,
+                            runSpacing: 6,
+                            children: [
+                              _Chip('Requester', name),
+                              if (requesterEmail.isNotEmpty) _Chip('Email', requesterEmail),
+                              _Chip('Requested At', requestedAt?.toLocal().toString() ?? '—'),
+                            ],
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          TextButton.icon(
+                            onPressed: () => _confirmDecline(id),
+                            icon: const Icon(Icons.cancel),
+                            label: const Text('Decline'),
+                          ),
+                          const SizedBox(width: 12),
+                          ElevatedButton.icon(
+                            onPressed: () => _enqueueAction(requestId: id, action: 'approve'),
+                            icon: const Icon(Icons.check_circle),
+                            label: const Text('Approve'),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
-                );
-              },
-            ),
+                ),
+              );
+            },
           );
         },
       ),
@@ -309,115 +335,16 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
   }
 }
 
-/* ===== UI helpers ===== */
-
-class _InfoTag extends StatelessWidget {
-  final IconData icon;
-  final String text;
-  final int maxLines;
-  final double? maxTextWidth;
-
-  const _InfoTag({
-    required this.icon,
-    required this.text,
-    this.maxLines = 1,
-    this.maxTextWidth,
-  });
+class _Chip extends StatelessWidget {
+  final String label;
+  final String value;
+  const _Chip(this.label, this.value);
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.grey.shade100,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: Colors.grey.shade300),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 14, color: Colors.grey.shade700),
-          const SizedBox(width: 6),
-          ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: maxTextWidth ?? 260),
-            child: Text(
-              text,
-              maxLines: maxLines,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 12.5, color: Colors.grey.shade800, height: 1.25),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _PressHoldDescriptionPill extends StatefulWidget {
-  final String text;
-  final int collapsedLines;
-  final double collapsedMaxWidth;
-  final double expandedMaxWidth;
-
-  const _PressHoldDescriptionPill({
-    required this.text,
-    this.collapsedLines = 5,
-    this.collapsedMaxWidth = 420,
-    this.expandedMaxWidth = 700,
-  });
-
-  @override
-  State<_PressHoldDescriptionPill> createState() => _PressHoldDescriptionPillState();
-}
-
-class _PressHoldDescriptionPillState extends State<_PressHoldDescriptionPill> {
-  bool _pressed = false;
-
-  void _setPressed(bool v) {
-    if (mounted && _pressed != v) setState(() => _pressed = v);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final bg = _pressed ? Colors.amber.shade50 : Colors.grey.shade100;
-    final border = _pressed ? Colors.amber.shade200 : Colors.grey.shade300;
-
-    final content = Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: border),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.notes, size: 14, color: Colors.grey.shade700),
-          const SizedBox(width: 6),
-          ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: _pressed ? widget.expandedMaxWidth : widget.collapsedMaxWidth,
-            ),
-            child: Text(
-              widget.text,
-              maxLines: _pressed ? 12 : widget.collapsedLines,
-              overflow: _pressed ? TextOverflow.visible : TextOverflow.ellipsis,
-              softWrap: true,
-              style: TextStyle(fontSize: 12.5, color: Colors.grey.shade800, height: 1.3),
-            ),
-          ),
-        ],
-      ),
-    );
-
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (_) => _setPressed(true),
-      onTapUp: (_) => _setPressed(false),
-      onTapCancel: () => _setPressed(false),
-      onLongPressStart: (_) => _setPressed(true),
-      onLongPressEnd: (_) => _setPressed(false),
-      child: content,
+    return Chip(
+      label: Text('$label: ${value.isEmpty ? '—' : value}'),
+      visualDensity: VisualDensity.compact,
     );
   }
 }
