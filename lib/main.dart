@@ -32,7 +32,7 @@ import 'pages/membership_form_page.dart';
 import 'pages/attendance_checkin_page.dart';
 import 'pages/post_announcements_page.dart';
 import 'pages/view_members_page.dart';
-import 'pages/ministres_page.dart';
+import 'pages/ministries_page.dart';
 import 'pages/upload_excel_page.dart';
 import 'pages/debadmintestpage.dart';
 import 'pages/profilepage.dart';
