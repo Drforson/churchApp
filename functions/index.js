@@ -207,7 +207,7 @@ async function updateMemberAndLinkedUserRoles(memberId, { add = [], remove = [],
   if (uid) await syncClaimsForUid(uid);
 }
 
-/* Inbox (legacy) writer — kept for existing flows */
+/* Inbox writer (legacy) */
 async function writeInbox(uid, payload) {
   await db.collection('inbox').doc(uid).set({ lastSeenAt: ts() }, { merge: true });
 
@@ -228,18 +228,14 @@ async function writeInbox(uid, payload) {
   await db.collection('inbox').doc(uid).collection('events').add(toWrite);
 }
 
-/* =========================
-   Notifications collection
-   ========================= */
-
+/* Notifications collection */
 async function writeNotification(payload) {
-  // Always adds createdAt if caller forgot
   const data = { ...payload };
   if (!data.createdAt) data.createdAt = ts();
   await db.collection('notifications').add(data);
 }
 
-/** Broadcast to leaders/admins for a ministry (by name) */
+/* ========= Notifications helpers for leaders (join requests) ========= */
 async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
   await writeNotification({
     type, // 'join_request' | 'join_request_cancelled'
@@ -252,15 +248,12 @@ async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId
   });
 }
 
-/** Direct fan-out to each leader (by resolving members → users) */
 async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
-  // leaders as members
   const leadersSnap = await db
     .collection('members')
     .where('leadershipMinistries', 'array-contains', ministryName)
     .get();
 
-  // additionally: ministries doc may store leader uids
   let ministryLeaderUids = [];
   const mins = await db
     .collection('ministries')
@@ -275,7 +268,6 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
 
   const batch = db.batch();
 
-  // Fan-out via members→users
   for (const lm of leadersSnap.docs) {
     const leaderMemberId = lm.id;
     const userQs = await db
@@ -300,7 +292,6 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
     });
   }
 
-  // Fan-out via ministries.leaderIds (if present)
   for (const uid of ministryLeaderUids) {
     const ref = db.collection('notifications').doc();
     batch.set(ref, {
@@ -319,7 +310,7 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
   await batch.commit();
 }
 
-/** Direct to requester when approved/rejected */
+/* ========= Join-request requester result ========= */
 async function notifyRequesterResult({ ministryName, ministryDocId, joinRequestId, requesterMemberId, result, moderatorUid }) {
   let recipientUid = null;
   const userQs = await db
@@ -341,6 +332,39 @@ async function notifyRequesterResult({ ministryName, ministryDocId, joinRequestI
   });
 }
 
+/* ========= Ministry-request requester result ========= */
+async function notifyMinistryRequesterResult({ requestId, requesterUid, ministryName, ministryDocId, result, reviewerUid, reason }) {
+  if (!requesterUid) return;
+
+  // Notifications collection
+  await writeNotification({
+    type: 'ministry_request_result',
+    result, // 'approved' | 'declined'
+    requestId,
+    ministryName: ministryName || null,
+    ministryDocId: ministryDocId || null,
+    recipientUid: requesterUid,
+    reviewerUid: reviewerUid || null,
+    reason: reason || null,
+  });
+
+  // Legacy inbox mirror (for your existing clients)
+  await writeInbox(requesterUid, {
+    type: result === 'approved' ? 'ministry_request_approved' : 'ministry_request_declined',
+    channel: 'approvals',
+    title: result === 'approved' ? 'Your ministry was approved' : 'Your ministry was declined',
+    body:
+      result === 'approved'
+        ? (ministryName ? `"${ministryName}" is now live.` : 'Your ministry request is approved.')
+        : (ministryName ? `"${ministryName}" was declined${reason ? `: ${reason}` : ''}` : `Your request was declined${reason ? `: ${reason}` : ''}`),
+    ministryId: ministryDocId || null,
+    ministryName: ministryName || null,
+    payload: { requestId, ministryId: ministryDocId || null, ministryName: ministryName || null },
+    route: '/pastor-approvals',
+    dedupeKey: `min_req_${requestId}_${result}`,
+  });
+}
+
 /* =========================================================
    1) Ministry approval actions (secure)
    ========================================================= */
@@ -350,16 +374,17 @@ exports.processMinistryApprovalAction = onDocumentCreated(
     const doc = event.data;
     if (!doc) return;
 
-    const { action, requestId, reason, byUid } = doc.data() || {};
-    if (!action || !requestId || !byUid) {
+    // NEW: consume 'decision' & 'reviewerUid' (from Pastor UI)
+    const { decision, requestId, reason, reviewerUid } = doc.data() || {};
+    if (!decision || !requestId || !reviewerUid) {
       logger.warn('Invalid payload on approval action', doc.id);
       await doc.ref.update({ status: 'invalid', processed: true, processedAt: new Date() });
       return;
     }
 
-    const allowed = await isUserPastorOrAdmin(byUid);
+    const allowed = await isUserPastorOrAdmin(reviewerUid);
     if (!allowed) {
-      logger.warn('Unauthorized approval action by', byUid);
+      logger.warn('Unauthorized approval action by', reviewerUid);
       await doc.ref.update({ status: 'denied', processed: true, processedAt: new Date() });
       return;
     }
@@ -371,18 +396,19 @@ exports.processMinistryApprovalAction = onDocumentCreated(
       return;
     }
     const r = reqSnap.data() || {};
-    if (S(r.status || 'pending') !== 'pending') {
+    const requestStatus = toLc(r.status || 'pending');
+    if (requestStatus !== 'pending') {
       await doc.ref.update({ status: 'already_processed', processed: true, processedAt: new Date() });
       return;
     }
 
     try {
-      if (action === 'approve') {
-        const minRef = db.collection('ministries').doc();
-        const ministryName = S(r.name);
-        const requestedByUid = S(r.requestedByUid) || byUid;
+      const ministryName = S(r.name || r.ministryName);
+      const requestedByUid = S(r.requestedByUid);
 
-        // Create ministry + mark request approved
+      if (toLc(decision) === 'approve') {
+        // Create ministry and mark request approved
+        const minRef = db.collection('ministries').doc();
         await db.runTransaction(async (txn) => {
           txn.set(minRef, {
             id: minRef.id,
@@ -390,18 +416,19 @@ exports.processMinistryApprovalAction = onDocumentCreated(
             description: S(r.description),
             approved: true,
             createdAt: ts(),
-            createdBy: requestedByUid,
-            leaderIds: requestedByUid ? [requestedByUid] : [],
+            createdBy: reviewerUid,
+            // Store the requester linkages (optional: you can pivot to memberIds if preferred)
+            leaderUids: requestedByUid ? [requestedByUid] : [],
           });
           txn.update(reqRef, {
             status: 'approved',
             approvedMinistryId: minRef.id,
             updatedAt: ts(),
-            approvedByUid: byUid,
+            approvedByUid: reviewerUid,
           });
         });
 
-        // Make requester leader & member
+        // Ensure requester becomes a leader & has the ministry in their arrays (if we can resolve memberId)
         if (requestedByUid) {
           const memberId = await getUserMemberId(requestedByUid);
           if (memberId) {
@@ -423,73 +450,61 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           }
         }
 
-        // Notify (legacy inbox) unchanged:
-        if (requestedByUid) {
-          await writeInbox(requestedByUid, {
-            type: 'ministry_request_approved',
-            channel: 'approvals',
-            title: 'Your ministry was approved',
-            body: `"${ministryName}" is now live.`,
-            ministryId: minRef.id,
-            ministryName,
-            payload: { requestId, ministryId: minRef.id, ministryName },
-            route: '/view-ministry',
-            dedupeKey: `mcr_approved_${requestId}`,
-          });
-        }
+        // Notify requester (notifications + inbox)
+        await notifyMinistryRequesterResult({
+          requestId,
+          requesterUid: requestedByUid || null,
+          ministryName,
+          ministryDocId: minRef.id,
+          result: 'approved',
+          reviewerUid,
+        });
 
-        await writeInbox(byUid, {
+        // Notify reviewer (inbox) for audit trail
+        await writeInbox(reviewerUid, {
           type: 'approval_action_processed',
           channel: 'approvals',
           title: 'Approved ministry request',
-          body: `"${ministryName}" approved.`,
+          body: ministryName ? `"${ministryName}" approved.` : 'Ministry request approved.',
           ministryId: minRef.id,
           ministryName,
           payload: { requestId, action: 'approve' },
           route: '/pastor-approvals',
-          dedupeKey: `mcr_action_${requestId}_approve_${byUid}`,
+          dedupeKey: `mcr_action_${requestId}_approve_${reviewerUid}`,
         });
 
         await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
-      } else if (action === 'decline') {
-        await reqRef.update({
-          status: 'declined',
-          declineReason: S(reason) || null,
-          updatedAt: ts(),
-          declinedByUid: byUid,
-        });
-
-        const requesterUid = S(r.requestedByUid);
-        if (requesterUid) {
-          await writeInbox(requesterUid, {
-            type: 'ministry_request_declined',
-            channel: 'approvals',
-            title: 'Your ministry was declined',
-            body: `"${S(r.name)}" was declined${S(reason) ? `: ${S(reason)}` : ''}`,
-            ministryId: null,
-            ministryName: S(r.name),
-            payload: { requestId, ministryId: null, ministryName: S(r.name) },
-            route: '/pastor-approvals',
-            dedupeKey: `mcr_declined_${requestId}`,
-          });
-        }
-
-        await writeInbox(byUid, {
-          type: 'approval_action_processed',
-          channel: 'approvals',
-          title: 'Declined ministry request',
-          body: `"${S(r.name)}" declined${S(reason) ? `: ${S(reason)}` : ''}`,
-          ministryId: null,
-          ministryName: S(r.name),
-          payload: { requestId, action: 'decline' },
-          route: '/pastor-approvals',
-          dedupeKey: `mcr_action_${requestId}_decline_${byUid}`,
-        });
-
-        await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
-      } else {
-        await doc.ref.update({ status: 'unknown_action', processed: true, processedAt: new Date() });
+        return;
       }
+
+      // DECLINE → notify then DELETE the request (per requirement)
+      const declineReason = S(reason) || null;
+
+      await notifyMinistryRequesterResult({
+        requestId,
+        requesterUid: requestedByUid || null,
+        ministryName,
+        ministryDocId: null,
+        result: 'declined',
+        reviewerUid,
+        reason: declineReason,
+      });
+
+      await reqRef.delete();
+
+      await writeInbox(reviewerUid, {
+        type: 'approval_action_processed',
+        channel: 'approvals',
+        title: 'Declined ministry request',
+        body: ministryName
+          ? `"${ministryName}" declined${declineReason ? `: ${declineReason}` : ''}`
+          : `Ministry request declined${declineReason ? `: ${declineReason}` : ''}`,
+        payload: { requestId, action: 'decline' },
+        route: '/pastor-approvals',
+        dedupeKey: `mcr_action_${requestId}_decline_${reviewerUid}`,
+      });
+
+      await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
     } catch (e) {
       logger.error('processMinistryApprovalAction error', e);
       await doc.ref.update({
@@ -511,7 +526,7 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated(
     const snap = event.data;
     if (!snap) return;
     const r = snap.data() || {};
-    const name = S(r.name);
+    const name = S(r.name || r.ministryName);
 
     const approverUids = await listPastorAndAdminUids();
     if (!approverUids.length) {
@@ -527,8 +542,8 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated(
           title: 'New ministry creation request',
           body: name ? `Ministry: ${name}` : 'A new request was submitted',
           ministryId: null,
-          ministryName: name,
-          payload: { requestId: snap.id, ministryName: name },
+          ministryName: name || null,
+          payload: { requestId: snap.id, ministryName: name || null },
           route: '/pastor-approvals',
           dedupeKey: `mcr_created_${snap.id}_${uid}`,
         })
@@ -551,7 +566,6 @@ exports.onJoinRequestCreated = onDocumentCreated(
     const requestedByUid = S(jr.requestedByUid);
     if (!ministryName) return;
 
-    // Try to get ministry doc id (nice-to-have)
     let ministryDocId = null;
     const mins = await db
       .collection('ministries')
@@ -562,7 +576,6 @@ exports.onJoinRequestCreated = onDocumentCreated(
       ministryDocId = mins.docs[0].id;
     }
 
-    // Broadcast for leaders/admins
     await writeLeaderBroadcast({
       ministryName,
       ministryDocId,
@@ -572,7 +585,6 @@ exports.onJoinRequestCreated = onDocumentCreated(
       type: 'join_request',
     });
 
-    // Fan-out to leaders (members→users) and ministries.leaderIds (if present)
     await writeDirectToLeaders({
       ministryName,
       ministryDocId,
@@ -581,9 +593,6 @@ exports.onJoinRequestCreated = onDocumentCreated(
       requesterMemberId: memberId,
       type: 'join_request',
     });
-
-    // (Optional) You can still keep your legacy inbox if desired (not required by app pages)
-    // — omitted intentionally to avoid duplication.
   }
 );
 
@@ -598,7 +607,7 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     if (!before || !after) return;
 
     const prev = S(before.status || 'pending');
-    const theNext = S(after.status || 'pending'); // ✅ fixed: declare const
+    const theNext = S(after.status || 'pending'); // fixed: ensure defined
     if (prev === theNext) return;
 
     if (theNext !== 'approved' && theNext !== 'rejected') return;
@@ -627,8 +636,6 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
       result: theNext,
       moderatorUid,
     });
-
-    // (Optional legacy inbox mirror was here; omitted to prevent duplication.)
   }
 );
 
@@ -639,9 +646,8 @@ exports.onJoinRequestDeleted = onDocumentDeleted(
   'join_requests/{id}',
   async (event) => {
     const r = event.data?.data() || {};
-    const status = S(r.status || 'pending');
+    const status = toLc(r.status || 'pending');
 
-    // Notify leaders only when a pending req is cancelled by requester
     if (status !== 'pending') return;
 
     const ministryName = S(r.ministryId);
