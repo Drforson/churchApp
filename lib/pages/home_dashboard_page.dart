@@ -1,3 +1,4 @@
+// lib/pages/home_dashboard_page.dart
 import 'dart:async';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:church_management_app/widgets/rolebadge.dart';
@@ -5,6 +6,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+
+import 'notification_center_page.dart'; // <-- added
 
 class HomeDashboardPage extends StatefulWidget {
   const HomeDashboardPage({super.key});
@@ -47,8 +50,8 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
       appBar: AppBar(
         title: const Text('Home'),
         centerTitle: true,
-        backgroundColor: Colors.blueGrey,          // neutral + readable
-        foregroundColor: const Color(0xFF111827), // dark label/icons
+        backgroundColor: Colors.blueGrey,
+        foregroundColor: const Color(0xFF111827),
         elevation: 0,
         actions: [
           IconButton(
@@ -56,7 +59,12 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
             onPressed: () => _logout(context),
             icon: const Icon(Icons.logout),
           ),
-          const NotificationBell(),
+          // ⬇️ make bell tappable and navigate to Notification Center
+          NotificationBell(
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const NotificationCenterPage()),
+            ),
+          ),
         ],
       ),
       body: SafeArea(
@@ -108,7 +116,8 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
                   if (n.isNotEmpty) name = n;
 
                   // Escalate to 'leader' if not already and member leads any ministry
-                  final leadFromMembers = List<String>.from(member['leadershipMinistries'] ?? const []);
+                  final leadFromMembers =
+                  List<String>.from(member['leadershipMinistries'] ?? const []);
                   if (effectiveRole == 'member' && leadFromMembers.isNotEmpty) {
                     effectiveRole = 'leader';
                   }
@@ -203,7 +212,9 @@ class _HeaderCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white.withOpacity(0.96),
         borderRadius: BorderRadius.circular(16),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 12, offset: const Offset(0, 6))],
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 12, offset: const Offset(0, 6))
+        ],
       ),
       child: Row(
         children: [
@@ -227,7 +238,10 @@ class _HeaderCard extends StatelessWidget {
                         name,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                        style: Theme.of(context)
+                            .textTheme
+                            .titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w700),
                       ),
                     ),
                     const SizedBox(width: 8),
@@ -247,7 +261,8 @@ class _HeaderCard extends StatelessWidget {
                 const SizedBox(height: 6),
                 Text(
                   'Profile ${(profileProgress * 100).toInt()}% complete',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF4B5563)),
+                  style:
+                  Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF4B5563)),
                 ),
               ],
             ),
@@ -344,7 +359,9 @@ class _StatTile extends StatelessWidget {
           decoration: BoxDecoration(
             color: Colors.white,
             borderRadius: BorderRadius.circular(14),
-            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 5))],
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 5))
+            ],
           ),
           padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           child: Column(
@@ -443,7 +460,11 @@ class _NoticeBoardCarouselState extends State<_NoticeBoardCarousel> {
           .snapshots(),
       builder: (context, eventsSnap) {
         return StreamBuilder<QuerySnapshot>(
-          stream: db.collection('announcements').orderBy('createdAt', descending: true).limit(5).snapshots(),
+          stream: db
+              .collection('announcements')
+              .orderBy('createdAt', descending: true)
+              .limit(5)
+              .snapshots(),
           builder: (context, annSnap) {
             final events = eventsSnap.data?.docs ?? const [];
             final anns = annSnap.data?.docs ?? const [];
@@ -459,7 +480,9 @@ class _NoticeBoardCarouselState extends State<_NoticeBoardCarousel> {
                 color: Colors.white.withOpacity(0.6),
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(color: Colors.white70),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 6))],
+                boxShadow: [
+                  BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 6))
+                ],
               ),
               child: PageView.builder(
                 controller: _controller,
@@ -572,7 +595,8 @@ class _QuickActions extends StatelessWidget {
       _ActionItem('Events', Icons.event, '/events'),
       _ActionItem('Profile', Icons.person, '/profile'),
       _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
-      if (role == 'admin' || role == 'leader') _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin'),
+      if (role == 'admin' || role == 'leader')
+        _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin'),
     ];
 
     return LayoutBuilder(builder: (context, c) {
@@ -615,7 +639,9 @@ class _ActionCard extends StatelessWidget {
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(16),
-          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 6))],
+          boxShadow: [
+            BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 6))
+          ],
         ),
         child: Padding(
           padding: const EdgeInsets.all(14),

@@ -7,8 +7,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../services/notification_center.dart';
 import 'ministries_details_page.dart';
-//import 'pastor_join_requests_page.dart'; // ⬅️ make sure you have this page
 
 class NotificationCenterPage extends StatefulWidget {
   const NotificationCenterPage({super.key});
@@ -22,209 +22,204 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
   final _auth = FirebaseAuth.instance;
 
   String? _uid;
-  bool _isAdmin = false;
   bool _isPastor = false;
-  bool _isLeader = false;
-  final Set<String> _leaderMinistriesByName = {};
 
-  StreamController<List<Map<String, dynamic>>>? _mergedCtrl;
-  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _subForYou;
-  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _subLeader;
-  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _userSub;
-
-  List<Map<String, dynamic>> _bufForYou = const [];
-  List<Map<String, dynamic>> _bufLeader = const [];
-  String _combineKey = '';
+  // Cache to avoid repeated lookups for the same moderator uid
+  final Map<String, String> _nameCache = {};
 
   @override
   void initState() {
     super.initState();
-    _bootstrap();
+    _bootstrapRoles();
   }
 
-  @override
-  void dispose() {
-    _userSub?.cancel();
-    _subForYou?.cancel();
-    _subLeader?.cancel();
-    _mergedCtrl?.close();
-    super.dispose();
-  }
-
-  Future<void> _bootstrap() async {
+  Future<void> _bootstrapRoles() async {
     final user = _auth.currentUser;
     if (user == null) return;
     _uid = user.uid;
 
-    _userSub = _db.collection('users').doc(user.uid).snapshots().listen((snap) async {
-      final data = snap.data() ?? {};
-      final roles = (data['roles'] is List)
-          ? List<String>.from((data['roles'] as List).map((e) => e.toString().toLowerCase()))
-          : <String>[];
+    try {
+      final uSnap = await _db.collection('users').doc(user.uid).get();
+      final u = uSnap.data() ?? {};
+      bool isPastor = (u['isPastor'] == true);
+      final uRoles = (u['roles'] is List)
+          ? List<String>.from((u['roles'] as List).map((e) => e.toString().toLowerCase()))
+          : const <String>[];
+      if (uRoles.contains('pastor')) isPastor = true;
 
-      bool isAdmin = roles.contains('admin') || data['isAdmin'] == true;
-      bool isPastor = roles.contains('pastor') || data['isPastor'] == true;
-
-      final lmUser = (data['leadershipMinistries'] is List)
-          ? List<String>.from((data['leadershipMinistries'] as List).map((e) => e.toString()))
-          : <String>[];
-
-      final memberId = (data['memberId'] ?? '').toString();
-      final leaderNames = <String>{...lmUser.map((e) => e.trim()).where((e) => e.isNotEmpty)};
-      if (memberId.isNotEmpty) {
-        try {
-          final mem = await _db.collection('members').doc(memberId).get();
-          final md = mem.data() ?? {};
-          if (md['leadershipMinistries'] is List) {
-            leaderNames.addAll(
-              List.from(md['leadershipMinistries'])
-                  .map((e) => e.toString().trim())
-                  .where((e) => e.isNotEmpty),
-            );
-          }
-          if (md['isPastor'] == true) isPastor = true;
-          final mRoles = (md['roles'] is List)
-              ? List<String>.from((md['roles'] as List).map((e) => e.toString().toLowerCase()))
-              : <String>[];
-          if (mRoles.contains('admin')) isAdmin = true;
-          if (mRoles.contains('pastor')) isPastor = true;
-        } catch (_) {}
+      final memberId = (u['memberId'] ?? '').toString();
+      if (!isPastor && memberId.isNotEmpty) {
+        final mSnap = await _db.collection('members').doc(memberId).get();
+        final m = mSnap.data() ?? {};
+        if (m['isPastor'] == true) isPastor = true;
+        final mRoles = (m['roles'] is List)
+            ? List<String>.from((m['roles'] as List).map((e) => e.toString().toLowerCase()))
+            : const <String>[];
+        if (mRoles.contains('pastor')) isPastor = true;
       }
 
       if (!mounted) return;
-      setState(() {
-        _isAdmin = isAdmin;
-        _isPastor = isPastor;
-        _isLeader = leaderNames.isNotEmpty || roles.contains('leader') || data['isLeader'] == true;
-        _leaderMinistriesByName
-          ..clear()
-          ..addAll(leaderNames);
-      });
-
-      _startCombinedStreams();
-    });
-  }
-
-  // ------------------- Combined Notification Stream -------------------
-
-  void _startCombinedStreams() {
-    _mergedCtrl?.close();
-    _mergedCtrl = StreamController<List<Map<String, dynamic>>>.broadcast();
-
-    // Direct (For You)
-    _subForYou = _db
-        .collection('notifications')
-        .where('recipientUid', isEqualTo: _uid)
-        .orderBy('createdAt', descending: true)
-        .snapshots()
-        .listen((qs) {
-      _bufForYou = qs.docs.map((d) => {'id': d.id, ...d.data()}).toList();
-      _emitMerged();
-    });
-
-    // Leader Broadcasts
-    if (_isAdmin || _isLeader || _isPastor) {
-      _subLeader = _db
-          .collection('notifications')
-          .where('audience.leadersOnly', isEqualTo: true)
-          .orderBy('createdAt', descending: true)
-          .snapshots()
-          .listen((qs) {
-        _bufLeader = qs.docs
-            .map((d) => {'id': d.id, ...d.data()})
-            .where((n) {
-          final type = (n['type'] ?? '').toString();
-          if (type != 'join_request' && type != 'join_request_cancelled') return false;
-          final acks = (n['acks'] is Map) ? Map<String, dynamic>.from(n['acks']) : const {};
-          if (_uid != null && acks[_uid] == true) return false;
-          if (_isAdmin || _isPastor) return true;
-          final name = (n['ministryId'] ?? '').toString();
-          return _leaderMinistriesByName.contains(name);
-        })
-            .toList();
-        _emitMerged();
-      });
+      setState(() => _isPastor = isPastor);
+    } catch (_) {
+      // ignore: leave pastor=false if we can't resolve
     }
   }
 
-  void _emitMerged() {
-    if (_mergedCtrl == null) return;
-    final all = <Map<String, dynamic>>[..._bufForYou, ..._bufLeader];
-    all.sort((a, b) {
-      final ta = a['createdAt'];
-      final tb = b['createdAt'];
-      final da = ta is Timestamp ? ta.toDate() : DateTime.fromMillisecondsSinceEpoch(0);
-      final db = tb is Timestamp ? tb.toDate() : DateTime.fromMillisecondsSinceEpoch(0);
-      return db.compareTo(da);
-    });
-    _mergedCtrl!.add(all);
-  }
+  // ------------------- Name resolution for moderator -------------------
 
-  Stream<List<Map<String, dynamic>>> get _notificationsStream =>
-      _mergedCtrl?.stream ?? const Stream.empty();
+  Future<String?> _resolveDisplayNameForUid(String uid) async {
+    if (_nameCache.containsKey(uid)) return _nameCache[uid];
+
+    try {
+      // First try users.displayName
+      final uSnap = await _db.collection('users').doc(uid).get();
+      final u = uSnap.data() ?? {};
+      final displayName = (u['displayName'] ?? '').toString().trim();
+      if (displayName.isNotEmpty) {
+        _nameCache[uid] = displayName;
+        return displayName;
+      }
+
+      // Else try users.memberId -> members.first/last
+      final memberId = (u['memberId'] ?? '').toString();
+      if (memberId.isNotEmpty) {
+        final mSnap = await _db.collection('members').doc(memberId).get();
+        final m = mSnap.data() ?? {};
+        final first = (m['firstName'] ?? '').toString().trim();
+        final last = (m['lastName'] ?? '').toString().trim();
+        final name = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
+        if (name.isNotEmpty) {
+          _nameCache[uid] = name;
+          return name;
+        }
+      }
+    } catch (_) {
+      // swallow and return null
+    }
+    return null;
+  }
 
   // ------------------- Helpers -------------------
 
-  Future<void> _markReadAndRemove(Map<String, dynamic> n) async {
-    final id = (n['id'] ?? '').toString();
-    if (id.isEmpty) return;
-    final ref = _db.collection('notifications').doc(id);
-    final recipientUid = (n['recipientUid'] ?? '').toString();
-    final isDirect = recipientUid.isNotEmpty && _uid == recipientUid;
-    try {
-      await ref.set({'read': true}, SetOptions(merge: true));
-      if (isDirect) {
-        await ref.delete();
-      } else if (_uid != null) {
-        await ref.set({'acks': {_uid!: true}}, SetOptions(merge: true));
-      }
-    } catch (_) {}
-  }
-
-  String _fmtWhen(dynamic ts) {
-    final dt = (ts is Timestamp) ? ts.toDate() : null;
+  String _fmtWhen(DateTime? dt) {
     if (dt == null) return '—';
     return DateFormat('dd MMM, HH:mm').format(dt.toLocal());
   }
 
-  String _titleFor(Map<String, dynamic> n) {
-    final type = (n['type'] ?? '').toString();
+  String _titleFor(InboxEvent ev) {
+    final type = (ev.type ?? '').toLowerCase();
     switch (type) {
       case 'join_request':
         return 'New join request';
+      case 'join_request.approved':
       case 'join_request_result':
-        final r = (n['result'] ?? '').toString();
-        return r == 'approved'
-            ? 'Your join request was approved'
-            : 'Your join request was declined';
+        {
+          final r = (ev.raw['result'] ?? '').toString().toLowerCase();
+          return r == 'approved'
+              ? 'Your join request was approved'
+              : 'Your join request was declined';
+        }
       case 'join_request_cancelled':
         return 'Join request cancelled';
       case 'ministry_request_created':
         return 'New ministry creation request';
       case 'ministry_request_result':
-        final r = (n['result'] ?? '').toString();
-        return r == 'approved'
-            ? 'Your ministry was approved'
-            : 'Your ministry was declined';
+        {
+          final r = (ev.raw['result'] ?? '').toString().toLowerCase();
+          return r == 'approved'
+              ? 'Your ministry was approved'
+              : 'Your ministry was declined';
+        }
+      case 'approval_action_processed':
+        return 'Approval action processed';
       case 'prayer_request_created':
         return 'New prayer request';
       default:
-        return 'Notification';
+        return ev.title ?? 'Notification';
     }
   }
 
-  String _subtitleFor(Map<String, dynamic> n) {
-    final name = (n['ministryName'] ?? n['ministryId'] ?? '').toString();
-    final when = _fmtWhen(n['createdAt']);
-    return name.isEmpty ? when : '$name • $when';
+  /// Builds the subtitle. For join_request_result we append "by <Name>" if known.
+  Widget _subtitleWidget(InboxEvent ev) {
+    final name = (ev.raw['ministryName'] ??
+        ev.raw['ministryId'] ??
+        ev.raw['ministry'] ??
+        '')
+        .toString();
+    final when = _fmtWhen(ev.createdAt);
+
+    final type = (ev.type ?? '').toLowerCase();
+    final isDecision = type == 'join_request_result' || type == 'join_request.approved';
+
+    // prefer moderatorName directly in payload if present
+    final payloadModeratorName = (ev.raw['moderatorName'] ?? '').toString().trim();
+    final moderatorUid = (ev.raw['moderatorUid'] ?? '').toString().trim();
+
+    // Base subtitle: "<Ministry • When>" or just "When"
+    final base = name.isEmpty ? when : '$name • $when';
+
+    if (!isDecision) {
+      return Text(
+        base,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      );
+    }
+
+    if (payloadModeratorName.isNotEmpty) {
+      // Already provided — no lookup needed
+      final action = (ev.raw['result'] ?? '').toString().toLowerCase() == 'approved'
+          ? 'approved'
+          : 'declined';
+      final line = '$base\n$action by $payloadModeratorName';
+      return Text(
+        line,
+        maxLines: 3,
+        overflow: TextOverflow.ellipsis,
+      );
+    }
+
+    if (moderatorUid.isEmpty) {
+      // No info available; just base
+      return Text(
+        base,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      );
+    }
+
+    // Resolve name async with caching
+    return FutureBuilder<String?>(
+      future: _resolveDisplayNameForUid(moderatorUid),
+      builder: (context, snap) {
+        final resolved = (snap.data ?? '').toString().trim();
+        if (resolved.isEmpty) {
+          return Text(
+            base,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          );
+        }
+        final action = (ev.raw['result'] ?? '').toString().toLowerCase() == 'approved'
+            ? 'approved'
+            : 'declined';
+        final line = '$base\n$action by $resolved';
+        return Text(
+          line,
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+        );
+      },
+    );
   }
 
-  Icon _iconFor(Map<String, dynamic> n) {
-    final type = (n['type'] ?? '').toString();
+  Icon _iconFor(InboxEvent ev) {
+    final type = (ev.type ?? '').toLowerCase();
     switch (type) {
       case 'join_request':
         return const Icon(Icons.group_add);
       case 'join_request_result':
+      case 'join_request.approved':
         return const Icon(Icons.check_circle);
       case 'join_request_cancelled':
         return const Icon(Icons.undo);
@@ -232,6 +227,8 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
         return const Icon(Icons.pending_actions);
       case 'ministry_request_result':
         return const Icon(Icons.verified);
+      case 'approval_action_processed':
+        return const Icon(Icons.task_alt);
       case 'prayer_request_created':
         return const Icon(Icons.volunteer_activism);
       default:
@@ -239,16 +236,40 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
     }
   }
 
-  // ------------------- Navigation -------------------
+  Future<void> _openFrom(InboxEvent ev) async {
+    final type = (ev.type ?? '').toLowerCase();
+    final ministryDocId = (ev.raw['ministryDocId'] ?? '').toString();
+    final ministryName =
+    (ev.raw['ministryName'] ?? ev.raw['ministryId'] ?? '').toString();
 
-  Future<void> _openFrom(Map<String, dynamic> n) async {
-    final type = (n['type'] ?? '').toString();
-    final ministryDocId = (n['ministryDocId'] ?? '').toString();
-    final ministryName = (n['ministryName'] ?? n['ministryId'] ?? '').toString();
+    if (type == 'ministry_request_result') {
+      final result = (ev.raw['result'] ?? '').toString().toLowerCase();
+      if (result == 'declined' || result == 'rejected') {
+        if (!mounted) return;
+        await showDialog<void>(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Ministry not created'),
+            content: const Text(
+              'This ministry request was declined.\nThe ministry does not exist.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              )
+            ],
+          ),
+        );
+        try {
+          await NotificationCenter.I.markRead(ev.id);
+        } catch (_) {}
+        return;
+      }
+    }
 
     bool opened = false;
 
-    // ✅ NEW: If pastor taps "join_request", go to PastorJoinRequestsPage
     if (type == 'join_request' && _isPastor) {
       opened = true;
       if (mounted) {
@@ -259,7 +280,6 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
       }
     }
 
-    // Ministry-related (normal users/leaders)
     if (!opened &&
         (type.startsWith('join_request') ||
             type == 'join_request_result' ||
@@ -271,8 +291,7 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
             context,
             MaterialPageRoute(
               builder: (_) => MinistryDetailsPage(
-                ministryId:
-                ministryDocId.isNotEmpty ? ministryDocId : 'unknown',
+                ministryId: ministryDocId.isNotEmpty ? ministryDocId : 'unknown',
                 ministryName:
                 ministryName.isNotEmpty ? ministryName : '(Unknown Ministry)',
               ),
@@ -282,30 +301,80 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
       }
     }
 
-    // fallback for prayer/ministry creation
     if (!opened && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Notification opened.')),
       );
     }
 
-    await _markReadAndRemove(n);
+    try {
+      await NotificationCenter.I.markRead(ev.id);
+    } catch (_) {}
   }
 
-  Widget _tile(Map<String, dynamic> n) {
-    final icon = _iconFor(n);
-    final title = _titleFor(n);
-    final subtitle = _subtitleFor(n);
+  Widget _tile(InboxEvent ev) {
+    final icon = _iconFor(ev);
+    final title = _titleFor(ev);
 
-    return ListTile(
-      leading: icon,
-      title: Text(title),
-      subtitle: Text(subtitle),
-      onTap: () => _openFrom(n),
-      trailing: OutlinedButton.icon(
-        icon: const Icon(Icons.open_in_new),
-        label: const Text('Open'),
-        onPressed: () => _openFrom(n),
+    return Dismissible(
+      key: ValueKey('ev_${ev.id}'),
+      background: Container(
+        color: Colors.red,
+        alignment: Alignment.centerLeft,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: const Icon(Icons.delete, color: Colors.white),
+      ),
+      secondaryBackground: Container(
+        color: Colors.green,
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: const Icon(Icons.done_all, color: Colors.white),
+      ),
+      confirmDismiss: (direction) async {
+        try {
+          if (direction == DismissDirection.endToStart) {
+            await NotificationCenter.I.markRead(ev.id); // swipe left -> read
+          } else {
+            await NotificationCenter.I.deleteEvent(ev.id); // swipe right -> delete
+          }
+          return true;
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Action failed: $e')),
+            );
+          }
+          return false;
+        }
+      },
+      child: ListTile(
+        leading: Stack(
+          alignment: Alignment.topRight,
+          children: [
+            Padding(padding: const EdgeInsets.only(right: 6, top: 6), child: icon),
+            if (!ev.read)
+              const Positioned(
+                right: 0,
+                top: 0,
+                child: CircleAvatar(radius: 4, backgroundColor: Colors.redAccent),
+              ),
+          ],
+        ),
+        title: Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontWeight: ev.read ? FontWeight.w400 : FontWeight.w600,
+          ),
+        ),
+        subtitle: _subtitleWidget(ev), // <-- shows "approved/declined by <Name>"
+        onTap: () => _openFrom(ev),
+        trailing: OutlinedButton.icon(
+          icon: const Icon(Icons.open_in_new),
+          label: const Text('Open'),
+          onPressed: () => _openFrom(ev),
+        ),
       ),
     );
   }
@@ -314,20 +383,78 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Notifications')),
-      body: StreamBuilder<List<Map<String, dynamic>>>(
-        stream: _notificationsStream,
+      appBar: AppBar(
+        title: const Text('Notifications'),
+        actions: [
+          TextButton.icon(
+            onPressed: () async {
+              try {
+                await NotificationCenter.I.markAllRead();
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('All notifications marked as read')),
+                  );
+                }
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Failed to mark all read: $e')),
+                  );
+                }
+              }
+            },
+            icon: const Icon(Icons.drafts_outlined),
+            label: const Text('Mark all read'),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: StreamBuilder<List<InboxEvent>>(
+        stream: NotificationCenter.I.inboxEventsStream(limit: 200),
         builder: (context, snap) {
-          final items = snap.data ?? const [];
+          if (snap.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final items = snap.data ?? const <InboxEvent>[];
           if (items.isEmpty) {
-            return const Center(child: Text('No notifications.'));
+            return const _EmptyState();
           }
           return ListView.separated(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             itemCount: items.length,
-            separatorBuilder: (_, __) => const Divider(height: 0),
+            separatorBuilder: (_, __) => const SizedBox(height: 8),
             itemBuilder: (_, i) => _tile(items[i]),
           );
         },
+      ),
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  const _EmptyState();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.notifications_none_rounded, size: 48),
+            const SizedBox(height: 12),
+            Text(
+              'You’re all caught up',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'New notifications will appear here.',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
+        ),
       ),
     );
   }

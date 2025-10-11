@@ -1,292 +1,210 @@
 // lib/services/notification_center.dart
 import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
-/// Centralized helper for writing and reading notifications.
-///
-/// Document shapes written here:
-///
-/// 1) Leader broadcast when a member requests to join a ministry:
-///    {
-///      type: 'join_request',
-///      ministryId: <MINISTRY_NAME>,          // name (matches members[].ministries)
-///      ministryDocId: <ministries/{docId}>,  // optional but recommended
-///      joinRequestId: <join_requests/{docId}>,
-///      requestedByUid: <uid>,
-///      memberId: <members/{id}>,
-///      createdAt: <server timestamp>,
-///      audience: { leadersOnly: true, adminAlso: true }
-///    }
-///
-/// 2) Direct notification to each leader (fan-out of #1):
-///    {
-///      type: 'join_request',
-///      ministryId, ministryDocId, joinRequestId, requestedByUid, memberId,
-///      recipientUid: <leader uid>,           // <— direct
-///      createdAt,
-///      audience: { direct: true, role: 'leader' }
-///    }
-///
-/// 3) Result notification to requester (approve/reject):
-///    {
-///      type: 'join_request_result',
-///      result: 'approved' | 'rejected',
-///      ministryId, ministryDocId, joinRequestId,
-///      memberId: <requester members/{id}>,
-///      recipientUid: <requester uid>,        // <— direct
-///      moderatorUid: <leader/admin uid>,     // optional
-///      createdAt
-///    }
-class NotificationCenter {
-  /// Singleton instance so `NotificationCenter.I` is valid.
-  static final NotificationCenter I = NotificationCenter._();
-  NotificationCenter._();
+/// Canonical inbox event model for inbox/{uid}/events.
+/// Keep fields nullable for UI safety; use `raw` if you need extra payload.
+class InboxEvent {
+  final String id;
+  final String? title;
+  final String? body;
+  final String? type;       // e.g., "join_request.approved"
+  final DateTime? createdAt;
+  final bool read;
+  final Map<String, dynamic> raw;
 
-  /// Optional init hook for future bootstrapping (safe no-op).
-  static Future<void> init() async {
-    // Add any startup wiring here if needed later (e.g., topic subs, cache).
-    return;
-  }
+  InboxEvent({
+    required this.id,
+    this.title,
+    this.body,
+    this.type,
+    this.createdAt,
+    required this.read,
+    required this.raw,
+  });
 
-  // Collection names
-  static const String _col = 'notifications';
-  static const String _usersCol = 'users';
-  static const String _membersCol = 'members';
+  static InboxEvent fromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data() ?? <String, dynamic>{};
+    final ts = data['createdAt'];
+    DateTime? created;
+    if (ts is Timestamp) created = ts.toDate();
 
-  // ---------------------------------------------------------------------------
-  // WRITE HELPERS
-  // ---------------------------------------------------------------------------
-
-  /// Broadcast + direct fan-out when a member requests to join.
-  static Future<void> notifyJoinRequested({
-    required String ministryName,      // human-readable NAME
-    required String ministryDocId,     // ministries/{docId}
-    required String joinRequestId,     // join_requests/{docId}
-    required String requesterUid,      // uid of requester
-    required String requesterMemberId, // members/{id}
-  }) async {
-    final db = FirebaseFirestore.instance;
-
-    // 1) Broadcast for leaders/admins
-    await db.collection(_col).add({
-      'type': 'join_request',
-      'ministryId': ministryName,
-      'ministryDocId': ministryDocId,
-      'joinRequestId': joinRequestId,
-      'requestedByUid': requesterUid,
-      'memberId': requesterMemberId,
-      'createdAt': FieldValue.serverTimestamp(),
-      'audience': {'leadersOnly': true, 'adminAlso': true},
-    });
-
-    // 2) Direct fan-out to leaders (resolve member -> user uid)
-    final leaderMembers = await db
-        .collection(_membersCol)
-        .where('leadershipMinistries', arrayContains: ministryName)
-        .get();
-
-    if (leaderMembers.docs.isEmpty) return;
-
-    final batch = db.batch();
-    for (final lm in leaderMembers.docs) {
-      final leaderMemberId = lm.id;
-      final userQs = await db
-          .collection(_usersCol)
-          .where('memberId', isEqualTo: leaderMemberId)
-          .limit(1)
-          .get();
-      if (userQs.docs.isEmpty) continue;
-
-      final leaderUid = userQs.docs.first.id;
-      batch.set(db.collection(_col).doc(), {
-        'type': 'join_request',
-        'ministryId': ministryName,
-        'ministryDocId': ministryDocId,
-        'joinRequestId': joinRequestId,
-        'requestedByUid': requesterUid,
-        'memberId': requesterMemberId,
-        'recipientUid': leaderUid, // direct to leader
-        'createdAt': FieldValue.serverTimestamp(),
-        'audience': {'direct': true, 'role': 'leader'},
-      });
+    String? _cleanStr(dynamic v) {
+      final s = (v ?? '').toString().trim();
+      return s.isEmpty ? null : s;
     }
-    await batch.commit();
-  }
 
-  /// Direct result to requester when leader approves/rejects.
-  static Future<void> notifyJoinResult({
-    required String ministryName,
-    required String ministryDocId,
-    required String joinRequestId,
-    required String requesterMemberId,
-    required String result, // 'approved' | 'rejected'
-    String? moderatorUid,
-  }) async {
-    assert(result == 'approved' || result == 'rejected');
-
-    final db = FirebaseFirestore.instance;
-
-    String? recipientUid;
-    final qs = await db
-        .collection(_usersCol)
-        .where('memberId', isEqualTo: requesterMemberId)
-        .limit(1)
-        .get();
-    if (qs.docs.isNotEmpty) recipientUid = qs.docs.first.id;
-
-    await db.collection(_col).add({
-      'type': 'join_request_result',
-      'result': result,
-      'ministryId': ministryName,
-      'ministryDocId': ministryDocId,
-      'joinRequestId': joinRequestId,
-      'memberId': requesterMemberId,
-      if (recipientUid != null) 'recipientUid': recipientUid,
-      if (moderatorUid != null) 'moderatorUid': moderatorUid,
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-  }
-
-  /// Optional: notify leaders that a pending request was cancelled by the requester.
-  static Future<void> notifyJoinCancelled({
-    required String ministryName,
-    required String ministryDocId,
-    required String joinRequestId,
-    required String requesterUid,
-    required String requesterMemberId,
-  }) async {
-    final db = FirebaseFirestore.instance;
-
-    // Broadcast
-    await db.collection(_col).add({
-      'type': 'join_request_cancelled',
-      'ministryId': ministryName,
-      'ministryDocId': ministryDocId,
-      'joinRequestId': joinRequestId,
-      'requestedByUid': requesterUid,
-      'memberId': requesterMemberId,
-      'createdAt': FieldValue.serverTimestamp(),
-      'audience': {'leadersOnly': true, 'adminAlso': true},
-    });
-
-    // Direct fan-out
-    final leaderMembers = await db
-        .collection(_membersCol)
-        .where('leadershipMinistries', arrayContains: ministryName)
-        .get();
-    if (leaderMembers.docs.isEmpty) return;
-
-    final batch = db.batch();
-    for (final lm in leaderMembers.docs) {
-      final leaderMemberId = lm.id;
-      final userQs = await db
-          .collection(_usersCol)
-          .where('memberId', isEqualTo: leaderMemberId)
-          .limit(1)
-          .get();
-      if (userQs.docs.isEmpty) continue;
-      final leaderUid = userQs.docs.first.id;
-
-      batch.set(db.collection(_col).doc(), {
-        'type': 'join_request_cancelled',
-        'ministryId': ministryName,
-        'ministryDocId': ministryDocId,
-        'joinRequestId': joinRequestId,
-        'requestedByUid': requesterUid,
-        'memberId': requesterMemberId,
-        'recipientUid': leaderUid,
-        'createdAt': FieldValue.serverTimestamp(),
-        'audience': {'direct': true, 'role': 'leader'},
-      });
-    }
-    await batch.commit();
-  }
-
-  // ---------------------------------------------------------------------------
-  // READ HELPERS (for Notification Center screens)
-  // ---------------------------------------------------------------------------
-
-  /// Direct notifications for a specific user (For You).
-  static Stream<List<Map<String, dynamic>>> streamForUser({
-    required String uid,
-  }) {
-    final db = FirebaseFirestore.instance;
-    return db
-        .collection(_col)
-        .where('recipientUid', isEqualTo: uid)
-        .orderBy('createdAt', descending: true)
-        .snapshots()
-        .map((qs) => qs.docs.map((d) => {'id': d.id, ...d.data()}).toList());
-  }
-
-  /// Leader broadcasts for ministries the user leads (admins see all).
-  static Stream<List<Map<String, dynamic>>> streamLeaderBroadcasts({
-    required bool isAdmin,
-    required Set<String> leadershipMinistryNames,
-  }) {
-    final db = FirebaseFirestore.instance;
-    final base = db
-        .collection(_col)
-        .where('type', isEqualTo: 'join_request')
-        .where('audience.leadersOnly', isEqualTo: true)
-        .orderBy('createdAt', descending: true)
-        .snapshots()
-        .map((qs) => qs.docs.map((d) => {'id': d.id, ...d.data()}).toList());
-
-    if (isAdmin) return base;
-    if (leadershipMinistryNames.isEmpty) return const Stream.empty();
-
-    return base.map((items) => items
-        .where((n) => leadershipMinistryNames
-        .contains((n['ministryId'] ?? '').toString()))
-        .toList());
-  }
-
-  /// Combined stream emitting both buckets whenever either changes.
-  static Stream<Map<String, List<Map<String, dynamic>>>> combinedStream({
-    required String uid,
-    required bool isAdmin,
-    required Set<String> leadershipMinistryNames,
-  }) {
-    final forYou$ = streamForUser(uid: uid);
-    final leader$ = streamLeaderBroadcasts(
-      isAdmin: isAdmin,
-      leadershipMinistryNames: leadershipMinistryNames,
+    return InboxEvent(
+      id: doc.id,
+      title: _cleanStr(data['title']),
+      body: _cleanStr(data['body']),
+      type: _cleanStr(data['type']),
+      createdAt: created,
+      read: (data['read'] is bool) ? data['read'] as bool : false,
+      raw: data,
     );
+  }
 
-    final controller =
-    StreamController<Map<String, List<Map<String, dynamic>>>>();
+  Map<String, dynamic> toFirestore() => raw;
+}
 
-    List<Map<String, dynamic>> latestForYou = const [];
-    List<Map<String, dynamic>> latestLeader = const [];
+/// Centralized read/write facade for the canonical inbox.
+class NotificationCenter {
+  NotificationCenter._();
+  static final NotificationCenter I = NotificationCenter._();
 
-    StreamSubscription<List<Map<String, dynamic>>>? subA;
-    StreamSubscription<List<Map<String, dynamic>>>? subB;
+  final _db = FirebaseFirestore.instance;
+  final _auth = FirebaseAuth.instance;
 
-    void emit() {
-      if (!controller.isClosed) {
-        controller.add({
-          'forYou': latestForYou,
-          'leaderAlerts': latestLeader,
-        });
+  /// Returns a typed reference to inbox/{uid}/events with converter.
+  CollectionReference<InboxEvent>? _eventsRefFor(String uid) {
+    if (uid.isEmpty) return null;
+    return _db
+        .collection('inbox')
+        .doc(uid)
+        .collection('events')
+        .withConverter<InboxEvent>(
+      fromFirestore: (snap, _) => InboxEvent.fromFirestore(snap),
+      toFirestore: (ev, _) => ev.toFirestore(),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // STREAMS
+  // ---------------------------------------------------------------------------
+
+  /// Live unread count for the currently-authenticated user.
+  Stream<int> unreadCountStream() {
+    return _auth.authStateChanges().switchMap((user) {
+      if (user == null) return  Stream<int>.value(0);
+      final ref = _eventsRefFor(user.uid);
+      if (ref == null) return  Stream<int>.value(0);
+      return ref.where('read', isEqualTo: false).snapshots().map((s) => s.size);
+    });
+  }
+
+  /// Live inbox events (most recent first) for the current user.
+  Stream<List<InboxEvent>> inboxEventsStream({int limit = 200}) {
+    return _auth.authStateChanges().switchMap((user) {
+      if (user == null) {
+        return  Stream<List<InboxEvent>>.value(<InboxEvent>[]);
+      }
+      final ref = _eventsRefFor(user.uid);
+      if (ref == null) {
+        return  Stream<List<InboxEvent>>.value(<InboxEvent>[]);
+      }
+      return ref
+          .orderBy('createdAt', descending: true)
+          .limit(limit)
+          .snapshots()
+          .map((snap) => snap.docs.map((d) => d.data()).toList());
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // ACTIONS
+  // ---------------------------------------------------------------------------
+
+  /// Mark a single event as read.
+  Future<void> markRead(String eventId) async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return;
+    final ref = _eventsRefFor(uid);
+    if (ref == null) return;
+    await ref.doc(eventId).update({'read': true});
+  }
+
+  /// Mark all unread events as read (efficient batched updates).
+  Future<void> markAllRead() async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return;
+    final ref = _eventsRefFor(uid);
+    if (ref == null) return;
+
+    final unread = await ref.where('read', isEqualTo: false).get();
+    if (unread.docs.isEmpty) return;
+
+    WriteBatch? batch;
+    var i = 0;
+    for (final d in unread.docs) {
+      batch ??= _db.batch();
+      batch.update(d.reference, {'read': true});
+      i++;
+      // Keep a safe margin under Firestore's ~500 ops/batch limit.
+      if (i % 450 == 0) {
+        await batch.commit();
+        batch = null;
       }
     }
+    if (batch != null) await batch.commit();
+  }
 
-    subA = forYou$.listen((data) {
-      latestForYou = data;
-      emit();
-    }, onError: controller.addError);
+  /// Delete an event from the inbox.
+  Future<void> deleteEvent(String eventId) async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return;
+    final ref = _eventsRefFor(uid);
+    if (ref == null) return;
+    await ref.doc(eventId).delete();
+  }
 
-    subB = leader$.listen((data) {
-      latestLeader = data;
-      emit();
-    }, onError: controller.addError);
+  /// (Optional) Utility to create an event for the current user.
+  /// Useful for local testing or ad-hoc app-generated notices.
+  Future<void> createEvent({
+    required String type,
+    String? title,
+    String? body,
+    Map<String, dynamic>? extra,
+  }) async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return;
+    final ref = _eventsRefFor(uid);
+    if (ref == null) return;
 
-    controller.onCancel = () async {
-      await subA?.cancel();
-      await subB?.cancel();
+    final data = <String, dynamic>{
+      'type': type,
+      if (title != null) 'title': title,
+      if (body != null) 'body': body,
+      'read': false,
+      'createdAt': FieldValue.serverTimestamp(),
+      if (extra != null) ...extra,
     };
 
-    return controller.stream;
+    await ref.add(InboxEvent(
+      id: 'pending',
+      type: type,
+      title: title,
+      body: body,
+      createdAt: null,
+      read: false,
+      raw: data,
+    ));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Lightweight switchMap so we don't need rx_dart or streams_extensions.
+// -----------------------------------------------------------------------------
+extension _SwitchMap<T> on Stream<T> {
+  Stream<R> switchMap<R>(Stream<R> Function(T value) project) async* {
+    StreamSubscription<R>? innerSub;
+    final controller = StreamController<R>();
+    late final StreamSubscription<T> outerSub;
+
+    outerSub = listen((outerValue) {
+      innerSub?.cancel();
+      innerSub = project(outerValue).listen(
+        controller.add,
+        onError: controller.addError,
+      );
+    }, onError: controller.addError, onDone: () async {
+      await innerSub?.cancel();
+      await controller.close();
+    });
+
+    yield* controller.stream;
+    await outerSub.cancel();
   }
 }

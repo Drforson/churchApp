@@ -1,3 +1,4 @@
+// lib/pages/admin_dashboard_page.dart
 import 'dart:async';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -5,6 +6,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter/services.dart';
+
+import 'notification_center_page.dart'; // <-- added
 
 class AdminDashboardPage extends StatefulWidget {
   const AdminDashboardPage({super.key});
@@ -19,10 +22,10 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
 
   bool _isAdmin = false;
   bool _isLeader = false;
-  bool _isPastor = false; // NEW: gate for “My Follow-Up”
+  bool _isPastor = false; // gate for “My Follow-Up”
   Set<String> _leadershipMinistries = {};
   String? _uid;
-  String? _displayName; // NEW: show real user name
+  String? _displayName; // show real user name
 
   @override
   void initState() {
@@ -71,7 +74,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       isPastor = isPastor || memberRoles.contains('pastor') || (md['isPastor'] == true);
     }
 
-    // Final safe fallback to auth displayName/email local-part if still null
+    // Final fallback to auth displayName/email local-part if still null
     name ??= _auth.currentUser?.displayName ??
         _auth.currentUser?.email?.split('@').first ??
         'Member';
@@ -100,12 +103,12 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       extendBodyBehindAppBar: true,
       appBar: AppBar(
         title: Text(_isAdmin ? 'Admin Dashboard' : _isLeader ? 'Leader Dashboard' : 'Dashboard'),
-        backgroundColor: Colors.teal.shade600, // ⬅️ a touch darker than the bg
-        foregroundColor: const Color(0xFF111827), // dark text/icons for contrast
+        backgroundColor: Colors.teal.shade600,
+        foregroundColor: const Color(0xFF111827),
         elevation: 0,
         centerTitle: true,
         scrolledUnderElevation: 0,
-        systemOverlayStyle: SystemUiOverlayStyle.dark, // dark status-bar icons
+        systemOverlayStyle: SystemUiOverlayStyle.dark,
         actions: [
           IconButton(
             tooltip: 'Refresh',
@@ -117,7 +120,12 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
             onPressed: () => _logout(context),
             icon: const Icon(Icons.logout),
           ),
-          NotificationBell(),
+          // ⬇️ Make the bell tappable to open Notification Center
+          NotificationBell(
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const NotificationCenterPage()),
+            ),
+          ),
         ],
       ),
       body: Container(
@@ -138,7 +146,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
                   isAdmin: _isAdmin,
                   isLeader: _isLeader,
                   ministries: _leadershipMinistries,
-                  displayName: _displayName ?? 'Member', // NEW
+                  displayName: _displayName ?? 'Member',
                 ),
                 const SizedBox(height: 14),
                 const _StatsGrid(),
@@ -149,7 +157,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
                 const SizedBox(height: 8),
                 _ActionsGrid(
                   canManage: canManage,
-                  isPastor: _isPastor, // NEW: to show “My Follow-Up”
+                  isPastor: _isPastor, // show “My Follow-Up”
                 ),
                 const SizedBox(height: 8),
               ],
@@ -167,7 +175,7 @@ class _HeaderCard extends StatelessWidget {
   final bool isAdmin;
   final bool isLeader;
   final Set<String> ministries;
-  final String displayName; // NEW
+  final String displayName;
 
   const _HeaderCard({
     required this.isAdmin,
@@ -180,8 +188,6 @@ class _HeaderCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final roleLabel = isAdmin ? 'Admin' : isLeader ? 'Leader' : 'Member';
 
-    // Keep your existing ministry/role context (unchanged logic),
-    // but now the main title is the user's name.
     final subtitle = isAdmin
         ? 'Role: Admin • Manage church-wide content and settings'
         : isLeader
@@ -195,7 +201,9 @@ class _HeaderCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white.withOpacity(0.96),
         borderRadius: BorderRadius.circular(16),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 12, offset: const Offset(0, 6))],
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 12, offset: const Offset(0, 6))
+        ],
       ),
       child: Row(
         children: [
@@ -209,7 +217,6 @@ class _HeaderCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // NEW: Welcome with actual name instead of role
                 Text(
                   'Welcome, $displayName',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
@@ -222,7 +229,6 @@ class _HeaderCard extends StatelessWidget {
               ],
             ),
           ),
-          // Optional: small role chip on the right
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: BoxDecoration(
@@ -258,7 +264,6 @@ class _StatsGrid extends StatelessWidget {
             ? 3
             : 3;
 
-        // Taller tiles to avoid vertical overflow
         final ratio = crossAxisCount >= 4 ? 1.0 : 0.65;
 
         return GridView.count(
@@ -320,7 +325,6 @@ class _StatTile extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           child: Column(
             children: [
-              // Top icon
               SizedBox(
                 height: 36,
                 child: Center(
@@ -331,7 +335,6 @@ class _StatTile extends StatelessWidget {
                   ),
                 ),
               ),
-              // Count (expands to fill, auto-fits)
               Expanded(
                 child: Center(
                   child: FittedBox(
@@ -347,7 +350,6 @@ class _StatTile extends StatelessWidget {
                   ),
                 ),
               ),
-              // Label (single line, ellipsis)
               SizedBox(
                 height: 22,
                 child: Center(
@@ -417,7 +419,8 @@ class _NoticeBoardCarouselState extends State<_NoticeBoardCarousel> {
           .snapshots(),
       builder: (context, eventsSnap) {
         return StreamBuilder<QuerySnapshot>(
-          stream: db.collection('announcements').orderBy('createdAt', descending: true).limit(5).snapshots(),
+          stream:
+          db.collection('announcements').orderBy('createdAt', descending: true).limit(5).snapshots(),
           builder: (context, annSnap) {
             final events = eventsSnap.data?.docs ?? const [];
             final anns = annSnap.data?.docs ?? const [];
@@ -431,7 +434,9 @@ class _NoticeBoardCarouselState extends State<_NoticeBoardCarousel> {
                 color: Colors.white.withOpacity(0.6),
                 borderRadius: BorderRadius.circular(16),
                 border: Border.all(color: Colors.white70),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 6))],
+                boxShadow: [
+                  BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 12, offset: const Offset(0, 6))
+                ],
               ),
               child: PageView.builder(
                 controller: _controller,
@@ -534,13 +539,13 @@ class _SectionTitle extends StatelessWidget {
 
 class _ActionsGrid extends StatelessWidget {
   final bool canManage;
-  final bool isPastor; // NEW
+  final bool isPastor;
   const _ActionsGrid({required this.canManage, required this.isPastor});
 
   @override
   Widget build(BuildContext context) {
     final items = <_ActionItem>[
-      _ActionItem('Profile', Icons.person, '/profile'), // NEW
+      _ActionItem('Profile', Icons.person, '/profile'),
       _ActionItem('Upload Sermons & Events', Icons.upload, '/admin-upload'),
       _ActionItem('Register Member/Visitor', Icons.how_to_reg, '/register-member'),
       _ActionItem('View Members', Icons.group, '/view-members'),
@@ -551,7 +556,6 @@ class _ActionsGrid extends StatelessWidget {
       _ActionItem('Attendance Check-In', Icons.check_circle_outline, '/attendance'),
       _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
       _ActionItem('Sunday Follow-Up', Icons.person_off, '/follow-up'),
-      // NEW: Only for pastors
       if (isPastor) _ActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin', requireManage: true),
     ].where((i) => !i.requireManage || canManage).toList();
@@ -559,7 +563,6 @@ class _ActionsGrid extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, c) {
         final columns = c.maxWidth >= 720 ? 4 : 2;
-        // Taller cards + flexible content
         final aspect = columns == 4 ? 1.25 : 0.88;
 
         return GridView.builder(

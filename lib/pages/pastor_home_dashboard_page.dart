@@ -1,3 +1,4 @@
+// lib/pages/pastor_home_dashboard_page.dart
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -6,7 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:intl/intl.dart';
 
-// ⬇️ NEW: import the approvals page
+import 'notification_center_page.dart'; // <— added
 import 'pastor_ministry_approvals_page.dart';
 
 class PastorHomeDashboardPage extends StatefulWidget {
@@ -40,12 +41,10 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
 
     String? name;
 
-    // Try users doc first
     final u = await _db.collection('users').doc(uid).get();
     final ud = u.data() ?? {};
     name = (ud['displayName'] ?? ud['name'])?.toString();
 
-    // Fallback to member name if needed
     if (name == null) {
       final memberId = ud['memberId'] as String?;
       if (memberId != null) {
@@ -60,7 +59,6 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
       }
     }
 
-    // Final fallback: auth displayName or email local part
     name ??= _auth.currentUser?.displayName ??
         _auth.currentUser?.email?.split('@').first ??
         'Pastor';
@@ -75,16 +73,21 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
       extendBodyBehindAppBar: true,
       appBar: AppBar(
         title: const Text('Pastor Dashboard'),
-        backgroundColor: Colors.teal.shade600,             // same tone as Admin
+        backgroundColor: Colors.teal.shade600,
         foregroundColor: const Color(0xFF111827),
         elevation: 0,
         centerTitle: true,
         scrolledUnderElevation: 0,
-        systemOverlayStyle: SystemUiOverlayStyle.dark,      // dark status bar icons
-        actions: const [
-          // If you prefer: move logout to a menu to avoid accidental taps
-          // IconButton(tooltip: 'Logout', onPressed: _logout, icon: Icon(Icons.logout)),
-          NotificationBell(),
+        systemOverlayStyle: SystemUiOverlayStyle.dark,
+        actions: [
+          // Tap now navigates to the Notification Center page
+          NotificationBell(
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => const NotificationCenterPage(),
+              ),
+            ),
+          ),
         ],
       ),
       body: Container(
@@ -103,13 +106,12 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
               children: [
                 _PastorHeaderCard(displayName: _displayName ?? 'Pastor'),
                 const SizedBox(height: 14),
-                const _PastorStatsGrid(), // 4 tiles (includes Follow-ups)
+                const _PastorStatsGrid(),
                 const SizedBox(height: 18),
                 _PastorNoticeBoardCarousel(),
                 const SizedBox(height: 18),
                 const _PastorSectionTitle('Quick Actions'),
                 const SizedBox(height: 8),
-                // ⬇️ Grid includes a button that opens the approvals page
                 _PastorActionsGrid(),
                 const SizedBox(height: 8),
               ],
@@ -117,7 +119,6 @@ class _PastorHomeDashboardPageState extends State<PastorHomeDashboardPage> {
           ),
         ),
       ),
-      // Optional: moved logout to a FAB for clarity
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _logout,
         icon: const Icon(Icons.logout),
@@ -504,10 +505,8 @@ class _PastorNoticeCard extends StatelessWidget {
         leading: Icon(icon, color: color),
         title: Text(
           title,
-          style: Theme.of(context)
-              .textTheme
-              .titleSmall
-              ?.copyWith(fontWeight: FontWeight.w600),
+          style:
+          Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
         ),
         subtitle: Text(
           subtitle,
@@ -542,7 +541,6 @@ class _PastorActionsGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = <_PastorActionItem>[
-      // ✅ NEW quick button: open the approvals page directly
       _PastorActionItem(
         'Ministry Approvals',
         Icons.verified_rounded,
@@ -552,14 +550,15 @@ class _PastorActionsGrid extends StatelessWidget {
           MaterialPageRoute(builder: (_) => const PastorMinistryApprovalsPage()),
         ),
       ),
-
       _PastorActionItem('Sunday Follow-Up', Icons.calendar_month_rounded, '/follow-up'),
       _PastorActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _PastorActionItem('Ministry', Icons.church_rounded, '/view-ministry'),
-      _PastorActionItem('Prayer Requests', Icons.volunteer_activism_rounded, '/manage-prayer-requests'),
+      _PastorActionItem('Prayer Requests', Icons.volunteer_activism_rounded,
+          '/manage-prayer-requests'),
       _PastorActionItem('Baptism', Icons.water_drop_rounded, '/manage-baptism'),
       _PastorActionItem('Profile', Icons.person_rounded, '/profile'),
-      _PastorActionItem('Post Announcement', Icons.campaign_rounded, '/post-announcements'),
+      _PastorActionItem('Post Announcement', Icons.campaign_rounded,
+          '/post-announcements'),
     ];
 
     return LayoutBuilder(

@@ -160,7 +160,7 @@ Future<void> main() async {
 
   // Notifications
   // Notifications
-  await NotificationCenter.init();
+ //  await NotificationCenter.init();
   await _initLocalNotifications();
   await _initMessaging();
 
