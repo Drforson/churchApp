@@ -458,17 +458,22 @@ class _MembersTabState extends State<_MembersTab> {
                               // Name only (ID removed)
                               Text(
                                 name,
-                                style: Theme.of(context).textTheme.titleMedium,
+                                maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.titleMedium,
                               ),
                               const SizedBox(height: 6),
+
                               // Requested date
                               Text(
                                 'Requested: $when',
-                                style: Theme.of(context).textTheme.bodySmall,
+                                maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodySmall,
                               ),
-                              const Spacer(),
+
+                              const SizedBox(height: 12), // was Spacer()
+
                               Row(
                                 mainAxisAlignment: MainAxisAlignment.end,
                                 children: [
@@ -491,7 +496,6 @@ class _MembersTabState extends State<_MembersTab> {
                                         try {
                                           await widget.onReject(reqId, memberId);
                                         } catch (_) {
-                                          // Revert hide on failure
                                           _hideOptimistically(reqId, false);
                                         } finally {
                                           _setBusy(reqId, false);
@@ -525,6 +529,7 @@ class _MembersTabState extends State<_MembersTab> {
                               ),
                             ],
                           ),
+
                         ),
                       ),
                     );
