@@ -21,21 +21,32 @@ class MinistresPage extends StatefulWidget {
   State<MinistresPage> createState() => _MinistresPageState();
 }
 
-class _MinistresPageState extends State<MinistresPage> {
+class _MinistresPageState extends State<MinistresPage>
+    with SingleTickerProviderStateMixin {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
 
   String? _uid;
   String? _memberId;
   Set<String> _userRoles = {};
-  Set<String> _userMinistries = {};
+  /// IMPORTANT: This stores **ministry names** (not ids), to match your Members doc schema.
+  Set<String> _memberMinistryNames = {};
   bool _loading = true;
+
+  late final TabController _tab;
   String _search = '';
 
   @override
   void initState() {
     super.initState();
+    _tab = TabController(length: 2, vsync: this); // My ministries / Other ministries
     _bootstrap();
+  }
+
+  @override
+  void dispose() {
+    _tab.dispose();
+    super.dispose();
   }
 
   Future<void> _bootstrap() async {
@@ -52,21 +63,20 @@ class _MinistresPageState extends State<MinistresPage> {
       final memberId = userData['memberId'] as String?;
       final rolesList = (userData['roles'] is List) ? List<String>.from(userData['roles']) : <String>[];
 
-      Set<String> roles = rolesList.map((e) => (e ?? '').toString()).toSet();
-
-      Set<String> ministries = {};
+      Set<String> ministriesByName = {};
       if (memberId != null) {
         final memberSnap = await _db.collection(FP.members).doc(memberId).get();
         final m = memberSnap.data() ?? {};
+        // Your schema stores ministry *names* in the member doc.
         final mins = (m['ministries'] is List) ? List<String>.from(m['ministries']) : <String>[];
-        ministries = mins.toSet();
+        ministriesByName = mins.toSet();
       }
 
       setState(() {
         _uid = uid;
         _memberId = memberId;
-        _userRoles = roles;
-        _userMinistries = ministries;
+        _userRoles = rolesList.toSet();
+        _memberMinistryNames = ministriesByName;
         _loading = false;
       });
     } catch (e) {
@@ -89,23 +99,24 @@ class _MinistresPageState extends State<MinistresPage> {
     return r.contains('pastor');
   }
 
-  bool _isMemberOf(String ministryId) {
-    return _userMinistries.contains(ministryId);
+  bool _isMemberOfByName(String ministryName) {
+    return _memberMinistryNames.contains(ministryName);
   }
 
-  Future<String?> _pendingJoinStatus(String ministryId) async {
+  Future<String?> _latestJoinStatusFor(String ministryName) async {
     if (_memberId == null) return null;
     final q = await _db.collection(FP.joinRequests)
         .where('memberId', isEqualTo: _memberId)
-        .where('ministryId', isEqualTo: ministryId)
-        .orderBy('createdAt', descending: true)
+    // In your app you persist the ministry *name* in join_requests.ministryId
+        .where('ministryId', isEqualTo: ministryName)
+        .orderBy('requestedAt', descending: true)
         .limit(1)
         .get();
     if (q.docs.isEmpty) return null;
-    return (q.docs.first.data()['status'] as String?) ?? 'pending';
+    return (q.docs.first.data()['status'] as String?)?.toLowerCase();
   }
 
-  Future<void> _openJoinBottomSheet(String ministryId, String ministryName) async {
+  Future<void> _openJoinBottomSheet(String ministryName) async {
     if (_memberId == null || _uid == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please sign in to request to join.')),
@@ -207,12 +218,13 @@ class _MinistresPageState extends State<MinistresPage> {
     try {
       await _db.collection(FP.joinRequests).add({
         'memberId': _memberId,
-        'ministryId': ministryId,
+        // Store the NAME, to match member.ministries array
+        'ministryId': ministryName,
         'requestedByUid': _uid,
         'message': controller.text.trim().isEmpty ? null : controller.text.trim(),
         'urgency': urgency,
         'status': 'pending',
-        'createdAt': FieldValue.serverTimestamp(),
+        'requestedAt': FieldValue.serverTimestamp(),
       });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -227,7 +239,7 @@ class _MinistresPageState extends State<MinistresPage> {
           ),
         );
       }
-      setState(() {});
+      setState(() {}); // refresh per-item status
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -248,11 +260,18 @@ class _MinistresPageState extends State<MinistresPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Ministries'),
+        bottom: TabBar(
+          controller: _tab,
+          tabs: const [
+            Tab(text: 'My ministries'),
+            Tab(text: 'Other ministries'),
+          ],
+        ),
         actions: [
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: SizedBox(
-              width: 240,
+              width: 260,
               child: TextField(
                 decoration: const InputDecoration(
                   hintText: 'Search ministries...',
@@ -276,72 +295,107 @@ class _MinistresPageState extends State<MinistresPage> {
           if (snap.hasError) {
             return Center(child: Text('Error: ${snap.error}'));
           }
-          final docs = snap.data?.docs ?? [];
-          final filtered = docs.where((d) {
+          final allDocs = (snap.data?.docs ?? []).where((d) {
             if (_search.isEmpty) return true;
             final name = (d.data()['name'] ?? '').toString().toLowerCase();
             return name.contains(_search);
           }).toList();
 
-          if (filtered.isEmpty) {
-            return const Center(child: Text('No ministries found.'));
+          // Partition into My vs Other using the *name* field
+          final my = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+          final other = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+
+          for (final d in allDocs) {
+            final name = (d.data()['name'] ?? '').toString();
+            if (_isMemberOfByName(name)) {
+              my.add(d);
+            } else {
+              other.add(d);
+            }
           }
 
-          return ListView.separated(
-            itemCount: filtered.length,
-            separatorBuilder: (_, __) => const Divider(height: 0),
-            itemBuilder: (context, i) {
-              final d = filtered[i];
-              final data = d.data();
-              final id = d.id;
-              final name = (data['name'] ?? 'Untitled').toString();
-              final description = (data['description'] ?? '').toString();
-              final createdAt = data['createdAt'];
-              final createdStr = createdAt is Timestamp
-                  ? DateFormat('d MMM y • HH:mm').format(createdAt.toDate())
-                  : null;
-
-              final amMember = _isMemberOf(id);
-
-              return FutureBuilder<String?>(
-                future: _pendingJoinStatus(id),
-                builder: (context, statusSnap) {
-                  final status = statusSnap.data; // null | pending | approved | declined
-
-                  return ListTile(
-                    title: Row(
-                      children: [
-                        Text(name, style: Theme.of(context).textTheme.titleMedium),
-                        const SizedBox(width: 8),
-                        if (status == 'pending') const _StatusChip(label: 'Request pending'),
-                        if (status == 'declined') const _StatusChip(label: 'Request declined'),
-                      ],
-                    ),
-                    subtitle: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (description.isNotEmpty) Text(description, maxLines: 2, overflow: TextOverflow.ellipsis),
-                        if (createdStr != null) Text(createdStr, style: Theme.of(context).textTheme.bodySmall),
-                      ],
-                    ),
-                    trailing: _buildActionButton(id, name, amMember, status),
-                    onTap: () {
-                      Navigator.push(context, MaterialPageRoute(
-                        builder: (_) => MinistryDetailsPage(ministryId: id, ministryName: name),
-                      ));
-                    },
-                  );
-                },
-              );
-            },
+          return TabBarView(
+            controller: _tab,
+            children: [
+              _buildList(context, my, isOtherTab: false),
+              _buildList(context, other, isOtherTab: true),
+            ],
           );
         },
       ),
     );
   }
 
-  Widget _buildActionButton(String ministryId, String ministryName, bool amMember, String? status) {
-    // Pastors/Admins have access to all ministries -> show "Open"
+  Widget _buildList(BuildContext context,
+      List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+      {required bool isOtherTab}) {
+    if (docs.isEmpty) {
+      return Center(child: Text(isOtherTab ? 'No other ministries.' : 'You are not in any ministries yet.'));
+    }
+    return ListView.separated(
+      itemCount: docs.length,
+      separatorBuilder: (_, __) => const Divider(height: 0),
+      itemBuilder: (context, i) {
+        final d = docs[i];
+        final data = d.data();
+        final id = d.id;
+        final name = (data['name'] ?? 'Untitled').toString();
+        final description = (data['description'] ?? '').toString();
+        final createdAt = data['createdAt'];
+        final createdStr = createdAt is Timestamp
+            ? DateFormat('d MMM y • HH:mm').format(createdAt.toDate())
+            : null;
+
+        final amMember = _isMemberOfByName(name); // compare by NAME
+
+        return FutureBuilder<String?>(
+          future: _latestJoinStatusFor(name),
+          builder: (context, statusSnap) {
+            final status = statusSnap.data; // null | pending | approved | rejected
+
+            return ListTile(
+              title: Row(
+                children: [
+                  Text(name, style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(width: 8),
+                  if (status == 'pending') const _StatusChip(label: 'Request pending'),
+                  if (status == 'rejected') const _StatusChip(label: 'Request declined'),
+                ],
+              ),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (description.isNotEmpty) Text(description, maxLines: 2, overflow: TextOverflow.ellipsis),
+                  if (createdStr != null) Text(createdStr, style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+              trailing: _buildActionButton(
+                ministryId: id,
+                ministryName: name,
+                amMember: amMember,
+                status: status,
+                isOtherTab: isOtherTab,
+              ),
+              onTap: () {
+                Navigator.push(context, MaterialPageRoute(
+                  builder: (_) => MinistryDetailsPage(ministryId: id, ministryName: name),
+                ));
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildActionButton({
+    required String ministryId,
+    required String ministryName,
+    required bool amMember,
+    required String? status,
+    required bool isOtherTab,
+  }) {
+    // Pastors/Admins: full access to all ministries — always show "Open"
     if (isAdmin || isPastor) {
       return OutlinedButton.icon(
         icon: const Icon(Icons.open_in_new),
@@ -354,7 +408,7 @@ class _MinistresPageState extends State<MinistresPage> {
       );
     }
 
-    // If already a member -> "View"
+    // Members who are already in the ministry: show "View"
     if (amMember) {
       return OutlinedButton.icon(
         icon: const Icon(Icons.visibility_outlined),
@@ -367,7 +421,7 @@ class _MinistresPageState extends State<MinistresPage> {
       );
     }
 
-    // Not a member: show Join (unless a pending request already exists)
+    // Other ministries (not a member): show Join unless there is a pending request
     if (status == 'pending') {
       return const SizedBox.shrink();
     }
@@ -375,7 +429,7 @@ class _MinistresPageState extends State<MinistresPage> {
     return FilledButton.icon(
       icon: const Icon(Icons.group_add),
       label: const Text('Join'),
-      onPressed: () => _openJoinBottomSheet(ministryId, ministryName),
+      onPressed: () => _openJoinBottomSheet(ministryName),
     );
   }
 }
