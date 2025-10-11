@@ -27,14 +27,13 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
     with TickerProviderStateMixin {
   late final TabController _tab;
 
-  Map<String, dynamic>? _currentUserData;
-  bool _loadingUser = true;
-
+  bool _loading = true;
   String? _uid;
   String? _memberId;
-  Set<String> _userRoles = {};
+  Set<String> _roles = {};
   Set<String> _memberMinistriesByName = {};
   String? _latestJoinStatus; // pending / approved / rejected / null
+  bool _canAccess = false;   // computed gate
 
   @override
   void initState() {
@@ -50,129 +49,66 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
   }
 
   Future<void> _bootstrap() async {
-    await _fetchCurrentUser();
-    await _fetchMembershipAndStatus();
-  }
-
-  Future<void> _fetchCurrentUser() async {
     try {
-      final uid = FirebaseAuth.instance.currentUser?.uid;
-      if (uid == null) {
+      final auth = FirebaseAuth.instance;
+      final db = FirebaseFirestore.instance;
+      _uid = auth.currentUser?.uid;
+
+      if (_uid == null) {
         setState(() {
-          _loadingUser = false;
-          _currentUserData = null;
-          _uid = null;
-          _memberId = null;
-          _userRoles = {};
+          _loading = false;
+          _canAccess = false;
         });
         return;
       }
-      final userSnap = await FirebaseFirestore.instance.collection(FP.users).doc(uid).get();
-      final data = userSnap.data() ?? {};
 
-      final roles = (data['roles'] is List)
-          ? List<String>.from(data['roles'])
-          : <String>[];
-      final leadershipMinistries = (data['leadershipMinistries'] is List)
-          ? List<String>.from(data['leadershipMinistries'])
-          : <String>[];
-      final memberId = (data['memberId'] is String) ? data['memberId'] as String : null;
+      final userSnap = await db.collection(FP.users).doc(_uid).get();
+      final u = userSnap.data() ?? {};
+      _memberId = (u['memberId'] is String) ? u['memberId'] as String : null;
+      _roles = (u['roles'] is List) ? Set<String>.from(u['roles']) : <String>{};
 
-      Set<String> ministriesByName = {};
-      if (memberId != null) {
-        final mem = await FirebaseFirestore.instance.collection(FP.members).doc(memberId).get();
-        final m = mem.data() ?? {};
-        ministriesByName = (m['ministries'] is List) ? Set<String>.from(m['ministries']) : <String>{};
+      if (_memberId != null) {
+        final memSnap = await db.collection(FP.members).doc(_memberId).get();
+        final m = memSnap.data() ?? {};
+        _memberMinistriesByName = (m['ministries'] is List)
+            ? Set<String>.from(m['ministries'])
+            : <String>{};
+      }
+
+      // Compute access: admin/pastor OR member of ministry by NAME
+      final rolesLower = _roles.map((e) => e.toLowerCase()).toSet();
+      final isAdmin = rolesLower.contains('admin');
+      final isPastor = rolesLower.contains('pastor');
+      final isMemberHere = _memberMinistriesByName.contains(widget.ministryName);
+
+      _canAccess = isAdmin || isPastor || isMemberHere;
+
+      // Latest join status (for banner if needed)
+      if (_memberId != null) {
+        final q = await db.collection(FP.joinRequests)
+            .where('memberId', isEqualTo: _memberId)
+            .where('ministryId', isEqualTo: widget.ministryName) // NAME
+            .orderBy('requestedAt', descending: true)
+            .limit(1)
+            .get();
+        if (q.docs.isNotEmpty) {
+          _latestJoinStatus = (q.docs.first.data()['status'] as String?)?.toLowerCase();
+        }
       }
 
       setState(() {
-        _uid = uid;
-        _memberId = memberId;
-        _userRoles = roles.toSet();
-        _memberMinistriesByName = ministriesByName;
-        _currentUserData = {
-          'roles': roles,
-          'leadershipMinistries': leadershipMinistries,
-        };
-        _loadingUser = false;
+        _loading = false;
       });
     } catch (_) {
       setState(() {
-        _loadingUser = false;
-        _currentUserData = null;
+        _loading = false;
+        _canAccess = false;
       });
     }
-  }
-
-  Future<void> _fetchMembershipAndStatus() async {
-    try {
-      if (_memberId == null) {
-        setState(() => _latestJoinStatus = null);
-        return;
-      }
-      final q = await FirebaseFirestore.instance
-          .collection(FP.joinRequests)
-          .where('memberId', isEqualTo: _memberId)
-      // Use ministry *name* in join_requests, to match your schema
-          .where('ministryId', isEqualTo: widget.ministryName)
-          .orderBy('requestedAt', descending: true)
-          .limit(1)
-          .get();
-
-      String? status;
-      if (q.docs.isNotEmpty) {
-        status = (q.docs.first.data()['status'] as String?)?.toLowerCase();
-      }
-      setState(() {
-        _latestJoinStatus = status; // pending / approved / rejected / null
-      });
-    } catch (_) {}
-  }
-
-  bool _isAdmin() {
-    final r = _userRoles.map((e) => e.toLowerCase()).toSet();
-    return r.contains('admin');
-  }
-
-  bool _isPastor() {
-    final r = _userRoles.map((e) => e.toLowerCase()).toSet();
-    return r.contains('pastor');
-  }
-
-  bool _isLeaderHere() {
-    if (_currentUserData == null) return false;
-    final roles = List<String>.from(_currentUserData!['roles'] ?? const <String>[]);
-    final leadershipMinistries =
-    List<String>.from(_currentUserData!['leadershipMinistries'] ?? const <String>[]);
-    return roles.contains('leader') && leadershipMinistries.contains(widget.ministryName);
-  }
-
-  bool _isAdminOrLeaderOfThisMinistry() {
-    return _isAdmin() || _isLeaderHere();
-  }
-
-  bool _amMemberOfThisMinistry() {
-    return _memberMinistriesByName.contains(widget.ministryName);
-  }
-
-  Future<String?> _getUserIdByMemberId(String memberId) async {
-    final qs = await FirebaseFirestore.instance
-        .collection(FP.users)
-        .where('memberId', isEqualTo: memberId)
-        .limit(1)
-        .get();
-    if (qs.docs.isEmpty) return null;
-    return qs.docs.first.id;
   }
 
   Future<void> _openJoinBottomSheet() async {
-    if (_uid == null || _memberId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please sign in to request to join.')),
-      );
-      return;
-    }
-
+    if (_uid == null || _memberId == null) return;
     final controller = TextEditingController();
     String urgency = 'normal';
 
@@ -197,41 +133,13 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
               const Divider(height: 1),
               Padding(
                 padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    TextField(
-                      controller: controller,
-                      maxLines: 3,
-                      decoration: const InputDecoration(
-                        labelText: 'Why do you want to join? (optional)',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        const Text('Urgency:'),
-                        const SizedBox(width: 12),
-                        StatefulBuilder(
-                          builder: (ctx2, setSB) => Row(
-                            children: [
-                              ChoiceChip(
-                                label: const Text('Normal'),
-                                selected: urgency == 'normal',
-                                onSelected: (_) => setSB(() => urgency = 'normal'),
-                              ),
-                              const SizedBox(width: 8),
-                              ChoiceChip(
-                                label: const Text('High'),
-                                selected: urgency == 'high',
-                                onSelected: (_) => setSB(() => urgency = 'high'),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+                child: TextField(
+                  controller: controller,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    labelText: 'Why do you want to join? (optional)',
+                    border: OutlineInputBorder(),
+                  ),
                 ),
               ),
               const Divider(height: 1),
@@ -274,19 +182,10 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
         'status': 'pending',
         'requestedAt': FieldValue.serverTimestamp(),
       });
-      await _fetchMembershipAndStatus();
-
       if (mounted) {
+        setState(() => _latestJoinStatus = 'pending');
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                Icon(Icons.check_circle_outline),
-                SizedBox(width: 8),
-                Expanded(child: Text('Join request sent. You’ll be notified when approved.')),
-              ],
-            ),
-          ),
+          const SnackBar(content: Text('Join request sent.')),
         );
       }
     } catch (e) {
@@ -298,106 +197,58 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
     }
   }
 
-  // Promotion / demotion logic (unchanged)
-  final Set<String> _processingMembers = {};
-
-  Future<void> _promoteToLeader(String memberId) async {
-    if (!_isAdminOrLeaderOfThisMinistry()) return;
-    setState(() => _processingMembers.add(memberId));
-    try {
-      final db = FirebaseFirestore.instance;
-      final memberRef = db.collection(FP.members).doc(memberId);
-
-      final userId = await _getUserIdByMemberId(memberId);
-      final userRef = (userId != null) ? db.collection(FP.users).doc(userId) : null;
-
-      final batch = db.batch();
-      batch.update(memberRef, {
-        'leadershipMinistries': FieldValue.arrayUnion([widget.ministryName]),
-      });
-      if (userRef != null) {
-        batch.update(userRef, {
-          'leadershipMinistries': FieldValue.arrayUnion([widget.ministryName]),
-        });
-      }
-      await batch.commit();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Promoted to leader.')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error promoting: $e'), backgroundColor: Colors.red),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _processingMembers.remove(memberId));
-    }
-  }
-
-  Future<void> _demoteFromLeader(String memberId) async {
-    if (!_isAdminOrLeaderOfThisMinistry()) return;
-    setState(() => _processingMembers.add(memberId));
-    try {
-      final db = FirebaseFirestore.instance;
-      final memberRef = db.collection(FP.members).doc(memberId);
-
-      final userId = await _getUserIdByMemberId(memberId);
-      final userRef = (userId != null) ? db.collection(FP.users).doc(userId) : null;
-
-      final batch = db.batch();
-      batch.update(memberRef, {
-        'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
-      });
-      if (userRef != null) {
-        batch.update(userRef, {
-          'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
-        });
-      }
-      await batch.commit();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Demoted from leader.')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error demoting: $e'), backgroundColor: Colors.red),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _processingMembers.remove(memberId));
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
-    if (_loadingUser) {
+    if (_loading) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    final canSeeJoin =
-        !_isAdmin() && !_isPastor() && !_amMemberOfThisMinistry() && _uid != null;
+    // If no access: show a locked screen; do NOT expose ministry content
+    if (!_canAccess) {
+      final canRequest =
+          _uid != null &&
+              !(_roles.map((e) => e.toLowerCase()).contains('admin')) &&
+              !(_roles.map((e) => e.toLowerCase()).contains('pastor')) &&
+              !_memberMinistriesByName.contains(widget.ministryName) &&
+              _latestJoinStatus != 'pending';
 
+      return Scaffold(
+        appBar: AppBar(title: Text(widget.ministryName)),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock_outline, size: 56),
+                const SizedBox(height: 12),
+                const Text(
+                  "You don't have access to this ministry yet.",
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 16),
+                ),
+                const SizedBox(height: 8),
+                if (_latestJoinStatus == 'pending')
+                  const Text('Your join request is pending approval.',
+                      style: TextStyle(fontStyle: FontStyle.italic)),
+                const SizedBox(height: 16),
+                if (canRequest)
+                  FilledButton.icon(
+                    icon: const Icon(Icons.group_add),
+                    label: const Text('Request to join'),
+                    onPressed: _openJoinBottomSheet,
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // If access is granted, show the real content with tabs
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.ministryName),
-        actions: [
-          if (canSeeJoin && _latestJoinStatus != 'pending')
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: FilledButton.icon(
-                icon: const Icon(Icons.group_add),
-                label: const Text('Join'),
-                onPressed: _openJoinBottomSheet,
-              ),
-            ),
-        ],
         bottom: TabBar(
           controller: _tab,
           tabs: const [
@@ -407,246 +258,71 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
           ],
         ),
       ),
-      body: Column(
+      body: TabBarView(
+        controller: _tab,
         children: [
-          if (_latestJoinStatus == 'pending')
-            Container(
-              margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Theme.of(context).colorScheme.outline),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.hourglass_top),
-                  const SizedBox(width: 8),
-                  const Expanded(child: Text('Your join request is pending')),
-                  TextButton(
-                    onPressed: () {},
-                    child: const Text('Details'),
-                  ),
-                ],
-              ),
-            ),
-          Expanded(
-            child: TabBarView(
-              controller: _tab,
-              children: [
-                _MembersTab(
-                  ministryName: widget.ministryName,
-                  ministryId: widget.ministryId,
-                  canModerate: _isAdminOrLeaderOfThisMinistry(),
-                  isAdmin: _isAdmin(),
-                  processingMembers: _processingMembers,
-                  onPromote: _promoteToLeader,
-                  onDemote: _demoteFromLeader,
-                ),
-                MinistryFeedPage(
-                  ministryId: widget.ministryId,
-                  ministryName: widget.ministryName,
-                ),
-                _OverviewTab(ministryId: widget.ministryId, ministryName: widget.ministryName),
-              ],
-            ),
-          ),
+          _MembersTab(ministryName: widget.ministryName, ministryId: widget.ministryId),
+          MinistryFeedPage(ministryId: widget.ministryId, ministryName: widget.ministryName),
+          _OverviewTab(ministryId: widget.ministryId, ministryName: widget.ministryName),
         ],
       ),
     );
   }
 }
 
-// ===== Members tab & Overview tab widgets remain the same as your previous version =====
-// (They don’t affect the Join button visibility logic covered above.)
-
-class _MembersTab extends StatefulWidget {
+// Simple Members Tab (unchanged in logic for access)
+class _MembersTab extends StatelessWidget {
   final String ministryId;
   final String ministryName;
-  final bool canModerate;
-  final bool isAdmin;
-  final Set<String> processingMembers;
-  final Future<void> Function(String memberId) onPromote;
-  final Future<void> Function(String memberId) onDemote;
-
-  const _MembersTab({
-    required this.ministryId,
-    required this.ministryName,
-    required this.canModerate,
-    required this.isAdmin,
-    required this.processingMembers,
-    required this.onPromote,
-    required this.onDemote,
-  });
+  const _MembersTab({required this.ministryId, required this.ministryName});
 
   @override
-  State<_MembersTab> createState() => _MembersTabState();
-}
+  Widget build(BuildContext context) {
+    final db = FirebaseFirestore.instance;
 
-class _MembersTabState extends State<_MembersTab> {
-  final _db = FirebaseFirestore.instance;
-
-  final TextEditingController _searchCtrl = TextEditingController();
-  Timer? _debounce;
-  String _filter = '';
-  String _roleFilter = 'All'; // All / Leaders / Members
-  final ScrollController _scroll = ScrollController();
-
-  @override
-  void initState() {
-    super.initState();
-    _searchCtrl.addListener(_onSearchChanged);
-  }
-
-  @override
-  void dispose() {
-    _searchCtrl.removeListener(_onSearchChanged);
-    _searchCtrl.dispose();
-    _debounce?.cancel();
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  void _onSearchChanged() {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 250), () {
-      if (!mounted) return;
-      setState(() {
-        _filter = _searchCtrl.text.trim().toLowerCase();
+    Stream<List<Map<String, dynamic>>> _membersStream() {
+      return db
+          .collection(FP.members)
+          .where('ministries', arrayContains: ministryName)
+          .snapshots()
+          .map((snap) {
+        return snap.docs.map((d) {
+          final data = d.data();
+          final first = (data['firstName'] ?? '').toString();
+          final last = (data['lastName'] ?? '').toString();
+          final name = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
+          final email = (data['email'] ?? '').toString();
+          return {
+            'memberId': d.id,
+            'name': name.isEmpty ? 'Unnamed Member' : name,
+            'email': email,
+          };
+        }).toList();
       });
-    });
-  }
+    }
 
-  bool _matchSearchAndRole(Map<String, dynamic> m) {
-    final name = (m['name'] ?? '').toString().toLowerCase();
-    final email = (m['email'] ?? '').toString().toLowerCase();
-    final isLeader = (m['isLeader'] == true);
-    final hit = _filter.isEmpty || name.contains(_filter) || email.contains(_filter);
-
-    if (!hit) return false;
-    if (_roleFilter == 'Leaders') return isLeader;
-    if (_roleFilter == 'Members') return !isLeader;
-    return true;
-  }
-
-  Stream<List<Map<String, dynamic>>> _membersStream() {
-    return _db
-        .collection(FP.members)
-        .where('ministries', arrayContains: widget.ministryName)
-        .snapshots()
-        .map((snap) {
-      return snap.docs.map((d) {
-        final data = d.data();
-        final first = (data['firstName'] ?? '').toString();
-        final last = (data['lastName'] ?? '').toString();
-        final name = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
-        final email = (data['email'] ?? '').toString();
-        final leadership = List<String>.from(data['leadershipMinistries'] ?? const <String>[]);
-        final isLeaderHere = leadership.contains(widget.ministryName);
-        return {
-          'memberId': d.id,
-          'name': name.isEmpty ? 'Unnamed Member' : name,
-          'email': email,
-          'isLeader': isLeaderHere,
-          'leadershipMinistries': leadership,
-        };
-      }).toList();
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _searchCtrl,
-                  decoration: const InputDecoration(
-                    prefixIcon: Icon(Icons.search),
-                    hintText: 'Search members by name or email…',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                ),
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: _membersStream(),
+      builder: (context, snap) {
+        if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+        final members = snap.data!;
+        if (members.isEmpty) return const Center(child: Text('No members yet.'));
+        return ListView.separated(
+          padding: const EdgeInsets.all(12),
+          itemCount: members.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 8),
+          itemBuilder: (context, i) {
+            final m = members[i];
+            return Card(
+              child: ListTile(
+                title: Text(m['name'] ?? 'Unnamed Member'),
+                subtitle: Text(m['email'] ?? ''),
               ),
-              const SizedBox(width: 12),
-              DropdownButton<String>(
-                value: _roleFilter,
-                onChanged: (v) => setState(() => _roleFilter = v ?? 'All'),
-                items: const [
-                  DropdownMenuItem(value: 'All', child: Text('All')),
-                  DropdownMenuItem(value: 'Leaders', child: Text('Leaders')),
-                  DropdownMenuItem(value: 'Members', child: Text('Members')),
-                ],
-              ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: StreamBuilder<List<Map<String, dynamic>>>(
-            stream: _membersStream(),
-            builder: (context, snap) {
-              if (!snap.hasData) {
-                return const Center(child: CircularProgressIndicator());
-              }
-              final all = snap.data!;
-              final filtered = all.where(_matchSearchAndRole).toList();
-
-              if (filtered.isEmpty) {
-                return const Center(child: Text('No members found.'));
-              }
-
-              return ListView.separated(
-                controller: _scroll,
-                padding: const EdgeInsets.all(12),
-                itemCount: filtered.length,
-                separatorBuilder: (_, __) => const SizedBox(height: 8),
-                itemBuilder: (context, i) {
-                  final m = filtered[i];
-                  final memberId = m['memberId'] as String;
-                  final isLeader = m['isLeader'] == true;
-
-                  return Card(
-                    child: ListTile(
-                      title: Text(m['name'] ?? 'Unnamed Member'),
-                      subtitle: Text(m['email'] ?? ''),
-                      trailing: widget.canModerate
-                          ? _LeaderToggle(
-                        value: isLeader,
-                        onChanged: (val) {
-                          if (val) {
-                            widget.onPromote(memberId);
-                          } else {
-                            widget.onDemote(memberId);
-                          }
-                        },
-                      )
-                          : null,
-                    ),
-                  );
-                },
-              );
-            },
-          ),
-        ),
-      ],
+            );
+          },
+        );
+      },
     );
-  }
-}
-
-class _LeaderToggle extends StatelessWidget {
-  final bool value;
-  final ValueChanged<bool> onChanged;
-  const _LeaderToggle({required this.value, required this.onChanged});
-
-  @override
-  Widget build(BuildContext context) {
-    return Switch(value: value, onChanged: onChanged);
   }
 }
 
