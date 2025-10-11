@@ -1,5 +1,5 @@
-import 'dart:convert';
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -18,7 +18,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
   final _auth = FirebaseAuth.instance;
 
   bool _loadingRole = true;
-  bool _canView = false;   // pastor || admin
+  bool _canView = false;   // pastor || admin can view
   bool _isPastor = false;  // only pastors can approve/decline (per rules)
   String? _uid;
 
@@ -54,18 +54,19 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     }
     _uid = user.uid;
 
+    // Live-listen to the user document so role updates reflect immediately.
     _userSub = _db.collection('users').doc(user.uid).snapshots().listen((snap) async {
       final data = snap.data() ?? <String, dynamic>{};
       final rolesLower = <String>{};
       String? memberId = data['memberId'] as String?;
 
-      // users.roles array
+      // users.roles array (any case)
       if (data['roles'] is List) {
         for (final v in List.from(data['roles'])) {
           if (v is String && v.trim().isNotEmpty) rolesLower.add(v.trim().toLowerCase());
         }
       }
-      // users.role
+      // users.role (single)
       if (data['role'] is String && (data['role'] as String).trim().isNotEmpty) {
         rolesLower.add((data['role'] as String).trim().toLowerCase());
       }
@@ -83,22 +84,19 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
 
       var canView = rolesLower.contains('pastor') || rolesLower.contains('admin');
       var isPastor = rolesLower.contains('pastor');
-      Map<String, dynamic> memberData = const {};
 
-      // member fallback
-      if (!canView && memberId != null && memberId.isNotEmpty) {
+      // member fallback (in case roles not on users/claims)
+      if (memberId != null && memberId.isNotEmpty) {
         try {
           final mem = await _db.collection('members').doc(memberId).get();
-          memberData = mem.data() ?? {};
+          final memberData = mem.data() ?? {};
           final mRoles = (memberData['roles'] as List<dynamic>? ?? const [])
               .map((e) => e.toString().toLowerCase())
               .toSet();
-          if (mRoles.contains('admin')) {
-            rolesLower.add('admin');
-          }
-          if (mRoles.contains('pastor') || memberData['isPastor'] == true) {
-            rolesLower.add('pastor');
-          }
+          if (mRoles.contains('admin')) rolesLower.add('admin');
+          if (mRoles.contains('pastor') || memberData['isPastor'] == true) rolesLower.add('pastor');
+
+          // Recompute after member fallback
           canView = rolesLower.contains('pastor') || rolesLower.contains('admin');
           isPastor = rolesLower.contains('pastor');
         } catch (_) {}
@@ -107,7 +105,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
       if (!mounted) return;
       setState(() {
         _canView = canView;
-        _isPastor = isPastor; // only pastors can act
+        _isPastor = isPastor;
         _loadingRole = false;
         _debug = {
           'uid': user.uid,
@@ -124,11 +122,16 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     String? fallbackFullName,
     String? fallbackEmail,
   }) async {
+    // Quick cache
     if (_nameCache.containsKey(requestedByUid)) return _nameCache[requestedByUid]!;
+
+    // Prefer server-provided full name
     if ((fallbackFullName ?? '').trim().isNotEmpty) {
       _nameCache[requestedByUid] = fallbackFullName!.trim();
       return _nameCache[requestedByUid]!;
     }
+
+    // Try to resolve via users -> members
     try {
       final u = await _db.collection('users').doc(requestedByUid).get();
       final udata = u.data() ?? {};
@@ -148,6 +151,8 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
         }
       }
     } catch (_) {}
+
+    // Fall back to email or uid
     final fb = (fallbackEmail ?? '').trim();
     if (fb.isNotEmpty) {
       _nameCache[requestedByUid] = fb;
@@ -172,8 +177,8 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     try {
       await _db.collection('ministry_approval_actions').add({
         'requestId': requestId,
-        'decision': decision,               // <-- matches Cloud Function
-        'reviewerUid': _uid,                // <-- matches Cloud Function
+        'decision': decision,                    // <-- matches Cloud Function
+        'reviewerUid': _uid,                     // <-- matches Cloud Function
         'reason': (reason ?? '').trim().isEmpty ? null : reason!.trim(),
         'createdAt': FieldValue.serverTimestamp(),
       });
@@ -220,6 +225,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     if (_loadingRole) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
+
     if (!_canView) {
       final pretty = const JsonEncoder.withIndent('  ').convert(_debug);
       return Scaffold(
@@ -250,6 +256,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
       );
     }
 
+    // NOTE: Your rules allow pastors/admins to read; this query shows only 'pending'
     final query = _db
         .collection('ministry_creation_requests')
         .where('status', isEqualTo: 'pending')
@@ -273,11 +280,11 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
               final data = d.data() as Map<String, dynamic>;
               final id = d.id;
 
-              final ministryName = (data['name'] ?? data['ministryName'] ?? '').toString();
-              final description = (data['description'] ?? '').toString();
-              final requestedByUid = (data['requestedByUid'] ?? '').toString();
-              final requesterEmail = (data['requesterEmail'] ?? '').toString();
-              final requesterFullName = (data['requesterFullName'] ?? '').toString();
+              final ministryName = (data['name'] ?? data['ministryName'] ?? '').toString().trim();
+              final description = (data['description'] ?? '').toString().trim();
+              final requestedByUid = (data['requestedByUid'] ?? '').toString().trim();
+              final requesterEmail = (data['requesterEmail'] ?? '').toString().trim();
+              final requesterFullName = (data['requesterFullName'] ?? '').toString().trim();
 
               final ts = data['requestedAt'] ?? data['createdAt'];
               final requestedAt = ts is Timestamp ? ts.toDate() : null;
@@ -292,7 +299,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                           style: Theme.of(context).textTheme.titleLarge),
                       const SizedBox(height: 6),
                       if (description.isNotEmpty) Text(description),
-                      const SizedBox(height: 6),
+                      const SizedBox(height: 8),
                       FutureBuilder<String>(
                         future: _resolveRequesterName(
                           requestedByUid: requestedByUid,
@@ -305,13 +312,11 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                             spacing: 12,
                             runSpacing: 6,
                             children: [
-                              _Chip('Requester', name),
-                              if (requesterEmail.isNotEmpty) _Chip('Email', requesterEmail),
-                              _Chip(
+                              _InfoChip('Requester', name),
+                              if (requesterEmail.isNotEmpty) _InfoChip('Email', requesterEmail),
+                              _InfoChip(
                                 'Requested At',
-                                requestedAt == null
-                                    ? '—'
-                                    : '${requestedAt.toLocal()}',
+                                requestedAt == null ? '—' : requestedAt.toLocal().toString(),
                               ),
                             ],
                           );
@@ -334,10 +339,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                             message: _isPastor ? 'Approve' : 'Only pastors can act',
                             child: ElevatedButton.icon(
                               onPressed: _isPastor
-                                  ? () => _enqueueAction(
-                                requestId: id,
-                                decision: 'approve',
-                              )
+                                  ? () => _enqueueAction(requestId: id, decision: 'approve')
                                   : null,
                               icon: const Icon(Icons.check_circle),
                               label: const Text('Approve'),
@@ -357,10 +359,10 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
   }
 }
 
-class _Chip extends StatelessWidget {
+class _InfoChip extends StatelessWidget {
   final String label;
   final String value;
-  const _Chip(this.label, this.value);
+  const _InfoChip(this.label, this.value);
 
   @override
   Widget build(BuildContext context) {

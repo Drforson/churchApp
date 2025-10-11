@@ -33,7 +33,7 @@ async function getUser(uid) {
     const snap = await db.doc(`users/${uid}`).get();
     return snap.exists ? { id: snap.id, ...snap.data() } : null;
   } catch (e) {
-    logger.error('getUser failed', uid, e);
+    logger.error('getUser failed', { uid, error: e });
     return null;
   }
 }
@@ -95,6 +95,7 @@ async function listMemberIdsByPastorOrAdmin() {
     qs.docs.forEach((d) => out.add(d.id));
   }
   {
+    // look for leadershipMinistries containing the word "pastor"
     const qs = await db.collection('members').where('leadershipMinistries', '!=', null).limit(500).get();
     qs.docs.forEach((d) => {
       const lm = d.data().leadershipMinistries || [];
@@ -173,7 +174,7 @@ async function syncClaimsForUid(uid) {
     await admin.auth().setCustomUserClaims(uid, claims);
     logger.info('syncClaimsForUid', { uid, claims });
   } catch (e) {
-    logger.error('syncClaimsForUid failed', uid, e);
+    logger.error('syncClaimsForUid failed', { uid, error: e });
   }
 }
 
@@ -236,6 +237,19 @@ async function writeNotification(payload) {
   await db.collection('notifications').add(data);
 }
 
+/* ========= Utility: add a member to a ministry ========= */
+async function addMemberToMinistry(memberId, ministryName, { asLeader = false } = {}) {
+  if (!memberId || !ministryName) return;
+  const updates = {
+    ministries: admin.firestore.FieldValue.arrayUnion(ministryName),
+    updatedAt: ts(),
+  };
+  if (asLeader) {
+    updates.leadershipMinistries = admin.firestore.FieldValue.arrayUnion(ministryName);
+  }
+  await db.doc(`members/${memberId}`).set(updates, { merge: true });
+}
+
 /* ========= Notifications helpers for leaders (join requests) ========= */
 async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
   await writeNotification({
@@ -249,6 +263,7 @@ async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId
   });
 }
 
+/* Read leaders both from members.leadershipMinistries and ministries.leaderUids/leaderIds */
 async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
   const leadersSnap = await db
     .collection('members')
@@ -262,13 +277,17 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
     .limit(1)
     .get();
   if (!mins.empty) {
-    const m = mins.docs[0].data() || {};
-    ministryLeaderUids = Array.isArray(m.leaderIds) ? m.leaderIds.filter(Boolean) : [];
+    const mData = mins.docs[0].data() || {};
+    // ⚠️ FIX: support both fields
+    const fromLeaderUids = Array.isArray(mData.leaderUids) ? mData.leaderUids : [];
+    const fromLeaderIds  = Array.isArray(mData.leaderIds)  ? mData.leaderIds  : [];
+    ministryLeaderUids = uniq([...fromLeaderUids, ...fromLeaderIds].filter(Boolean));
     ministryDocId = ministryDocId || mins.docs[0].id;
   }
 
   const batch = db.batch();
 
+  // From member leadershipMinistries → map to users
   for (const lm of leadersSnap.docs) {
     const leaderMemberId = lm.id;
     const userQs = await db
@@ -377,14 +396,14 @@ exports.processMinistryApprovalAction = onDocumentCreated(
     logger.info('processMinistryApprovalAction received', { id: doc.id, decision, requestId, reviewerUid });
 
     if (!decision || !requestId || !reviewerUid) {
-      logger.warn('Invalid payload on approval action', doc.id);
+      logger.warn('Invalid payload on approval action', { id: doc.id });
       await doc.ref.update({ status: 'invalid', processed: true, processedAt: new Date() });
       return;
     }
 
     const allowed = await isUserPastorOrAdmin(reviewerUid);
     if (!allowed) {
-      logger.warn('Unauthorized approval action by', reviewerUid);
+      logger.warn('Unauthorized approval action', { reviewerUid });
       await doc.ref.update({ status: 'denied', processed: true, processedAt: new Date() });
       return;
     }
@@ -416,6 +435,7 @@ exports.processMinistryApprovalAction = onDocumentCreated(
             approved: true,
             createdAt: ts(),
             createdBy: reviewerUid,
+            // Write to leaderUids (preferred). We’ll also read legacy leaderIds elsewhere.
             leaderUids: requestedByUid ? [requestedByUid] : [],
           });
           txn.update(reqRef, {
@@ -429,24 +449,21 @@ exports.processMinistryApprovalAction = onDocumentCreated(
         if (requestedByUid) {
           const memberId = await getUserMemberId(requestedByUid);
           if (memberId) {
-            await db.doc(`members/${memberId}`).set({
-              ministries: admin.firestore.FieldValue.arrayUnion(ministryName),
-              leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
-              updatedAt: ts(),
-            }, { merge: true });
+            // Add membership + leadership for requester
+            await addMemberToMinistry(memberId, ministryName, { asLeader: true });
 
+            // Ensure 'leader' role on both member & linked user, and sync claims
             await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
-
             await db.doc(`users/${requestedByUid}`).set({
               leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
               roles: admin.firestore.FieldValue.arrayUnion('leader'),
               updatedAt: ts(),
             }, { merge: true });
-
             await syncClaimsForUid(requestedByUid);
           }
         }
 
+        // Notify requester & reviewer
         await notifyMinistryRequesterResult({
           requestId,
           requesterUid: requestedByUid || null,
@@ -501,7 +518,7 @@ exports.processMinistryApprovalAction = onDocumentCreated(
 
       await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
     } catch (e) {
-      logger.error('processMinistryApprovalAction error', e);
+      logger.error('processMinistryApprovalAction error', { error: e });
       await doc.ref.update({
         status: 'error',
         error: (e && e.message) || String(e),
@@ -572,6 +589,8 @@ exports.onJoinRequestCreated = onDocumentCreated(
       ministryDocId = mins.docs[0].id;
     }
 
+    logger.info('join_requests CREATED', { id: doc.id, ministryName, memberId });
+
     await writeLeaderBroadcast({
       ministryName,
       ministryDocId,
@@ -593,7 +612,9 @@ exports.onJoinRequestCreated = onDocumentCreated(
 );
 
 /* =========================================================
-   4) Notify requester when join request status changes  ➜ /notifications
+   4) When join request status changes:
+      - notify requester
+      - if APPROVED: add member to the ministry
    ========================================================= */
 exports.onJoinRequestUpdated = onDocumentUpdated(
   'join_requests/{id}',
@@ -602,17 +623,16 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     const after = event.data?.after?.data();
     if (!before || !after) return;
 
-    const prev = S(before.status || 'pending');
-    const theNext = S(after.status || 'pending');
+    const prev = toLc(S(before.status || 'pending'));
+    const theNext = toLc(S(after.status || 'pending'));
     if (prev === theNext) return;
-
-    if (theNext !== 'approved' && theNext !== 'rejected') return;
 
     const memberId = S(after.memberId);
     const ministryName = S(after.ministryId);
-    let ministryDocId = S(after.ministryDocId) || null;
+    if (!memberId || !ministryName) return;
 
-    if (!ministryDocId && ministryName) {
+    let ministryDocId = S(after.ministryDocId) || null;
+    if (!ministryDocId) {
       const mins = await db
         .collection('ministries')
         .where('name', '==', ministryName)
@@ -620,23 +640,34 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
         .get();
       if (!mins.empty) ministryDocId = mins.docs[0].id;
     }
-    if (!memberId || !ministryName) return;
 
     const moderatorUid = S(after.moderatorUid) || null;
 
-    await notifyRequesterResult({
-      ministryName,
-      ministryDocId,
-      joinRequestId: event.params.id,
-      requesterMemberId: memberId,
-      result: theNext,
-      moderatorUid,
-    });
+    // Notify requester about the result
+    if (theNext === 'approved' || theNext === 'rejected') {
+      logger.info('join_requests STATUS CHANGE', {
+        id: event.params.id, from: prev, to: theNext, memberId, ministryName,
+      });
+
+      await notifyRequesterResult({
+        ministryName,
+        ministryDocId,
+        joinRequestId: event.params.id,
+        requesterMemberId: memberId,
+        result: theNext,
+        moderatorUid,
+      });
+    }
+
+    // If approved, add member to ministry memberships (idempotent)
+    if (theNext === 'approved') {
+      await addMemberToMinistry(memberId, ministryName, { asLeader: false });
+    }
   }
 );
 
 /* =========================================================
-   4b) Notify leaders when a pending join request is deleted (cancelled)  ➜ /notifications
+   4b) Notify leaders when a pending join request is deleted (cancelled)
    ========================================================= */
 exports.onJoinRequestDeleted = onDocumentDeleted(
   'join_requests/{id}',
@@ -662,6 +693,8 @@ exports.onJoinRequestDeleted = onDocumentDeleted(
         .get();
       if (!mins.empty) ministryDocId = mins.docs[0].id;
     }
+
+    logger.info('join_requests CANCELLED', { id: joinRequestId, ministryName, requesterMemberId });
 
     await writeLeaderBroadcast({
       ministryName,
