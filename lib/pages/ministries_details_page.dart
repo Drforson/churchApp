@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // for HapticFeedback
 import 'package:intl/intl.dart';
 
 import '../core/firestore_paths.dart'; // keep if you use FP.* elsewhere
@@ -65,6 +66,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       _memberId = (u['memberId'] is String) ? u['memberId'] as String : null;
       _roles = (u['roles'] is List) ? Set<String>.from(u['roles']) : <String>{};
 
+      // Load member ministries-by-name
       if (_memberId != null) {
         final memSnap = await _db.collection('members').doc(_memberId).get();
         final m = memSnap.data() ?? {};
@@ -72,17 +74,23 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
         (m['ministries'] is List) ? Set<String>.from(m['ministries']) : <String>{};
       }
 
+      // Compute access: admin | pastor | leader-of-this | member-of-this
       final rolesLower = _roles.map((e) => e.toLowerCase()).toSet();
       final isAdmin = rolesLower.contains('admin');
       final isPastor = rolesLower.contains('pastor');
+      final leaderMins = (u['leadershipMinistries'] is List)
+          ? Set<String>.from(u['leadershipMinistries'])
+          : <String>{};
+      final isLeaderHere =
+          rolesLower.contains('leader') && leaderMins.contains(widget.ministryName);
       final isMemberHere = _memberMinistriesByName.contains(widget.ministryName);
-      _canAccess = isAdmin || isPastor || isMemberHere;
+      _canAccess = isAdmin || isPastor || isLeaderHere || isMemberHere;
 
-      // latest request status (for banner)
+      // latest request status (for banner). Accept both name & docId legacy keys.
       if (_memberId != null) {
         final q = await _db.collection('join_requests')
             .where('memberId', isEqualTo: _memberId)
-            .where('ministryId', isEqualTo: widget.ministryName) // NAME
+            .where('ministryId', whereIn: [widget.ministryName, widget.ministryId])
             .orderBy('requestedAt', descending: true)
             .limit(1)
             .get();
@@ -112,8 +120,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
 
     await _db.collection('notifications').add({
       'type': 'join_request_result',
-      'ministryId': widget.ministryName,
-      'ministryDocId': widget.ministryId,
+      'ministryId': widget.ministryName,  // human name
+      'ministryDocId': widget.ministryId, // doc id
       'memberId': requesterMemberId,
       'joinRequestId': joinRequestId,
       'result': result, // approved | rejected
@@ -132,23 +140,37 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
         final jrSnap = await tx.get(jrRef);
         if (!jrSnap.exists) throw Exception('Join request not found');
         final r = jrSnap.data() as Map<String, dynamic>;
-        final status = (r['status'] ?? '').toString();
+        final status = (r['status'] ?? '').toString().toLowerCase();
         if (status != 'pending') throw Exception('Request already processed');
-        final ministryName = (r['ministryId'] ?? '').toString();
-        if (ministryName != widget.ministryName) throw Exception('Wrong ministry');
+
+        // accept either name or docId legacy fields
+        final reqMinistryKey = (r['ministryId'] ?? '').toString();
+        final reqMinistryDocId = (r['ministryDocId'] ?? '').toString();
+        final matchesThisMinistry =
+            reqMinistryKey == widget.ministryName ||
+                reqMinistryKey == widget.ministryId ||
+                reqMinistryDocId == widget.ministryId;
+        if (!matchesThisMinistry) throw Exception('Wrong ministry');
 
         final memSnap = await tx.get(memberRef);
         if (!memSnap.exists) throw Exception('Member not found');
         final md = memSnap.data() as Map<String, dynamic>;
         final current = List<String>.from(md['ministries'] ?? const <String>[]);
+
         if (!current.contains(widget.ministryName)) {
-          tx.update(memberRef, {'ministries': FieldValue.arrayUnion([widget.ministryName])});
+          tx.update(memberRef, {
+            'ministries': FieldValue.arrayUnion([widget.ministryName])
+          });
         }
 
-        tx.update(jrRef, {'status': 'approved', 'updatedAt': FieldValue.serverTimestamp()});
+        tx.update(jrRef, {
+          'status': 'approved',
+          'updatedAt': FieldValue.serverTimestamp(),
+        });
       });
 
-      await _notifyRequester(memberId, requestId, 'approved');
+      // Notify is non-fatal (don’t mask success)
+      try { await _notifyRequester(memberId, requestId, 'approved'); } catch (_) {}
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -159,17 +181,29 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error approving: $e'), backgroundColor: Colors.red),
       );
+      // Surface failure to caller so optimistic-hide can be reverted
+      rethrow;
     }
   }
 
   Future<void> rejectJoin(String requestId, String memberId) async {
     try {
-      await _db.collection('join_requests').doc(requestId).update({
+      final jrRef = _db.collection('join_requests').doc(requestId);
+
+      // verify still pending to avoid racey double taps
+      final snap = await jrRef.get();
+      if (snap.exists) {
+        final status = (snap.data()?['status'] ?? '').toString().toLowerCase();
+        if (status != 'pending') throw Exception('Request already processed');
+      }
+
+      await jrRef.update({
         'status': 'rejected',
         'updatedAt': FieldValue.serverTimestamp(),
       });
 
-      await _notifyRequester(memberId, requestId, 'rejected');
+      // Notify is non-fatal
+      try { await _notifyRequester(memberId, requestId, 'rejected'); } catch (_) {}
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -180,6 +214,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error rejecting: $e'), backgroundColor: Colors.red),
       );
+      rethrow;
     }
   }
 
@@ -269,6 +304,22 @@ class _MembersTabState extends State<_MembersTab> {
 
   bool _isLeaderOrAdmin = false;
 
+  // Track which join_request ids are being submitted
+  final Set<String> _busy = <String>{};
+
+  // Optimistic hide: ids temporarily removed from the list
+  final Set<String> _hidden = <String>{};
+
+  void _setBusy(String id, bool v) {
+    if (!mounted) return;
+    setState(() { v ? _busy.add(id) : _busy.remove(id); });
+  }
+
+  void _hideOptimistically(String id, bool v) {
+    if (!mounted) return;
+    setState(() { v ? _hidden.add(id) : _hidden.remove(id); });
+  }
+
   @override
   void initState() {
     super.initState();
@@ -284,9 +335,9 @@ class _MembersTabState extends State<_MembersTab> {
     final leaderMins = (data['leadershipMinistries'] is List)
         ? List<String>.from(data['leadershipMinistries'])
         : <String>[];
-    final can = roles.map((e) => e.toLowerCase()).contains('admin') ||
-        (roles.map((e) => e.toLowerCase()).contains('leader') &&
-            leaderMins.contains(widget.ministryName));
+    final rolesLower = roles.map((e) => e.toLowerCase()).toList();
+    final can = rolesLower.contains('admin') ||
+        (rolesLower.contains('leader') && leaderMins.contains(widget.ministryName));
     if (mounted) setState(() => _isLeaderOrAdmin = can);
   }
 
@@ -311,16 +362,20 @@ class _MembersTabState extends State<_MembersTab> {
     });
   }
 
+  // Cover legacy join_requests where ministryId saved as name or docId.
   Stream<List<Map<String, dynamic>>> _pendingRequests() {
     return _db
         .collection('join_requests')
-        .where('ministryId', isEqualTo: widget.ministryName)
         .where('status', isEqualTo: 'pending')
+        .where('ministryId', whereIn: [widget.ministryName, widget.ministryId])
         .orderBy('requestedAt', descending: true)
         .snapshots()
         .asyncMap((qs) async {
       final out = <Map<String, dynamic>>[];
       for (final doc in qs.docs) {
+        // Skip optimistically hidden ones
+        if (_hidden.contains(doc.id)) continue;
+
         final r = doc.data();
         final memberId = (r['memberId'] ?? '').toString();
         final requestedAt = (r['requestedAt'] is Timestamp)
@@ -368,7 +423,7 @@ class _MembersTabState extends State<_MembersTab> {
           ),
         if (_isLeaderOrAdmin)
           SizedBox(
-            height: 130,
+            height: 156,
             child: StreamBuilder<List<Map<String, dynamic>>>(
               stream: _pendingRequests(),
               builder: (context, snap) {
@@ -376,12 +431,18 @@ class _MembersTabState extends State<_MembersTab> {
                 final reqs = snap.data!;
                 if (reqs.isEmpty) return const Center(child: Text('No pending requests.'));
                 return ListView.separated(
+                  physics: const ClampingScrollPhysics(),
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.all(12),
                   itemCount: reqs.length,
                   separatorBuilder: (_, __) => const SizedBox(width: 12),
                   itemBuilder: (context, i) {
                     final r = reqs[i];
+                    final String reqId = r['id'] as String;
+                    final String memberId = r['memberId'] as String;
+                    final bool busy = _busy.contains(reqId);
+                    final String name = (r['fullName'] ?? 'Unknown Member') as String;
+
                     final when = (r['requestedAt'] is DateTime)
                         ? DateFormat('dd MMM, HH:mm').format(r['requestedAt'] as DateTime)
                         : '—';
@@ -394,20 +455,14 @@ class _MembersTabState extends State<_MembersTab> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              // Full name (not uid)
+                              // Name only (ID removed)
                               Text(
-                                r['fullName'] ?? 'Unknown Member',
+                                name,
                                 style: Theme.of(context).textTheme.titleMedium,
                                 overflow: TextOverflow.ellipsis,
                               ),
-                              const SizedBox(height: 2),
-                              // Show memberId very subtly below, if you want to keep it.
-                              Text(
-                                'ID: ${r['memberId']}',
-                                style: Theme.of(context).textTheme.bodySmall,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              const SizedBox(height: 2),
+                              const SizedBox(height: 6),
+                              // Requested date
                               Text(
                                 'Requested: $when',
                                 style: Theme.of(context).textTheme.bodySmall,
@@ -417,23 +472,55 @@ class _MembersTabState extends State<_MembersTab> {
                               Row(
                                 mainAxisAlignment: MainAxisAlignment.end,
                                 children: [
-                                  // RED X (reject)
-                                  IconButton(
-                                    tooltip: 'Reject',
-                                    onPressed: () =>
-                                        widget.onReject(r['id'], r['memberId']),
-                                    icon: const Icon(Icons.close),
-                                    color: Colors.red,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  // GREEN CHECK (approve)
-                                  IconButton(
-                                    tooltip: 'Approve',
-                                    onPressed: () =>
-                                        widget.onApprove(r['id'], r['memberId']),
-                                    icon: const Icon(Icons.check_circle),
-                                    color: Colors.green,
-                                  ),
+                                  if (busy) ...[
+                                    const SizedBox(
+                                      width: 22, height: 22,
+                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    const Text('Submitting...'),
+                                  ] else ...[
+                                    // REJECT (❌)
+                                    IconButton(
+                                      tooltip: 'Reject',
+                                      constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+                                      onPressed: () async {
+                                        _setBusy(reqId, true);
+                                        _hideOptimistically(reqId, true);
+                                        await HapticFeedback.selectionClick();
+                                        try {
+                                          await widget.onReject(reqId, memberId);
+                                        } catch (_) {
+                                          // Revert hide on failure
+                                          _hideOptimistically(reqId, false);
+                                        } finally {
+                                          _setBusy(reqId, false);
+                                        }
+                                      },
+                                      icon: const Icon(Icons.close),
+                                      color: Colors.red,
+                                    ),
+                                    const SizedBox(width: 6),
+                                    // APPROVE (✅)
+                                    IconButton(
+                                      tooltip: 'Approve',
+                                      constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+                                      onPressed: () async {
+                                        _setBusy(reqId, true);
+                                        _hideOptimistically(reqId, true);
+                                        await HapticFeedback.selectionClick();
+                                        try {
+                                          await widget.onApprove(reqId, memberId);
+                                        } catch (_) {
+                                          _hideOptimistically(reqId, false);
+                                        } finally {
+                                          _setBusy(reqId, false);
+                                        }
+                                      },
+                                      icon: const Icon(Icons.check_circle),
+                                      color: Colors.green,
+                                    ),
+                                  ],
                                 ],
                               ),
                             ],
