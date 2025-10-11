@@ -30,17 +30,28 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
   Map<String, dynamic>? _currentUserData;
   bool _loadingUser = true;
 
+  String? _uid;
+  String? _memberId;
+  Set<String> _userRoles = {};
+  Set<String> _memberMinistries = {};
+  String? _latestJoinStatus; // pending / approved / rejected / null
+
   @override
   void initState() {
     super.initState();
     _tab = TabController(length: 3, vsync: this); // Members / Feed / Overview
-    _fetchCurrentUser();
+    _bootstrap();
   }
 
   @override
   void dispose() {
     _tab.dispose();
     super.dispose();
+  }
+
+  Future<void> _bootstrap() async {
+    await _fetchCurrentUser();
+    await _fetchMembershipAndStatus();
   }
 
   Future<void> _fetchCurrentUser() async {
@@ -50,19 +61,35 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
         setState(() {
           _loadingUser = false;
           _currentUserData = null;
+          _uid = null;
+          _memberId = null;
+          _userRoles = {};
         });
         return;
       }
-      final snap = await FirebaseFirestore.instance.collection(FP.users).doc(uid).get();
-      final data = snap.data() ?? {};
+      final userSnap = await FirebaseFirestore.instance.collection(FP.users).doc(uid).get();
+      final data = userSnap.data() ?? {};
+
       final roles = (data['roles'] is List)
           ? List<String>.from(data['roles'])
           : <String>[];
       final leadershipMinistries = (data['leadershipMinistries'] is List)
           ? List<String>.from(data['leadershipMinistries'])
           : <String>[];
+      final memberId = (data['memberId'] is String) ? data['memberId'] as String : null;
+
+      Set<String> ministries = {};
+      if (memberId != null) {
+        final mem = await FirebaseFirestore.instance.collection(FP.members).doc(memberId).get();
+        final m = mem.data() ?? {};
+        ministries = (m['ministries'] is List) ? Set<String>.from(m['ministries']) : <String>{};
+      }
 
       setState(() {
+        _uid = uid;
+        _memberId = memberId;
+        _userRoles = roles.toSet();
+        _memberMinistries = ministries;
         _currentUserData = {
           'roles': roles,
           'leadershipMinistries': leadershipMinistries,
@@ -77,19 +104,59 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
     }
   }
 
-  bool _isAdmin() {
-    if (_currentUserData == null) return false;
-    final roles = List<String>.from(_currentUserData!['roles'] ?? const <String>[]);
-    return roles.contains('admin');
+  Future<void> _fetchMembershipAndStatus() async {
+    try {
+      if (_memberId == null) {
+        setState(() => _latestJoinStatus = null);
+        return;
+      }
+      // Fetch the latest join request for this member + ministry
+      final q = await FirebaseFirestore.instance
+          .collection(FP.joinRequests)
+          .where('memberId', isEqualTo: _memberId)
+      // NOTE: your schema stores ministryId as NAME (ministryName) elsewhere,
+      // so we match on the human-readable name consistently:
+          .where('ministryId', isEqualTo: widget.ministryName)
+          .orderBy('requestedAt', descending: true)
+          .limit(1)
+          .get();
+
+      String? status;
+      if (q.docs.isNotEmpty) {
+        status = (q.docs.first.data()['status'] as String?)?.toLowerCase();
+      }
+      setState(() {
+        _latestJoinStatus = status; // pending / approved / rejected / null
+      });
+    } catch (_) {
+      // ignore; keep null
+    }
   }
 
-  bool _isAdminOrLeaderOfThisMinistry() {
+  bool _isAdmin() {
+    final r = _userRoles.map((e) => e.toLowerCase()).toSet();
+    return r.contains('admin');
+  }
+
+  bool _isPastor() {
+    final r = _userRoles.map((e) => e.toLowerCase()).toSet();
+    return r.contains('pastor');
+  }
+
+  bool _isLeaderHere() {
     if (_currentUserData == null) return false;
     final roles = List<String>.from(_currentUserData!['roles'] ?? const <String>[]);
     final leadershipMinistries =
     List<String>.from(_currentUserData!['leadershipMinistries'] ?? const <String>[]);
-    return roles.contains('admin') ||
-        (roles.contains('leader') && leadershipMinistries.contains(widget.ministryName));
+    return roles.contains('leader') && leadershipMinistries.contains(widget.ministryName);
+  }
+
+  bool _isAdminOrLeaderOfThisMinistry() {
+    return _isAdmin() || _isLeaderHere();
+  }
+
+  bool _amMemberOfThisMinistry() {
+    return _memberMinistries.contains(widget.ministryName);
   }
 
   Future<String?> _getUserIdByMemberId(String memberId) async {
@@ -100,6 +167,143 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
         .get();
     if (qs.docs.isEmpty) return null;
     return qs.docs.first.id;
+  }
+
+  // ===================== Join UI (non-admin/non-pastor members) =====================
+
+  Future<void> _openJoinBottomSheet() async {
+    if (_uid == null || _memberId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please sign in to request to join.')),
+      );
+      return;
+    }
+
+    final controller = TextEditingController();
+    String urgency = 'normal';
+
+    final ok = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (ctx) {
+        final insets = MediaQuery.of(ctx).viewInsets;
+        return Padding(
+          padding: EdgeInsets.only(bottom: insets.bottom),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 8),
+              ListTile(
+                leading: const Icon(Icons.group_add),
+                title: Text('Request to join ${widget.ministryName}', style: Theme.of(ctx).textTheme.titleMedium),
+                subtitle: const Text('This will notify ministry leaders for approval.'),
+              ),
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    TextField(
+                      controller: controller,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                        labelText: 'Why do you want to join? (optional)',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Text('Urgency:'),
+                        const SizedBox(width: 12),
+                        StatefulBuilder(
+                          builder: (ctx2, setSB) => Row(
+                            children: [
+                              ChoiceChip(
+                                label: const Text('Normal'),
+                                selected: urgency == 'normal',
+                                onSelected: (_) => setSB(() => urgency = 'normal'),
+                              ),
+                              const SizedBox(width: 8),
+                              ChoiceChip(
+                                label: const Text('High'),
+                                selected: urgency == 'high',
+                                onSelected: (_) => setSB(() => urgency = 'high'),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.of(ctx).pop(false),
+                        child: const Text('Cancel'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton.icon(
+                        icon: const Icon(Icons.send),
+                        label: const Text('Send request'),
+                        onPressed: () => Navigator.of(ctx).pop(true),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (ok != true) return;
+
+    try {
+      await FirebaseFirestore.instance.collection(FP.joinRequests).add({
+        'memberId': _memberId,
+        // IMPORTANT: across your app you use ministryName for membership arrays,
+        // so we persist the join request with the NAME as ministryId for consistency.
+        'ministryId': widget.ministryName,
+        'requestedByUid': _uid,
+        'message': controller.text.trim().isEmpty ? null : controller.text.trim(),
+        'urgency': urgency,
+        'status': 'pending',
+        'requestedAt': FieldValue.serverTimestamp(),
+      });
+      await _fetchMembershipAndStatus();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Icon(Icons.check_circle_outline),
+                SizedBox(width: 8),
+                Expanded(child: Text('Join request sent. You’ll be notified when approved.')),
+              ],
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to send request: $e')),
+        );
+      }
+    }
   }
 
   // ===================== Leader Promotion / Demotion (no writes to users.roles) =====================
@@ -188,9 +392,24 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
     if (_loadingUser) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
+
+    final canSeeJoin =
+        !_isAdmin() && !_isPastor() && !_amMemberOfThisMinistry() && _uid != null;
+
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.ministryName),
+        actions: [
+          if (canSeeJoin && _latestJoinStatus != 'pending')
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: FilledButton.icon(
+                icon: const Icon(Icons.group_add),
+                label: const Text('Join'),
+                onPressed: _openJoinBottomSheet,
+              ),
+            ),
+        ],
         bottom: TabBar(
           controller: _tab,
           tabs: const [
@@ -200,23 +419,49 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tab,
+      body: Column(
         children: [
-          _MembersTab(
-            ministryName: widget.ministryName,
-            ministryId: widget.ministryId,
-            canModerate: _isAdminOrLeaderOfThisMinistry(),
-            isAdmin: _isAdmin(),
-            processingMembers: _processingMembers,
-            onPromote: _promoteToLeader,
-            onDemote: _demoteFromLeader,
+          if (_latestJoinStatus == 'pending')
+            Container(
+              margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Theme.of(context).colorScheme.outline),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.hourglass_top),
+                  const SizedBox(width: 8),
+                  const Expanded(child: Text('Your join request is pending')),
+                  TextButton(
+                    onPressed: () {}, // could open a details sheet if you track message/urgency
+                    child: const Text('Details'),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: TabBarView(
+              controller: _tab,
+              children: [
+                _MembersTab(
+                  ministryName: widget.ministryName,
+                  ministryId: widget.ministryId,
+                  canModerate: _isAdminOrLeaderOfThisMinistry(),
+                  isAdmin: _isAdmin(),
+                  processingMembers: _processingMembers,
+                  onPromote: _promoteToLeader,
+                  onDemote: _demoteFromLeader,
+                ),
+                MinistryFeedPage(
+                  ministryId: widget.ministryId,
+                  ministryName: widget.ministryName,
+                ),
+                _OverviewTab(ministryId: widget.ministryId, ministryName: widget.ministryName),
+              ],
+            ),
           ),
-          MinistryFeedPage(
-            ministryId: widget.ministryId,
-            ministryName: widget.ministryName,
-          ),
-          _OverviewTab(ministryId: widget.ministryId, ministryName: widget.ministryName),
         ],
       ),
     );
@@ -298,8 +543,7 @@ class _MembersTabState extends State<_MembersTab> {
   }
 
   Stream<List<Map<String, dynamic>>> _membersStream() {
-    // We query members who either are in this ministry (members tab focus)
-    // NOTE: We keep the query simple and filter in memory for smoother UX.
+    // Members who belong to this ministry (filter in memory for fast UX)
     return _db
         .collection(FP.members)
         .where('ministries', arrayContains: widget.ministryName)
@@ -324,7 +568,7 @@ class _MembersTabState extends State<_MembersTab> {
     });
   }
 
-  // ---------- Join Requests for this ministry ----------
+  // ---------- Join Requests for this ministry (new modern style: horizontal cards) ----------
   Stream<List<Map<String, dynamic>>> _joinRequestsStream() {
     return _db
         .collection(FP.joinRequests)
