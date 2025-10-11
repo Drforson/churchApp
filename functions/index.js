@@ -1,5 +1,9 @@
 /* functions/index.js */
-const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore');
+const {
+  onDocumentCreated,
+  onDocumentUpdated,
+  onDocumentDeleted,
+} = require('firebase-functions/v2/firestore');
 const { onCall } = require('firebase-functions/v2/https');
 const { setGlobalOptions, logger } = require('firebase-functions/v2');
 const admin = require('firebase-admin');
@@ -203,7 +207,7 @@ async function updateMemberAndLinkedUserRoles(memberId, { add = [], remove = [],
   if (uid) await syncClaimsForUid(uid);
 }
 
-/* Inbox writer */
+/* Inbox (legacy) writer — kept for existing flows */
 async function writeInbox(uid, payload) {
   await db.collection('inbox').doc(uid).set({ lastSeenAt: ts() }, { merge: true });
 
@@ -222,6 +226,119 @@ async function writeInbox(uid, payload) {
   }
 
   await db.collection('inbox').doc(uid).collection('events').add(toWrite);
+}
+
+/* =========================
+   Notifications collection
+   ========================= */
+
+async function writeNotification(payload) {
+  // Always adds createdAt if caller forgot
+  const data = { ...payload };
+  if (!data.createdAt) data.createdAt = ts();
+  await db.collection('notifications').add(data);
+}
+
+/** Broadcast to leaders/admins for a ministry (by name) */
+async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
+  await writeNotification({
+    type, // 'join_request' | 'join_request_cancelled'
+    ministryId: ministryName,         // NAME (aligns with members[].ministries)
+    ministryDocId: ministryDocId || null,
+    joinRequestId,
+    requestedByUid: requestedByUid || null,
+    memberId: requesterMemberId || null,
+    audience: { leadersOnly: true, adminAlso: true },
+  });
+}
+
+/** Direct fan-out to each leader (by resolving members → users) */
+async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
+  // leaders as members
+  const leadersSnap = await db
+    .collection('members')
+    .where('leadershipMinistries', 'array-contains', ministryName)
+    .get();
+
+  // additionally: ministries doc may store leader uids
+  let ministryLeaderUids = [];
+  const mins = await db
+    .collection('ministries')
+    .where('name', '==', ministryName)
+    .limit(1)
+    .get();
+  if (!mins.empty) {
+    const m = mins.docs[0].data() || {};
+    ministryLeaderUids = Array.isArray(m.leaderIds) ? m.leaderIds.filter(Boolean) : [];
+    ministryDocId = ministryDocId || mins.docs[0].id;
+  }
+
+  const batch = db.batch();
+
+  // Fan-out via members→users
+  for (const lm of leadersSnap.docs) {
+    const leaderMemberId = lm.id;
+    const userQs = await db
+      .collection('users')
+      .where('memberId', '==', leaderMemberId)
+      .limit(1)
+      .get();
+    if (userQs.empty) continue;
+
+    const leaderUid = userQs.docs[0].id;
+    const ref = db.collection('notifications').doc();
+    batch.set(ref, {
+      type,
+      ministryId: ministryName,
+      ministryDocId: ministryDocId || null,
+      joinRequestId,
+      requestedByUid: requestedByUid || null,
+      memberId: requesterMemberId || null,
+      recipientUid: leaderUid,
+      audience: { direct: true, role: 'leader' },
+      createdAt: ts(),
+    });
+  }
+
+  // Fan-out via ministries.leaderIds (if present)
+  for (const uid of ministryLeaderUids) {
+    const ref = db.collection('notifications').doc();
+    batch.set(ref, {
+      type,
+      ministryId: ministryName,
+      ministryDocId: ministryDocId || null,
+      joinRequestId,
+      requestedByUid: requestedByUid || null,
+      memberId: requesterMemberId || null,
+      recipientUid: uid,
+      audience: { direct: true, role: 'leader' },
+      createdAt: ts(),
+    });
+  }
+
+  await batch.commit();
+}
+
+/** Direct to requester when approved/rejected */
+async function notifyRequesterResult({ ministryName, ministryDocId, joinRequestId, requesterMemberId, result, moderatorUid }) {
+  let recipientUid = null;
+  const userQs = await db
+    .collection('users')
+    .where('memberId', '==', requesterMemberId)
+    .limit(1)
+    .get();
+  if (!userQs.empty) recipientUid = userQs.docs[0].id;
+
+  await writeNotification({
+    type: 'join_request_result',
+    result, // 'approved' | 'rejected'
+    ministryId: ministryName,
+    ministryDocId: ministryDocId || null,
+    joinRequestId,
+    memberId: requesterMemberId,
+    recipientUid: recipientUid || null,
+    moderatorUid: moderatorUid || null,
+  });
 }
 
 /* =========================================================
@@ -284,21 +401,18 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           });
         });
 
-        // 🔥 Make requester a MEMBER of that ministry and a LEADER in their profiles
+        // Make requester leader & member
         if (requestedByUid) {
           const memberId = await getUserMemberId(requestedByUid);
           if (memberId) {
-            // Add ministry name to member profile (membership + leadership)
             await db.doc(`members/${memberId}`).set({
               ministries: admin.firestore.FieldValue.arrayUnion(ministryName),
               leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
               updatedAt: ts(),
             }, { merge: true });
 
-            // Ensure 'leader' role on member & linked user
             await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
 
-            // Also reflect leadershipMinistries on the user document
             await db.doc(`users/${requestedByUid}`).set({
               leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
               roles: admin.firestore.FieldValue.arrayUnion('leader'),
@@ -309,7 +423,7 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           }
         }
 
-        // Notify requester + actor
+        // Notify (legacy inbox) unchanged:
         if (requestedByUid) {
           await writeInbox(requestedByUid, {
             type: 'ministry_request_approved',
@@ -320,7 +434,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
             ministryName,
             payload: { requestId, ministryId: minRef.id, ministryName },
             route: '/view-ministry',
-            routeArgs: { ministryId: minRef.id, ministryName },
             dedupeKey: `mcr_approved_${requestId}`,
           });
         }
@@ -425,7 +538,7 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated(
 );
 
 /* =========================================================
-   3) Notify leaders when a join request is created
+   3) Notify leaders when a join request is created  ➜ /notifications
    ========================================================= */
 exports.onJoinRequestCreated = onDocumentCreated(
   'join_requests/{id}',
@@ -434,59 +547,48 @@ exports.onJoinRequestCreated = onDocumentCreated(
     if (!doc) return;
     const jr = doc.data() || {};
     const memberId = S(jr.memberId);
-    const ministryName = S(jr.ministryId);
+    const ministryName = S(jr.ministryId); // NAME matches members[].ministries
+    const requestedByUid = S(jr.requestedByUid);
     if (!ministryName) return;
 
+    // Try to get ministry doc id (nice-to-have)
+    let ministryDocId = null;
     const mins = await db
       .collection('ministries')
       .where('name', '==', ministryName)
-      .where('approved', '==', true)
       .limit(1)
       .get();
-    if (mins.empty) return;
-
-    const minDoc = mins.docs[0];
-    const ministry = minDoc.data() || {};
-    const leaderIds = Array.isArray(ministry.leaderIds) ? ministry.leaderIds : [];
-
-    let requesterName = 'Member';
-    if (memberId) {
-      const memSnap = await db.doc(`members/${memberId}`).get();
-      if (memSnap.exists) {
-        const m = memSnap.data() || {};
-        const full = S(m.fullName);
-        const fn = S(m.firstName);
-        const ln = S(m.lastName);
-        requesterName = full || [fn, ln].filter(Boolean).join(' ') || 'Member';
-      }
+    if (!mins.empty) {
+      ministryDocId = mins.docs[0].id;
     }
 
-    await Promise.all(
-      leaderIds.map((uid) =>
-        writeInbox(uid, {
-          type: 'join_request_created',
-          channel: 'joinreq',
-          title: `Join request from ${requesterName}`,
-          body: `Ministry: ${ministryName}`,
-          ministryId: minDoc.id,
-          ministryName,
-          payload: {
-            joinRequestId: doc.id,
-            memberId,
-            ministryId: ministryName,
-            ministryName,
-            requesterName,
-          },
-          route: '/leader-join-requests',
-          dedupeKey: `jr_leader_${doc.id}_${uid}`,
-        })
-      )
-    );
+    // Broadcast for leaders/admins
+    await writeLeaderBroadcast({
+      ministryName,
+      ministryDocId,
+      joinRequestId: doc.id,
+      requestedByUid,
+      requesterMemberId: memberId,
+      type: 'join_request',
+    });
+
+    // Fan-out to leaders (members→users) and ministries.leaderIds (if present)
+    await writeDirectToLeaders({
+      ministryName,
+      ministryDocId,
+      joinRequestId: doc.id,
+      requestedByUid,
+      requesterMemberId: memberId,
+      type: 'join_request',
+    });
+
+    // (Optional) You can still keep your legacy inbox if desired (not required by app pages)
+    // — omitted intentionally to avoid duplication.
   }
 );
 
 /* =========================================================
-   4) Notify requester when join request status changes
+   4) Notify requester when join request status changes  ➜ /notifications
    ========================================================= */
 exports.onJoinRequestUpdated = onDocumentUpdated(
   'join_requests/{id}',
@@ -496,42 +598,91 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     if (!before || !after) return;
 
     const prev = S(before.status || 'pending');
-    theNext = S(after.status || 'pending');
+    const theNext = S(after.status || 'pending'); // ✅ fixed: declare const
     if (prev === theNext) return;
+
+    if (theNext !== 'approved' && theNext !== 'rejected') return;
 
     const memberId = S(after.memberId);
     const ministryName = S(after.ministryId);
-    let toUid = S(after.requestedByUid);
+    let ministryDocId = S(after.ministryDocId) || null;
 
-    if (!toUid && memberId) {
-      const users = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
-      if (!users.empty) toUid = users.docs[0].id;
+    if (!ministryDocId && ministryName) {
+      const mins = await db
+        .collection('ministries')
+        .where('name', '==', ministryName)
+        .limit(1)
+        .get();
+      if (!mins.empty) ministryDocId = mins.docs[0].id;
     }
-    if (!toUid) return;
+    if (!memberId || !ministryName) return;
 
-    const pretty = theNext.charAt(0).toUpperCase() + theNext.slice(1);
-    await writeInbox(toUid, {
-      type: 'join_request_status',
-      channel: 'joinreq',
-      title: `Join request ${pretty}`,
-      body: ministryName ? `Ministry: ${ministryName}` : '',
-      ministryId: null,
+    const moderatorUid = S(after.moderatorUid) || null;
+
+    await notifyRequesterResult({
       ministryName,
-      payload: {
-        joinRequestId: event.params.id,
-        memberId,
-        ministryId: ministryName,
-        ministryName,
-        status: theNext,
-      },
-      route: '/my-join-requests',
-      dedupeKey: `jr_me_${event.params.id}_${theNext}_${toUid}`,
+      ministryDocId,
+      joinRequestId: event.params.id,
+      requesterMemberId: memberId,
+      result: theNext,
+      moderatorUid,
+    });
+
+    // (Optional legacy inbox mirror was here; omitted to prevent duplication.)
+  }
+);
+
+/* =========================================================
+   4b) Notify leaders when a pending join request is deleted (cancelled)  ➜ /notifications
+   ========================================================= */
+exports.onJoinRequestDeleted = onDocumentDeleted(
+  'join_requests/{id}',
+  async (event) => {
+    const r = event.data?.data() || {};
+    const status = S(r.status || 'pending');
+
+    // Notify leaders only when a pending req is cancelled by requester
+    if (status !== 'pending') return;
+
+    const ministryName = S(r.ministryId);
+    let ministryDocId = S(r.ministryDocId) || null;
+    const requesterMemberId = S(r.memberId);
+    const requestedByUid = S(r.requestedByUid);
+    const joinRequestId = event.params.id;
+
+    if (!ministryName || !requesterMemberId) return;
+
+    if (!ministryDocId) {
+      const mins = await db
+        .collection('ministries')
+        .where('name', '==', ministryName)
+        .limit(1)
+        .get();
+      if (!mins.empty) ministryDocId = mins.docs[0].id;
+    }
+
+    await writeLeaderBroadcast({
+      ministryName,
+      ministryDocId,
+      joinRequestId,
+      requestedByUid,
+      requesterMemberId,
+      type: 'join_request_cancelled',
+    });
+
+    await writeDirectToLeaders({
+      ministryName,
+      ministryDocId,
+      joinRequestId,
+      requestedByUid,
+      requesterMemberId,
+      type: 'join_request_cancelled',
     });
   }
 );
 
 /* =========================================================
-   5) Notify pastors when a prayer request is submitted
+   5) Notify pastors when a prayer request is submitted (legacy inbox)
    ========================================================= */
 exports.onPrayerRequestCreated = onDocumentCreated(
   'prayerRequests/{id}',
