@@ -2,11 +2,9 @@ import 'dart:convert';
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import '../core/firestore_paths.dart';
 
 class PastorMinistryApprovalsPage extends StatefulWidget {
   const PastorMinistryApprovalsPage({super.key});
@@ -18,11 +16,10 @@ class PastorMinistryApprovalsPage extends StatefulWidget {
 class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPage> {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
-  final FirebaseFunctions _functions =
-  FirebaseFunctions.instanceFor(region: 'europe-west2');
 
   bool _loadingRole = true;
-  bool _canModerate = false; // pastor || admin (users doc, claims, or member fallback)
+  bool _canView = false;   // pastor || admin
+  bool _isPastor = false;  // only pastors can approve/decline (per rules)
   String? _uid;
 
   Map<String, dynamic> _debug = {};
@@ -43,21 +40,21 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     super.dispose();
   }
 
-  // Mirrors RoleGate: users → (else) members fallback; plus custom claims
   Future<void> _wireRoleListener() async {
     final user = _auth.currentUser;
     if (user == null) {
       setState(() {
         _uid = null;
         _loadingRole = false;
-        _canModerate = false;
+        _canView = false;
+        _isPastor = false;
         _debug = {'reason': 'no-auth-user'};
       });
       return;
     }
     _uid = user.uid;
 
-    _userSub = _db.collection(FP.users).doc(user.uid).snapshots().listen((snap) async {
+    _userSub = _db.collection('users').doc(user.uid).snapshots().listen((snap) async {
       final data = snap.data() ?? <String, dynamic>{};
       final rolesLower = <String>{};
       String? memberId = data['memberId'] as String?;
@@ -68,15 +65,15 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
           if (v is String && v.trim().isNotEmpty) rolesLower.add(v.trim().toLowerCase());
         }
       }
-      // users.role single
+      // users.role
       if (data['role'] is String && (data['role'] as String).trim().isNotEmpty) {
         rolesLower.add((data['role'] as String).trim().toLowerCase());
       }
-      // Boolean fallbacks
+      // boolean fallbacks
       if (data['isPastor'] == true) rolesLower.add('pastor');
       if (data['isAdmin'] == true) rolesLower.add('admin');
 
-      // Custom claims
+      // custom claims
       try {
         final token = await user.getIdTokenResult(true);
         final claims = token.claims ?? {};
@@ -84,98 +81,113 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
         if (claims['admin'] == true || claims['isAdmin'] == true) rolesLower.add('admin');
       } catch (_) {}
 
-      var granted = rolesLower.contains('pastor') || rolesLower.contains('admin');
+      var canView = rolesLower.contains('pastor') || rolesLower.contains('admin');
+      var isPastor = rolesLower.contains('pastor');
       Map<String, dynamic> memberData = const {};
 
-      // 🔁 Member fallback (exactly like RoleGate in main.dart)
-      if (!granted && memberId != null && memberId.isNotEmpty) {
+      // member fallback
+      if (!canView && memberId != null && memberId.isNotEmpty) {
         try {
-          final mem = await _db.collection(FP.members).doc(memberId).get();
+          final mem = await _db.collection('members').doc(memberId).get();
           memberData = mem.data() ?? {};
           final mRoles = (memberData['roles'] as List<dynamic>? ?? const [])
               .map((e) => e.toString().toLowerCase())
               .toSet();
-          final leads = List<String>.from(memberData['leadershipMinistries'] ?? const <String>[]);
           if (mRoles.contains('admin')) {
             rolesLower.add('admin');
-          } else if (mRoles.contains('pastor') || (memberData['isPastor'] == true)) {
-            rolesLower.add('pastor');
-          } else if (mRoles.contains('leader') || leads.isNotEmpty) {
-            rolesLower.add('leader');
           }
-          granted = rolesLower.contains('pastor') || rolesLower.contains('admin');
+          if (mRoles.contains('pastor') || memberData['isPastor'] == true) {
+            rolesLower.add('pastor');
+          }
+          canView = rolesLower.contains('pastor') || rolesLower.contains('admin');
+          isPastor = rolesLower.contains('pastor');
         } catch (_) {}
       }
 
       if (!mounted) return;
       setState(() {
-        _canModerate = granted;
+        _canView = canView;
+        _isPastor = isPastor; // only pastors can act
         _loadingRole = false;
         _debug = {
           'uid': user.uid,
-          'userDocPath': snap.reference.path,
-          'user.roles': data['roles'],
-          'user.role': data['role'],
-          'user.isPastor': data['isPastor'],
-          'user.isAdmin': data['isAdmin'],
-          'user.memberId': memberId,
-          'member.roles': memberData is Map ? memberData['roles'] : null,
-          'member.isPastor': memberData is Map ? memberData['isPastor'] : null,
-          'member.leadershipMinistries': memberData is Map ? memberData['leadershipMinistries'] : null,
           'resolvedRolesLower': rolesLower.toList(),
-          'granted': granted,
+          'canView': canView,
+          'isPastor': isPastor,
         };
       });
     });
   }
 
-  /// Ensure the requester (by UID) has the 'leader' role on their member/user.
-  /// - Looks up users/{uid} → memberId
-  /// - Calls callable `ensureMemberLeaderRole` (server does the safe updates)
-  Future<void> _ensureRequesterLeaderRoleByUid(String requestedByUid) async {
-    try {
-      if (requestedByUid.trim().isEmpty) return;
-      final u = await _db.collection(FP.users).doc(requestedByUid).get();
-      final memberId = (u.data()?['memberId'] ?? '').toString();
-      if (memberId.isEmpty) return;
-
-      final callable = _functions.httpsCallable(
-        'ensureMemberLeaderRole',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
-      );
-      await callable.call(<String, dynamic>{'memberId': memberId});
-    } catch (_) {
-      // Non-fatal; creation already assigns leaderIds on the ministry.
+  Future<String> _resolveRequesterName({
+    required String requestedByUid,
+    String? fallbackFullName,
+    String? fallbackEmail,
+  }) async {
+    if (_nameCache.containsKey(requestedByUid)) return _nameCache[requestedByUid]!;
+    if ((fallbackFullName ?? '').trim().isNotEmpty) {
+      _nameCache[requestedByUid] = fallbackFullName!.trim();
+      return _nameCache[requestedByUid]!;
     }
+    try {
+      final u = await _db.collection('users').doc(requestedByUid).get();
+      final udata = u.data() ?? {};
+      final memberId = (udata['memberId'] ?? '').toString();
+      if (memberId.isNotEmpty) {
+        final m = await _db.collection('members').doc(memberId).get();
+        if (m.exists) {
+          final md = m.data() as Map<String, dynamic>;
+          final fullField = (md['fullName'] ?? '').toString().trim();
+          final fn = (md['firstName'] ?? '').toString().trim();
+          final ln = (md['lastName'] ?? '').toString().trim();
+          final full = fullField.isNotEmpty ? fullField : [fn, ln].where((s) => s.isNotEmpty).join(' ').trim();
+          if (full.isNotEmpty) {
+            _nameCache[requestedByUid] = full;
+            return full;
+          }
+        }
+      }
+    } catch (_) {}
+    final fb = (fallbackEmail ?? '').trim();
+    if (fb.isNotEmpty) {
+      _nameCache[requestedByUid] = fb;
+      return fb;
+    }
+    _nameCache[requestedByUid] = requestedByUid;
+    return requestedByUid;
   }
 
   Future<void> _enqueueAction({
     required String requestId,
-    required String action, // 'approve' | 'decline'
+    required String decision, // 'approve' | 'decline'
     String? reason,
-    String? requestedByUid,
   }) async {
-    if (!_canModerate || _uid == null) return;
-
-    await _db.collection('ministry_approval_actions').add({
-      'action': action,
-      'requestId': requestId,
-      'reason': (reason ?? '').trim().isEmpty ? null : reason!.trim(),
-      'byUid': _uid,
-      'createdAt': FieldValue.serverTimestamp(),
-      'processed': false,
-    });
-
-    // If approving, also ensure the requester gains 'leader' role on their profile.
-    if (action == 'approve' && (requestedByUid ?? '').trim().isNotEmpty) {
-      // Fire-and-forget; do not block UX on this auxiliary sync.
-      unawaited(_ensureRequesterLeaderRoleByUid(requestedByUid!.trim()));
+    if (!_isPastor || _uid == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only pastors can approve or decline.')),
+      );
+      return;
     }
 
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(action == 'approve' ? 'Approval queued' : 'Decline queued')),
-    );
+    try {
+      await _db.collection('ministry_approval_actions').add({
+        'requestId': requestId,
+        'decision': decision,               // <-- matches Cloud Function
+        'reviewerUid': _uid,                // <-- matches Cloud Function
+        'reason': (reason ?? '').trim().isEmpty ? null : reason!.trim(),
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(decision == 'approve' ? 'Approval queued' : 'Decline queued')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error queuing action: $e')),
+      );
+    }
   }
 
   Future<void> _confirmDecline(String requestId) async {
@@ -199,50 +211,8 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
       ),
     );
     if (ok == true) {
-      await _enqueueAction(requestId: requestId, action: 'decline', reason: controller.text);
+      await _enqueueAction(requestId: requestId, decision: 'decline', reason: controller.text);
     }
-  }
-
-  /// Resolve a nice display name for the requester:
-  /// - members/{memberId}: "firstName lastName" or fullName
-  /// - fallback: users/{uid}.email
-  /// - fallback: UID itself
-  Future<String> _resolveRequesterName({
-    required String requestedByUid,
-    String? fallbackFullName,
-    String? fallbackEmail,
-  }) async {
-    if (_nameCache.containsKey(requestedByUid)) return _nameCache[requestedByUid]!;
-    if ((fallbackFullName ?? '').trim().isNotEmpty) {
-      _nameCache[requestedByUid] = fallbackFullName!.trim();
-      return _nameCache[requestedByUid]!;
-    }
-    try {
-      final u = await _db.collection(FP.users).doc(requestedByUid).get();
-      final udata = u.data() ?? {};
-      final memberId = (udata['memberId'] ?? '').toString();
-      if (memberId.isNotEmpty) {
-        final m = await _db.collection(FP.members).doc(memberId).get();
-        if (m.exists) {
-          final md = m.data() as Map<String, dynamic>;
-          final fullField = (md['fullName'] ?? '').toString().trim();
-          final fn = (md['firstName'] ?? '').toString().trim();
-          final ln = (md['lastName'] ?? '').toString().trim();
-          final full = fullField.isNotEmpty ? fullField : [fn, ln].where((s) => s.isNotEmpty).join(' ').trim();
-          if (full.isNotEmpty) {
-            _nameCache[requestedByUid] = full;
-            return full;
-          }
-        }
-      }
-    } catch (_) {}
-    final fb = (fallbackEmail ?? '').trim();
-    if (fb.isNotEmpty) {
-      _nameCache[requestedByUid] = fb;
-      return fb;
-    }
-    _nameCache[requestedByUid] = requestedByUid;
-    return requestedByUid;
   }
 
   @override
@@ -250,7 +220,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     if (_loadingRole) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-    if (!_canModerate) {
+    if (!_canView) {
       final pretty = const JsonEncoder.withIndent('  ').convert(_debug);
       return Scaffold(
         appBar: AppBar(title: const Text('Ministry Approvals')),
@@ -262,7 +232,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   const Text(
-                    'Access denied.\nOnly pastors and admins can manage ministry creation requests.',
+                    'Access denied.\nOnly pastors and admins can view ministry creation requests.',
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 16),
@@ -308,7 +278,8 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
               final requestedByUid = (data['requestedByUid'] ?? '').toString();
               final requesterEmail = (data['requesterEmail'] ?? '').toString();
               final requesterFullName = (data['requesterFullName'] ?? '').toString();
-              final ts = data['requestedAt'];
+
+              final ts = data['requestedAt'] ?? data['createdAt'];
               final requestedAt = ts is Timestamp ? ts.toDate() : null;
 
               return Card(
@@ -350,20 +321,27 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                       Row(
                         mainAxisAlignment: MainAxisAlignment.end,
                         children: [
-                          TextButton.icon(
-                            onPressed: () => _confirmDecline(id),
-                            icon: const Icon(Icons.cancel),
-                            label: const Text('Decline'),
+                          Tooltip(
+                            message: _isPastor ? 'Decline' : 'Only pastors can act',
+                            child: TextButton.icon(
+                              onPressed: _isPastor ? () => _confirmDecline(id) : null,
+                              icon: const Icon(Icons.cancel),
+                              label: const Text('Decline'),
+                            ),
                           ),
                           const SizedBox(width: 12),
-                          ElevatedButton.icon(
-                            onPressed: () => _enqueueAction(
-                              requestId: id,
-                              action: 'approve',
-                              requestedByUid: requestedByUid, // ensure leader role on requester
+                          Tooltip(
+                            message: _isPastor ? 'Approve' : 'Only pastors can act',
+                            child: ElevatedButton.icon(
+                              onPressed: _isPastor
+                                  ? () => _enqueueAction(
+                                requestId: id,
+                                decision: 'approve',
+                              )
+                                  : null,
+                              icon: const Icon(Icons.check_circle),
+                              label: const Text('Approve'),
                             ),
-                            icon: const Icon(Icons.check_circle),
-                            label: const Text('Approve'),
                           ),
                         ],
                       ),
