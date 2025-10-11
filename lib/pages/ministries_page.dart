@@ -6,12 +6,13 @@ import 'package:intl/intl.dart';
 
 import 'ministries_details_page.dart';
 
-/// Firestore paths – adjust to match your app if needed
+/// Firestore paths
 class FP {
   static const users = 'users';
   static const members = 'members';
   static const ministries = 'ministries';
   static const joinRequests = 'join_requests';
+  static const notifications = 'notifications';
 }
 
 class MinistresPage extends StatefulWidget {
@@ -29,17 +30,20 @@ class _MinistresPageState extends State<MinistresPage>
   String? _uid;
   String? _memberId;
   Set<String> _userRoles = {};
-  /// IMPORTANT: This stores **ministry names** (not ids), to match your Members doc schema.
+  /// Stores **ministry names** (not ids) to match Members schema.
   Set<String> _memberMinistryNames = {};
   bool _loading = true;
 
   late final TabController _tab;
   String _search = '';
 
+  /// Track busy state per ministry (by name) to avoid double actions.
+  final Set<String> _busyMinistryNames = {};
+
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 2, vsync: this); // My ministries / Other ministries
+    _tab = TabController(length: 2, vsync: this); // My / Other
     _bootstrap();
   }
 
@@ -52,24 +56,20 @@ class _MinistresPageState extends State<MinistresPage>
   Future<void> _bootstrap() async {
     final uid = _auth.currentUser?.uid;
     if (uid == null) {
-      setState(() {
-        _loading = false;
-      });
+      setState(() => _loading = false);
       return;
     }
     try {
       final userSnap = await _db.collection(FP.users).doc(uid).get();
-      final userData = userSnap.data() ?? {};
-      final memberId = userData['memberId'] as String?;
-      final rolesList = (userData['roles'] is List) ? List<String>.from(userData['roles']) : <String>[];
+      final user = userSnap.data() ?? {};
+      final memberId = user['memberId'] as String?;
+      final rolesList = (user['roles'] is List) ? List<String>.from(user['roles']) : <String>[];
 
       Set<String> ministriesByName = {};
       if (memberId != null) {
         final memberSnap = await _db.collection(FP.members).doc(memberId).get();
         final m = memberSnap.data() ?? {};
-        // Your schema stores ministry *names* in the member doc.
-        final mins = (m['ministries'] is List) ? List<String>.from(m['ministries']) : <String>[];
-        ministriesByName = mins.toSet();
+        ministriesByName = (m['ministries'] is List) ? Set<String>.from(m['ministries']) : <String>{};
       }
 
       setState(() {
@@ -80,40 +80,95 @@ class _MinistresPageState extends State<MinistresPage>
         _loading = false;
       });
     } catch (e) {
-      setState(() { _loading = false; });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Failed to load profile: $e'))
-        );
-      }
+      setState(() => _loading = false);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to load profile: $e')),
+      );
     }
   }
 
-  bool get isAdmin {
-    final r = _userRoles.map((e) => e.toLowerCase()).toSet();
-    return r.contains('admin');
-  }
+  bool get isAdmin => _userRoles.map((e) => e.toLowerCase()).contains('admin');
+  bool get isPastor => _userRoles.map((e) => e.toLowerCase()).contains('pastor');
 
-  bool get isPastor {
-    final r = _userRoles.map((e) => e.toLowerCase()).toSet();
-    return r.contains('pastor');
-  }
+  bool _isMemberOfByName(String ministryName) => _memberMinistryNames.contains(ministryName);
 
-  bool _isMemberOfByName(String ministryName) {
-    return _memberMinistryNames.contains(ministryName);
-  }
-
-  Future<String?> _latestJoinStatusFor(String ministryName) async {
+  /// Latest status for current user + ministry name
+  Future<Map<String, String?>?> _latestJoinFor(String ministryName) async {
     if (_memberId == null) return null;
     final q = await _db.collection(FP.joinRequests)
         .where('memberId', isEqualTo: _memberId)
-    // In your app you persist the ministry *name* in join_requests.ministryId
         .where('ministryId', isEqualTo: ministryName)
         .orderBy('requestedAt', descending: true)
         .limit(1)
         .get();
     if (q.docs.isEmpty) return null;
-    return (q.docs.first.data()['status'] as String?)?.toLowerCase();
+    final data = q.docs.first.data();
+    return {
+      'status': (data['status'] as String?)?.toLowerCase(), // pending/approved/rejected
+      'id': q.docs.first.id,
+    };
+  }
+
+  Future<void> _showBlockedDialog(String ministryName) async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.lock_outline),
+        title: const Text("Access blocked"),
+        content: Text('You can only access "$ministryName" after you’ve joined in.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
+  /// Send notifications:
+  /// - A broadcast for leaders (ministryId + leadersOnly)
+  /// - Direct per-leader notifications (if we can resolve their uids)
+  Future<void> _notifyLeadersOnJoin(String ministryName, String joinRequestId) async {
+    try {
+      // Broadcast notification leaders can read by ministryId
+      await _db.collection(FP.notifications).add({
+        'type': 'join_request',
+        'ministryId': ministryName,       // NAME for leader filters
+        'joinRequestId': joinRequestId,
+        'createdAt': FieldValue.serverTimestamp(),
+        'audience': {'leadersOnly': true, 'adminAlso': true},
+      });
+
+      // Try to fan-out to individual leaders (resolve members -> users)
+      final leaders = await _db.collection(FP.members)
+          .where('leadershipMinistries', arrayContains: ministryName)
+          .get();
+
+      if (leaders.docs.isEmpty) return;
+
+      final batch = _db.batch();
+      for (final lm in leaders.docs) {
+        final memberId = lm.id;
+        final userQs = await _db.collection(FP.users)
+            .where('memberId', isEqualTo: memberId)
+            .limit(1)
+            .get();
+        if (userQs.docs.isEmpty) continue;
+        final leaderUid = userQs.docs.first.id;
+
+        final ref = _db.collection(FP.notifications).doc();
+        batch.set(ref, {
+          'type': 'join_request',
+          'ministryId': ministryName,
+          'joinRequestId': joinRequestId,
+          'recipientUid': leaderUid,
+          'createdAt': FieldValue.serverTimestamp(),
+          'audience': {'direct': true, 'role': 'leader'},
+        });
+      }
+      await batch.commit();
+    } catch (_) {
+      // swallow – notifications are best-effort
+    }
   }
 
   Future<void> _openJoinBottomSheet(String ministryName) async {
@@ -127,15 +182,15 @@ class _MinistresPageState extends State<MinistresPage>
     final controller = TextEditingController();
     String urgency = 'normal';
 
-    final result = await showModalBottomSheet<bool>(
+    final ok = await showModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       showDragHandle: true,
       builder: (ctx) {
-        final viewInsets = MediaQuery.of(ctx).viewInsets;
+        final insets = MediaQuery.of(ctx).viewInsets;
         return Padding(
-          padding: EdgeInsets.only(bottom: viewInsets.bottom),
+          padding: EdgeInsets.only(bottom: insets.bottom),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -213,12 +268,13 @@ class _MinistresPageState extends State<MinistresPage>
       },
     );
 
-    if (result != true) return;
+    if (ok != true) return;
 
     try {
-      await _db.collection(FP.joinRequests).add({
+      // 1) create join request
+      final jrRef = await _db.collection(FP.joinRequests).add({
         'memberId': _memberId,
-        // Store the NAME, to match member.ministries array
+        // Store the NAME, to match member.ministries array & rules
         'ministryId': ministryName,
         'requestedByUid': _uid,
         'message': controller.text.trim().isEmpty ? null : controller.text.trim(),
@@ -226,35 +282,52 @@ class _MinistresPageState extends State<MinistresPage>
         'status': 'pending',
         'requestedAt': FieldValue.serverTimestamp(),
       });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                Icon(Icons.check_circle_outline),
-                SizedBox(width: 8),
-                Expanded(child: Text('Join request sent. You’ll be notified when approved.')),
-              ],
-            ),
+
+      // 2) notify leaders
+      await _notifyLeadersOnJoin(ministryName, jrRef.id);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              Icon(Icons.check_circle_outline),
+              SizedBox(width: 8),
+              Expanded(child: Text('Join request sent. Leaders have been notified.')),
+            ],
           ),
-        );
-      }
-      setState(() {}); // refresh per-item status
+        ),
+      );
+      setState(() {}); // let FutureBuilders refresh
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to send request: $e')),
-        );
-      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send request: $e')),
+      );
+    }
+  }
+
+  Future<void> _cancelPendingRequest(String requestId) async {
+    if (requestId.isEmpty) return;
+    try {
+      await _db.collection(FP.joinRequests).doc(requestId).delete();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Join request cancelled.')),
+      );
+      setState(() {}); // refresh status
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to cancel: $e')),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
@@ -301,7 +374,6 @@ class _MinistresPageState extends State<MinistresPage>
             return name.contains(_search);
           }).toList();
 
-          // Partition into My vs Other using the *name* field
           final my = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
           final other = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
 
@@ -346,14 +418,21 @@ class _MinistresPageState extends State<MinistresPage>
             ? DateFormat('d MMM y • HH:mm').format(createdAt.toDate())
             : null;
 
-        final amMember = _isMemberOfByName(name); // compare by NAME
+        final amMember = _isMemberOfByName(name);
 
-        return FutureBuilder<String?>(
-          future: _latestJoinStatusFor(name),
+        // Future builder for status & latest request id for this user+ministry
+        return FutureBuilder<Map<String, String?>?>(
+          future: _latestJoinFor(name),
           builder: (context, statusSnap) {
-            final status = statusSnap.data; // null | pending | approved | rejected
+            final latest = statusSnap.data;
+            final status = latest?['status']; // pending | approved | rejected | null
+            final reqId = latest?['id'] ?? '';
 
-            return ListTile(
+            // GREY OUT non-member tiles (unless admin/pastor)
+            final locked = !amMember && !isAdmin && !isPastor;
+
+            final tile = ListTile(
+              enabled: !locked, // visually dims splash focus, but we also control opacity
               title: Row(
                 children: [
                   Text(name, style: Theme.of(context).textTheme.titleMedium),
@@ -374,13 +453,29 @@ class _MinistresPageState extends State<MinistresPage>
                 ministryName: name,
                 amMember: amMember,
                 status: status,
-                isOtherTab: isOtherTab,
+                requestId: reqId,
               ),
-              onTap: () {
-                Navigator.push(context, MaterialPageRoute(
-                  builder: (_) => MinistryDetailsPage(ministryId: id, ministryName: name),
-                ));
+              onTap: () async {
+                if (isAdmin || isPastor || amMember) {
+                  Navigator.push(context, MaterialPageRoute(
+                    builder: (_) => MinistryDetailsPage(ministryId: id, ministryName: name),
+                  ));
+                } else {
+                  await _showBlockedDialog(name);
+                }
               },
+            );
+
+            if (!locked) return tile;
+
+            // Greyed out visual with tap still intercepted -> shows popup
+            return Opacity(
+              opacity: 0.55,
+              child: AbsorbPointer(
+                // Absorb the tile built-in tap ripple, we manually handle via onTap above
+                absorbing: false,
+                child: tile,
+              ),
             );
           },
         );
@@ -393,9 +488,9 @@ class _MinistresPageState extends State<MinistresPage>
     required String ministryName,
     required bool amMember,
     required String? status,
-    required bool isOtherTab,
+    required String requestId,
   }) {
-    // Pastors/Admins: full access to all ministries — always show "Open"
+    // Admins/Pastors: full access — Open
     if (isAdmin || isPastor) {
       return OutlinedButton.icon(
         icon: const Icon(Icons.open_in_new),
@@ -408,7 +503,7 @@ class _MinistresPageState extends State<MinistresPage>
       );
     }
 
-    // Members who are already in the ministry: show "View"
+    // Already a member: View
     if (amMember) {
       return OutlinedButton.icon(
         icon: const Icon(Icons.visibility_outlined),
@@ -421,15 +516,49 @@ class _MinistresPageState extends State<MinistresPage>
       );
     }
 
-    // Other ministries (not a member): show Join unless there is a pending request
-    if (status == 'pending') {
-      return const SizedBox.shrink();
-    }
+    // Not a member: single toggle button (Join <-> Cancel)
+    return _joinCancelToggleButton(
+      ministryName: ministryName,
+      pending: status == 'pending',
+      requestId: requestId,
+    );
+  }
+
+  Widget _joinCancelToggleButton({
+    required String ministryName,
+    required bool pending,
+    required String requestId,
+  }) {
+    final busy = _busyMinistryNames.contains(ministryName);
+    final label = pending ? 'Cancel' : 'Join';
+    final icon = pending ? Icons.undo : Icons.group_add;
 
     return FilledButton.icon(
-      icon: const Icon(Icons.group_add),
-      label: const Text('Join'),
-      onPressed: () => _openJoinBottomSheet(ministryName),
+      icon: busy
+          ? const SizedBox(
+        width: 16, height: 16,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      )
+          : Icon(icon),
+      label: Text(label),
+      onPressed: busy
+          ? null
+          : () async {
+        setState(() => _busyMinistryNames.add(ministryName));
+        try {
+          if (pending) {
+            // Cancel existing pending request
+            await _cancelPendingRequest(requestId);
+          } else {
+            // Create a new join request via bottom sheet
+            await _openJoinBottomSheet(ministryName);
+          }
+        } finally {
+          if (mounted) {
+            setState(() => _busyMinistryNames.remove(ministryName));
+          }
+        }
+      },
     );
   }
 }

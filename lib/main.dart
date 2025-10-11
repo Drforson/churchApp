@@ -159,9 +159,11 @@ Future<void> main() async {
   Stripe.publishableKey = 'pk_test_your_publishable_key';
 
   // Notifications
-  NotificationCenter.I;
+  // Notifications
+  await NotificationCenter.init();
   await _initLocalNotifications();
   await _initMessaging();
+
 
   runApp(
     MultiProvider(
