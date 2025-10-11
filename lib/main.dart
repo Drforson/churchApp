@@ -407,7 +407,7 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
       return MaterialPageRoute(builder: (_) => PostAnnouncementsPage());
 
     case '/view-ministry':
-      return MaterialPageRoute(builder: (_) => const MinistresPage());
+      return MaterialPageRoute(builder: (_) => const MinistriesPage());
 
     case '/manage-prayer-requests':
       return MaterialPageRoute(builder: (_) => const PrayerRequestManagePage());

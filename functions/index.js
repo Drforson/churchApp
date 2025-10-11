@@ -171,6 +171,7 @@ async function syncClaimsForUid(uid) {
       isLeader: roles.includes('leader') || undefined,
     };
     await admin.auth().setCustomUserClaims(uid, claims);
+    logger.info('syncClaimsForUid', { uid, claims });
   } catch (e) {
     logger.error('syncClaimsForUid failed', uid, e);
   }
@@ -336,7 +337,6 @@ async function notifyRequesterResult({ ministryName, ministryDocId, joinRequestI
 async function notifyMinistryRequesterResult({ requestId, requesterUid, ministryName, ministryDocId, result, reviewerUid, reason }) {
   if (!requesterUid) return;
 
-  // Notifications collection
   await writeNotification({
     type: 'ministry_request_result',
     result, // 'approved' | 'declined'
@@ -348,7 +348,6 @@ async function notifyMinistryRequesterResult({ requestId, requesterUid, ministry
     reason: reason || null,
   });
 
-  // Legacy inbox mirror (for your existing clients)
   await writeInbox(requesterUid, {
     type: result === 'approved' ? 'ministry_request_approved' : 'ministry_request_declined',
     channel: 'approvals',
@@ -374,8 +373,9 @@ exports.processMinistryApprovalAction = onDocumentCreated(
     const doc = event.data;
     if (!doc) return;
 
-    // NEW: consume 'decision' & 'reviewerUid' (from Pastor UI)
     const { decision, requestId, reason, reviewerUid } = doc.data() || {};
+    logger.info('processMinistryApprovalAction received', { id: doc.id, decision, requestId, reviewerUid });
+
     if (!decision || !requestId || !reviewerUid) {
       logger.warn('Invalid payload on approval action', doc.id);
       await doc.ref.update({ status: 'invalid', processed: true, processedAt: new Date() });
@@ -407,7 +407,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
       const requestedByUid = S(r.requestedByUid);
 
       if (toLc(decision) === 'approve') {
-        // Create ministry and mark request approved
         const minRef = db.collection('ministries').doc();
         await db.runTransaction(async (txn) => {
           txn.set(minRef, {
@@ -417,7 +416,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
             approved: true,
             createdAt: ts(),
             createdBy: reviewerUid,
-            // Store the requester linkages (optional: you can pivot to memberIds if preferred)
             leaderUids: requestedByUid ? [requestedByUid] : [],
           });
           txn.update(reqRef, {
@@ -428,7 +426,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           });
         });
 
-        // Ensure requester becomes a leader & has the ministry in their arrays (if we can resolve memberId)
         if (requestedByUid) {
           const memberId = await getUserMemberId(requestedByUid);
           if (memberId) {
@@ -450,7 +447,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           }
         }
 
-        // Notify requester (notifications + inbox)
         await notifyMinistryRequesterResult({
           requestId,
           requesterUid: requestedByUid || null,
@@ -460,7 +456,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           reviewerUid,
         });
 
-        // Notify reviewer (inbox) for audit trail
         await writeInbox(reviewerUid, {
           type: 'approval_action_processed',
           channel: 'approvals',
@@ -477,7 +472,7 @@ exports.processMinistryApprovalAction = onDocumentCreated(
         return;
       }
 
-      // DECLINE → notify then DELETE the request (per requirement)
+      // DECLINE
       const declineReason = S(reason) || null;
 
       await notifyMinistryRequesterResult({
@@ -527,6 +522,7 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated(
     if (!snap) return;
     const r = snap.data() || {};
     const name = S(r.name || r.ministryName);
+    logger.info('ministry_creation_requests CREATED', { id: snap.id, requestedByUid: r.requestedByUid, name });
 
     const approverUids = await listPastorAndAdminUids();
     if (!approverUids.length) {
@@ -607,7 +603,7 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     if (!before || !after) return;
 
     const prev = S(before.status || 'pending');
-    const theNext = S(after.status || 'pending'); // fixed: ensure defined
+    const theNext = S(after.status || 'pending');
     if (prev === theNext) return;
 
     if (theNext !== 'approved' && theNext !== 'rejected') return;
