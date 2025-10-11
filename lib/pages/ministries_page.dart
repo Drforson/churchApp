@@ -1,6 +1,4 @@
 // lib/pages/ministries_page.dart
-import 'dart:async';
-import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -20,82 +18,55 @@ class _MinistriesPageState extends State<MinistriesPage>
   bool _loading = true;
   bool _isLeader = false;
   String? _uid;
-  String? _memberId;
 
-  Map<String, dynamic> _claims = {};
-  Map<String, dynamic>? _userDoc;
-  Map<String, dynamic>? _memberDoc;
-
-  // UI
-  final _nameCtrl = TextEditingController();
-  final _descCtrl = TextEditingController();
+  // search
+  final _searchCtrl = TextEditingController();
+  String _query = '';
 
   @override
   void initState() {
     super.initState();
-    _bootstrap();
+    _resolveRole();
+    _searchCtrl.addListener(() {
+      final v = _searchCtrl.text.trim();
+      if (v != _query) {
+        setState(() => _query = v);
+      }
+    });
   }
 
-  Future<void> _bootstrap() async {
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _resolveRole() async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      setState(() {
+        _uid = null;
+        _isLeader = false;
+        _loading = false;
+      });
+      return;
+    }
+    _uid = user.uid;
     try {
-      final user = _auth.currentUser;
-      if (user == null) {
-        setState(() {
-          _loading = false;
-          _isLeader = false;
-        });
-        return;
-      }
-      _uid = user.uid;
-
-      // force refresh claims
-      final token = await user.getIdTokenResult(true);
-      _claims = token.claims ?? {};
-
-      // fetch users doc
-      final userSnap = await _db.collection('users').doc(_uid).get();
-      _userDoc = userSnap.data();
-
-      // memberId
-      _memberId = _userDoc?['memberId'];
-
-      // fetch member doc if any
-      if (_memberId != null) {
-        final memSnap = await _db.collection('members').doc(_memberId).get();
-        _memberDoc = memSnap.data();
-      }
-
-      bool isLeaderByClaim = (_claims['leader'] == true) || (_claims['isLeader'] == true);
-      List rolesUser = (_userDoc?['roles'] is List) ? List.from(_userDoc!['roles']) : const [];
-      List rolesMember = (_memberDoc?['roles'] is List) ? List.from(_memberDoc!['roles']) : const [];
-      List lmUser = (_userDoc?['leadershipMinistries'] is List) ? List.from(_userDoc!['leadershipMinistries']) : const [];
-      List lmMember = (_memberDoc?['leadershipMinistries'] is List) ? List.from(_memberDoc!['leadershipMinistries']) : const [];
-
-      bool isLeader = isLeaderByClaim
-          || rolesUser.map((e) => e.toString().toLowerCase()).contains('leader')
-          || rolesMember.map((e) => e.toString().toLowerCase()).contains('leader')
-          || lmUser.isNotEmpty
-          || lmMember.isNotEmpty;
-
-      // Console debug
-      // ignore: avoid_print
-      print('[MinistriesPage] bootstrap'
-          '\n  uid=$_uid'
-          '\n  claims=${jsonEncode(_claims)}'
-          '\n  users.roles=$rolesUser'
-          '\n  users.leadershipMinistries=$lmUser'
-          '\n  memberId=$_memberId'
-          '\n  members.roles=$rolesMember'
-          '\n  members.leadershipMinistries=$lmMember'
-          '\n  -> isLeader=$isLeader');
-
+      final u = await _db.collection('users').doc(user.uid).get();
+      final data = u.data() ?? {};
+      final roles = (data['roles'] is List)
+          ? List<String>.from(data['roles'])
+          : <String>[];
+      final bool isLeader = roles.map((e) => e.toLowerCase()).contains('leader') ||
+          (data['isLeader'] == true) ||
+          (data['leadershipMinistries'] is List &&
+              (data['leadershipMinistries'] as List).isNotEmpty);
       setState(() {
         _isLeader = isLeader;
         _loading = false;
       });
-    } catch (e, st) {
-      // ignore: avoid_print
-      print('[MinistriesPage] bootstrap error: $e\n$st');
+    } catch (_) {
       setState(() {
         _isLeader = false;
         _loading = false;
@@ -105,223 +76,377 @@ class _MinistriesPageState extends State<MinistriesPage>
 
   // -------- New Ministry Request (Leader) --------
   Future<void> _openNewMinistryDialog() async {
-    _nameCtrl.clear();
-    _descCtrl.clear();
+    final nameCtrl = TextEditingController();
+    final descCtrl = TextEditingController();
 
-    await showDialog(
+    final ok = await showDialog<bool>(
       context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          title: const Text('Request a new ministry'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: _nameCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Ministry name',
-                  hintText: 'e.g., Ushers, Choir, Media...',
-                ),
+      builder: (context) => AlertDialog(
+        title: const Text('Request New Ministry'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Ministry name',
+                hintText: 'e.g., Worship Team',
               ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _descCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Description (optional)',
-                ),
-                maxLines: 3,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'A request will be sent to Pastors/Admins for approval.',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
+              textInputAction: TextInputAction.next,
             ),
-            FilledButton.icon(
-              onPressed: _submitRequest,
-              icon: const Icon(Icons.send),
-              label: const Text('Submit'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: descCtrl,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: 'Description (optional)',
+              ),
             ),
           ],
-        );
-      },
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Submit')),
+        ],
+      ),
     );
+
+    if (ok == true) {
+      final name = nameCtrl.text.trim();
+      final desc = descCtrl.text.trim();
+      await _submitNewRequest(name, desc);
+    }
   }
 
-  Future<void> _submitRequest() async {
-    final name = _nameCtrl.text.trim();
-    final desc = _descCtrl.text.trim();
+  Future<void> _submitNewRequest(String name, String description) async {
     if (name.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter a ministry name')),
+        const SnackBar(content: Text('Name is required.')),
       );
       return;
     }
-
     final uid = _auth.currentUser?.uid;
     if (uid == null) return;
 
-    final payload = <String, dynamic>{
-      'name': name,
-      'description': desc,
-      'requestedByUid': uid,                 // required by rules
-      'requesterMemberId': _memberId,        // helps rules if users.memberId missing
-      'status': 'pending',                   // enforced by rules if provided
-      'createdAt': FieldValue.serverTimestamp(),
-    };
-
-    // Console dump before write
-    // ignore: avoid_print
-    print('[MinistryRequest] attempting create payload=${jsonEncode(payload)}');
-
     try {
-      await _db.collection('ministry_creation_requests').add(payload);
-      if (mounted) {
-        Navigator.of(context).pop(); // close dialog
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Request submitted for "$name"')),
-        );
+      // Optional: enrich with requester identity for nicer Pastor UI
+      String? requesterEmail;
+      String? requesterFullName;
+
+      final u = await _db.collection('users').doc(uid).get();
+      final data = u.data() ?? {};
+      requesterEmail = (data['email'] ?? '').toString();
+
+      final memberId = (data['memberId'] ?? '').toString();
+      if (memberId.isNotEmpty) {
+        final m = await _db.collection('members').doc(memberId).get();
+        final md = m.data() ?? {};
+        final fullField = (md['fullName'] ?? '').toString().trim();
+        final fn = (md['firstName'] ?? '').toString().trim();
+        final ln = (md['lastName'] ?? '').toString().trim();
+        final full = fullField.isNotEmpty
+            ? fullField
+            : [fn, ln].where((s) => s.isNotEmpty).join(' ').trim();
+        if (full.isNotEmpty) requesterFullName = full;
       }
-    } on FirebaseException catch (e, st) {
-      // ignore: avoid_print
-      print('[MinistryRequest] FirebaseException code=${e.code} message=${e.message}\n$st');
-      if (mounted) {
-        _showDebugSheet(
-          title: 'Permission error',
-          message:
-          'Code: ${e.code}\nMessage: ${e.message}\n\nWe will show your current claims, users/members docs, and the exact payload we tried to send.',
-          payload: payload,
-        );
-      }
-    } catch (e, st) {
-      // ignore: avoid_print
-      print('[MinistryRequest] error: $e\n$st');
-      if (mounted) {
-        _showDebugSheet(
-          title: 'Unexpected error',
-          message: e.toString(),
-          payload: payload,
-        );
-      }
+
+      await _db.collection('ministry_creation_requests').add({
+        'ministryName': name,
+        'name': name,
+        'description': description,
+        'requestedByUid': uid,
+        'requesterEmail': requesterEmail,
+        'requesterFullName': requesterFullName,
+        'status': 'pending',
+        'requestedAt': FieldValue.serverTimestamp(),
+      });
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Request submitted. A Pastor will review it.')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error submitting request: $e')),
+      );
     }
   }
 
-  void _showDebugSheet({
-    required String title,
-    required String message,
-    Map<String, dynamic>? payload,
-  }) {
-    showModalBottomSheet(
-      context: context,
-      showDragHandle: true,
-      isScrollControlled: true,
-      builder: (ctx) {
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-          child: SafeArea(
-            child: SingleChildScrollView(
-              child: DefaultTextStyle(
-                style: Theme.of(context).textTheme.bodyMedium!,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title, style: Theme.of(context).textTheme.titleLarge),
-                    const SizedBox(height: 8),
-                    Text(message),
-                    const SizedBox(height: 12),
-                    _kv('UID', _uid),
-                    _kv('Custom claims', const JsonEncoder.withIndent('  ').convert(_claims)),
-                    _kv('users doc', const JsonEncoder.withIndent('  ').convert(_userDoc ?? {})),
-                    _kv('members doc', const JsonEncoder.withIndent('  ').convert(_memberDoc ?? {})),
-                    _kv('payload', const JsonEncoder.withIndent('  ').convert(payload ?? {})),
-                    const SizedBox(height: 24),
-                    Text(
-                      'Rule checklist for create(ministry_creation_requests):\n'
-                          '  • signedIn ✅\n'
-                          '  • isLeader() OR memberIdIsLeader(requesterMemberId) ✅\n'
-                          '  • name: non-empty string ✅\n'
-                          '  • requestedByUid == auth.uid OR requesterMemberId == your memberId ✅\n'
-                          '  • (if status provided) status == "pending" ✅',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        );
-      },
+  // -------- Data streams --------
+
+  Stream<List<Map<String, dynamic>>> _ministriesStream() {
+    // Basic ministries list. If you persist a "name" field (recommended).
+    final base = _db.collection('ministries').orderBy('name');
+    return base.snapshots().map((qs) {
+      final list = qs.docs.map((d) {
+        final data = d.data() as Map<String, dynamic>;
+        return {
+          'id': d.id,
+          'name': (data['name'] ?? '').toString(),
+          'description': (data['description'] ?? '').toString(),
+          'createdAt': data['createdAt'],
+        };
+      }).toList();
+
+      if (_query.isEmpty) return list;
+      final q = _query.toLowerCase();
+      return list
+          .where((m) =>
+      (m['name'] as String).toLowerCase().contains(q) ||
+          (m['description'] as String).toLowerCase().contains(q))
+          .toList();
+    });
+  }
+
+  Stream<List<Map<String, dynamic>>> _myRequestsStream() {
+    if (_uid == null) return const Stream.empty();
+    final q = _db
+        .collection('ministry_creation_requests')
+        .where('requestedByUid', isEqualTo: _uid)
+        .orderBy('requestedAt', descending: true);
+    return q.snapshots().map((qs) {
+      return qs.docs.map((d) {
+        final data = d.data() as Map<String, dynamic>;
+        return {
+          'id': d.id,
+          'name': (data['name'] ?? data['ministryName'] ?? '').toString(),
+          'description': (data['description'] ?? '').toString(),
+          'status': (data['status'] ?? 'pending').toString().toLowerCase(),
+          'requestedAt': data['requestedAt'],
+          'approvedAt': data['approvedAt'],
+        };
+      }).toList();
+    });
+  }
+
+  // -------- UI helpers --------
+
+  Color _statusColor(String status) {
+    switch (status) {
+      case 'approved':
+        return Colors.green;
+      case 'declined':
+      case 'rejected':
+        return Colors.red;
+      default:
+        return Colors.orange;
+    }
+  }
+
+  Widget _statusChip(String status) {
+    final color = _statusColor(status);
+    return Chip(
+      label: Text(status[0].toUpperCase() + status.substring(1)),
+      backgroundColor: color.withOpacity(0.12),
+      labelStyle: TextStyle(color: color),
+      visualDensity: VisualDensity.compact,
+      side: BorderSide(color: color.withOpacity(0.4)),
     );
   }
 
-  Widget _kv(String k, Object? v) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Text('$k:\n$v'),
+  Future<void> _cancelPending(String requestId) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel request?'),
+        content: const Text('This will delete your pending request.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('No')),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Yes, cancel')),
+        ],
+      ),
     );
+    if (ok == true) {
+      try {
+        await _db.collection('ministry_creation_requests').doc(requestId).delete();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Request cancelled.')),
+        );
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error cancelling: $e')),
+        );
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final fab = (!_loading && _isLeader)
-        ? FloatingActionButton.extended(
-      onPressed: _openNewMinistryDialog,
-      icon: const Icon(Icons.add),
-      label: const Text('Request ministry'),
-    )
-        : null;
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Ministries'),
-        actions: [
-          IconButton(
-            tooltip: 'Debug',
-            icon: const Icon(Icons.bug_report),
-            onPressed: () => _showDebugSheet(
-              title: 'Environment debug',
-              message: 'Here is what we know about your auth/roles.',
-              payload: const {},
+    final tabs = <Tab>[const Tab(text: 'Ministries')];
+    if (_isLeader) tabs.add(const Tab(text: 'My Requests'));
+
+    return DefaultTabController(
+      length: tabs.length,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Ministries'),
+          bottom: TabBar(tabs: tabs),
+          actions: [
+            // Search field (simple inline)
+            SizedBox(
+              width: 220,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+                child: TextField(
+                  controller: _searchCtrl,
+                  decoration: InputDecoration(
+                    hintText: 'Search ministries…',
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    suffixIcon: _query.isEmpty
+                        ? const Icon(Icons.search)
+                        : IconButton(
+                      onPressed: () => _searchCtrl.clear(),
+                      icon: const Icon(Icons.clear),
+                    ),
+                  ),
+                ),
+              ),
             ),
-          ),
-        ],
-      ),
-      floatingActionButton: fab,
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _buildBody(),
-    );
-  }
+            if (_isLeader)
+              IconButton(
+                tooltip: 'Request New Ministry',
+                onPressed: _openNewMinistryDialog,
+                icon: const Icon(Icons.add_box),
+              ),
+          ],
+        ),
+        floatingActionButton: _isLeader
+            ? FloatingActionButton(
+          tooltip: 'Request New Ministry',
+          onPressed: _openNewMinistryDialog,
+          child: const Icon(Icons.add),
+        )
+            : null,
+        body: TabBarView(
+          children: [
+            // ---- Tab 1: Ministries ----
+            StreamBuilder<List<Map<String, dynamic>>>(
+              stream: _ministriesStream(),
+              builder: (context, snap) {
+                if (!snap.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                final items = snap.data!;
+                if (items.isEmpty) {
+                  return const Center(child: Text('No ministries yet.'));
+                }
+                return ListView.separated(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: items.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 8),
+                  itemBuilder: (context, i) {
+                    final m = items[i];
+                    final ts = m['createdAt'];
+                    final createdAt = ts is Timestamp ? ts.toDate() : null;
+                    return Card(
+                      child: ListTile(
+                        leading: const Icon(Icons.groups),
+                        title: Text((m['name'] as String).isEmpty ? 'Unnamed Ministry' : m['name'] as String),
+                        subtitle: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if ((m['description'] as String).isNotEmpty)
+                              Text(m['description'] as String, maxLines: 2, overflow: TextOverflow.ellipsis),
+                            if (createdAt != null)
+                              Text('Created: ${createdAt.toLocal()}',
+                                  style: Theme.of(context).textTheme.bodySmall),
+                          ],
+                        ),
+                        onTap: () {
+                          // TODO: navigate to MinistryDetailsPage if desired
+                          // Navigator.push(context, MaterialPageRoute(builder: (_) => MinistryDetailsPage(...)));
+                        },
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
 
-  Widget _buildBody() {
-    // This is just a simple list of ministries; you can replace with your own UI.
-    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: _db.collection('ministries').orderBy('name').snapshots(),
-      builder: (context, snap) {
-        if (!snap.hasData) return const Center(child: CircularProgressIndicator());
-        final docs = snap.data!.docs;
-        if (docs.isEmpty) {
-          return const Center(child: Text('No ministries yet'));
-        }
-        return ListView.separated(
-          itemCount: docs.length,
-          separatorBuilder: (_, __) => const Divider(height: 1),
-          itemBuilder: (_, i) {
-            final d = docs[i].data();
-            return ListTile(
-              title: Text(d['name'] ?? '—'),
-              subtitle: Text(d['description'] ?? ''),
-              leading: const Icon(Icons.groups_2),
-            );
-          },
-        );
-      },
+            // ---- Tab 2: My Requests (only for leaders) ----
+            if (_isLeader)
+              StreamBuilder<List<Map<String, dynamic>>>(
+                stream: _myRequestsStream(),
+                builder: (context, snap) {
+                  if (!snap.hasData) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  final reqs = snap.data!;
+                  if (reqs.isEmpty) {
+                    return const Center(child: Text('You have no requests yet.'));
+                  }
+                  return ListView.separated(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: reqs.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (context, i) {
+                      final r = reqs[i];
+                      final status = (r['status'] as String).toLowerCase();
+                      final ts = r['requestedAt'];
+                      final requestedAt = ts is Timestamp ? ts.toDate() : null;
+
+                      return Card(
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      (r['name'] as String).isEmpty ? 'Unnamed Ministry' : r['name'] as String,
+                                      style: Theme.of(context).textTheme.titleMedium,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  _statusChip(status),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              if ((r['description'] as String).isNotEmpty)
+                                Text(r['description'] as String,
+                                    maxLines: 3, overflow: TextOverflow.ellipsis),
+                              const SizedBox(height: 6),
+                              if (requestedAt != null)
+                                Text(
+                                  'Requested: ${requestedAt.toLocal()}',
+                                  style: Theme.of(context).textTheme.bodySmall,
+                                ),
+                              const SizedBox(height: 8),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: [
+                                  if (status == 'pending')
+                                    TextButton.icon(
+                                      onPressed: () => _cancelPending(r['id'] as String),
+                                      icon: const Icon(Icons.cancel),
+                                      label: const Text('Cancel'),
+                                    )
+                                  else
+                                    const SizedBox.shrink(),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
