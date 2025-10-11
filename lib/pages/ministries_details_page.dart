@@ -2,13 +2,11 @@
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'; // for HapticFeedback
 import 'package:intl/intl.dart';
-
-import '../core/firestore_paths.dart'; // keep if you use FP.* elsewhere
-import 'ministry_feed_page.dart';
 
 class MinistryDetailsPage extends StatefulWidget {
   final String ministryId;   // ministries/{docId}
@@ -98,9 +96,11 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       ) async {
     // Resolve requester uid
     String? requesterUid;
-    final qs = await _db.collection('users')
+    final qs = await _db
+        .collection('users')
         .where('memberId', isEqualTo: requesterMemberId)
-        .limit(1).get();
+        .limit(1)
+        .get();
     if (qs.docs.isNotEmpty) {
       requesterUid = qs.docs.first.id;
     }
@@ -150,7 +150,9 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       });
 
       // Notify is non-fatal
-      try { await _notifyRequester(memberId, requestId, 'approved'); } catch (_) {}
+      try {
+        await _notifyRequester(memberId, requestId, 'approved');
+      } catch (_) {}
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -181,7 +183,9 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       });
 
       // Notify is non-fatal
-      try { await _notifyRequester(memberId, requestId, 'rejected'); } catch (_) {}
+      try {
+        await _notifyRequester(memberId, requestId, 'rejected');
+      } catch (_) {}
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -249,6 +253,7 @@ class _MembersTab extends StatefulWidget {
 
 class _MembersTabState extends State<_MembersTab> {
   final _db = FirebaseFirestore.instance;
+  final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
 
   bool _isLeaderOrAdmin = false;
   String? _myMemberId;
@@ -261,12 +266,16 @@ class _MembersTabState extends State<_MembersTab> {
 
   void _setBusy(String id, bool v) {
     if (!mounted) return;
-    setState(() { v ? _busy.add(id) : _busy.remove(id); });
+    setState(() {
+      v ? _busy.add(id) : _busy.remove(id);
+    });
   }
 
   void _setHidden(String id, bool v) {
     if (!mounted) return;
-    setState(() { v ? _hidden.add(id) : _hidden.remove(id); });
+    setState(() {
+      v ? _hidden.add(id) : _hidden.remove(id);
+    });
   }
 
   @override
@@ -280,7 +289,8 @@ class _MembersTabState extends State<_MembersTab> {
     if (uid == null) return;
     final u = await _db.collection('users').doc(uid).get();
     final data = u.data() ?? {};
-    _myMemberId = (data['memberId'] ?? '').toString().isNotEmpty ? (data['memberId'] as String) : null;
+    _myMemberId =
+    (data['memberId'] ?? '').toString().isNotEmpty ? (data['memberId'] as String) : null;
     final roles = (data['roles'] is List) ? List<String>.from(data['roles']) : <String>[];
     final leaderMins = (data['leadershipMinistries'] is List)
         ? List<String>.from(data['leadershipMinistries'])
@@ -304,13 +314,20 @@ class _MembersTabState extends State<_MembersTab> {
         final name = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
         final email = (data['email'] ?? '').toString();
         final leadership = (data['leadershipMinistries'] is List)
-            ? List<String>.from(data['leadershipMinistries']) : <String>[];
-        final isLeader = leadership.contains(widget.ministryName);
+            ? List<String>.from(data['leadershipMinistries'])
+            : <String>[];
+        final roles = (data['roles'] is List)
+            ? List<String>.from(data['roles']).map((e) => e.toLowerCase()).toSet()
+            : <String>{};
+        final isLeaderHere =
+            roles.contains('leader') && leadership.contains(widget.ministryName);
         return {
           'memberId': d.id,
           'name': name.isEmpty ? 'Unnamed Member' : name,
           'email': email,
-          'isLeader': isLeader,
+          'isLeader': isLeaderHere,
+          'leadershipMinistries': leadership,
+          'roles': roles.toList(),
         };
       }).toList();
     });
@@ -332,9 +349,8 @@ class _MembersTabState extends State<_MembersTab> {
 
         final r = doc.data();
         final memberId = (r['memberId'] ?? '').toString();
-        final requestedAt = (r['requestedAt'] is Timestamp)
-            ? (r['requestedAt'] as Timestamp).toDate()
-            : null;
+        final requestedAt =
+        (r['requestedAt'] is Timestamp) ? (r['requestedAt'] as Timestamp).toDate() : null;
 
         // Resolve full name now (so we show a human name, not the uid)
         String fullName = 'Unknown Member';
@@ -358,47 +374,35 @@ class _MembersTabState extends State<_MembersTab> {
     });
   }
 
-  // ===== Member moderation helpers =====
+  // ---------- NEW: Use callable for promote/demote (no client write to /users) ----------
 
-  Future<DocumentReference<Map<String, dynamic>>?> _userRefForMember(String memberId) async {
-    final qs = await _db.collection('users').where('memberId', isEqualTo: memberId).limit(1).get();
-    if (qs.docs.isEmpty) return null;
-    return qs.docs.first.reference;
+  Future<void> _callSetLeader({
+    required String memberId,
+    required bool makeLeader,
+  }) async {
+    final callable = _functions.httpsCallable('leaderSetMemberLeaderRole');
+    await callable.call(<String, dynamic>{
+      'memberId': memberId,
+      'ministryName': widget.ministryName,
+      'makeLeader': makeLeader,
+    });
   }
 
   Future<int> _countLeadersInMinistry() async {
-    final qs = await _db.collection('members').where('leadershipMinistries', arrayContains: widget.ministryName).get();
+    final qs = await _db
+        .collection('members')
+        .where('leadershipMinistries', arrayContains: widget.ministryName)
+        .get();
     return qs.docs.length;
   }
 
-  // ---------- UPDATED: WriteBatch versions (no transactions) ----------
-
   Future<void> _promoteToLeader(String memberId) async {
     try {
-      final memberRef = _db.collection('members').doc(memberId);
-      final userRef = await _userRefForMember(memberId);
-
-      final batch = _db.batch();
-
-      // Update member doc (leaders can update members)
-      batch.update(memberRef, {
-        'leadershipMinistries': FieldValue.arrayUnion([widget.ministryName]),
-        'roles': FieldValue.arrayUnion(['leader']),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
-      // Update user doc: only leadershipMinistries (rules forbid leaders changing users.roles)
-      if (userRef != null) {
-        batch.update(userRef, {
-          'leadershipMinistries': FieldValue.arrayUnion([widget.ministryName]),
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      }
-
-      await batch.commit();
-
+      HapticFeedback.selectionClick();
+      await _callSetLeader(memberId: memberId, makeLeader: true);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Promoted to leader')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Promoted to leader')));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -413,36 +417,18 @@ class _MembersTabState extends State<_MembersTab> {
       final leadersCount = await _countLeadersInMinistry();
       if (leadersCount <= 1) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Cannot demote the last leader of this ministry'), backgroundColor: Colors.orange),
+          const SnackBar(
+              content: Text('Cannot demote the last leader of this ministry'),
+              backgroundColor: Colors.orange),
         );
         return;
       }
 
-      final memberRef = _db.collection('members').doc(memberId);
-      final userRef = await _userRefForMember(memberId);
-
-      final batch = _db.batch();
-
-      // Remove this ministry from leadership arrays
-      batch.update(memberRef, {
-        'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
-        // Also remove 'leader' role; if you only want to remove when no leaderships remain,
-        // do it via Cloud Function (requires read). For now keep simple as before:
-        'roles': FieldValue.arrayRemove(['leader']),
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
-      if (userRef != null) {
-        batch.update(userRef, {
-          'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      }
-
-      await batch.commit();
-
+      HapticFeedback.selectionClick();
+      await _callSetLeader(memberId: memberId, makeLeader: false);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Demoted from leader')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Demoted from leader')));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -453,47 +439,42 @@ class _MembersTabState extends State<_MembersTab> {
 
   Future<void> _removeFromMinistry(String memberId) async {
     try {
-      // if target is a leader here, ensure not last leader
+      // if target is a leader here, ensure not last leader and demote first
       final mSnap = await _db.collection('members').doc(memberId).get();
       final m = mSnap.data() ?? {};
-      final mLeader = (m['leadershipMinistries'] is List) ? List<String>.from(m['leadershipMinistries']) : <String>[];
-      final isLeaderHere = mLeader.contains(widget.ministryName);
+      final mLeader = (m['leadershipMinistries'] is List)
+          ? List<String>.from(m['leadershipMinistries'])
+          : <String>[];
+      final roles = (m['roles'] is List)
+          ? List<String>.from(m['roles']).map((e) => e.toLowerCase()).toSet()
+          : <String>{};
+      final isLeaderHere =
+          roles.contains('leader') && mLeader.contains(widget.ministryName);
+
       if (isLeaderHere) {
         final leadersCount = await _countLeadersInMinistry();
         if (leadersCount <= 1) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Cannot remove the last leader of this ministry'), backgroundColor: Colors.orange),
+            const SnackBar(
+                content: Text('Cannot remove the last leader of this ministry'),
+                backgroundColor: Colors.orange),
           );
           return;
         }
+        // Demote via callable first (keeps user+member in sync)
+        await _callSetLeader(memberId: memberId, makeLeader: false);
       }
 
-      final memberRef = _db.collection('members').doc(memberId);
-      final userRef = await _userRefForMember(memberId);
-
-      final batch = _db.batch();
-
-      // Drop membership + leadership from member doc
-      batch.update(memberRef, {
+      // Now remove the membership name from the member doc
+      final memberRef = _db.doc('members/$memberId');
+      await memberRef.set({
         'ministries': FieldValue.arrayRemove([widget.ministryName]),
-        'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
-        'roles': FieldValue.arrayRemove(['leader']),
         'updatedAt': FieldValue.serverTimestamp(),
-      });
-
-      // Mirror on user doc (no roles write)
-      if (userRef != null) {
-        batch.update(userRef, {
-          'ministries': FieldValue.arrayRemove([widget.ministryName]),
-          'leadershipMinistries': FieldValue.arrayRemove([widget.ministryName]),
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      }
-
-      await batch.commit();
+      }, SetOptions(merge: true));
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Member removed from ministry')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Member removed from ministry')));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -668,6 +649,7 @@ class _MembersTabState extends State<_MembersTab> {
                 separatorBuilder: (_, __) => const SizedBox(height: 8),
                 itemBuilder: (context, i) {
                   final m = members[i];
+                  final memberId = m['memberId'] as String;
                   return Card(
                     child: ListTile(
                       title: Row(
@@ -693,15 +675,15 @@ class _MembersTabState extends State<_MembersTab> {
                         m['email'] ?? '',
                         style: const TextStyle(color: Colors.black54),
                       ),
-                      trailing: (_isLeaderOrAdmin && (m['memberId'] != _myMemberId))
+                      trailing: (_isLeaderOrAdmin && (memberId != _myMemberId))
                           ? PopupMenuButton<String>(
                         onSelected: (value) async {
                           if (value == 'promote') {
-                            await _promoteToLeader(m['memberId'] as String);
+                            await _promoteToLeader(memberId);
                           } else if (value == 'demote') {
-                            await _demoteFromLeader(m['memberId'] as String);
+                            await _demoteFromLeader(memberId);
                           } else if (value == 'remove') {
-                            await _removeFromMinistry(m['memberId'] as String);
+                            await _removeFromMinistry(memberId);
                           }
                         },
                         itemBuilder: (context) {
@@ -826,8 +808,9 @@ class _OverviewTab extends StatelessWidget {
     final db = FirebaseFirestore.instance;
     final membersQ =
     db.collection('members').where('ministries', arrayContains: ministryName);
-    final leadersQ =
-    db.collection('members').where('leadershipMinistries', arrayContains: ministryName);
+    final leadersQ = db
+        .collection('members')
+        .where('leadershipMinistries', arrayContains: ministryName);
     final postsQ = db
         .collection('ministries')
         .doc(ministryId)

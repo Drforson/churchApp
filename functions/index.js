@@ -160,6 +160,26 @@ async function isUserPastorOrAdmin(uid) {
   return false;
 }
 
+/* NEW: does uid lead ministryName (via user.leadershipMinistries or ministries.leaderUids/leaderIds)? */
+async function isUserLeaderOfMinistry(uid, ministryName) {
+  if (!uid || !ministryName) return false;
+
+  const user = await getUser(uid);
+  const leadsByUser =
+    Array.isArray(user?.leadershipMinistries) &&
+    user.leadershipMinistries.includes(ministryName);
+
+  let leadsByMinistry = false;
+  const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+  if (!mins.empty) {
+    const mData = mins.docs[0].data() || {};
+    const leaderUids = Array.isArray(mData.leaderUids) ? mData.leaderUids : [];
+    const leaderIds  = Array.isArray(mData.leaderIds)  ? mData.leaderIds  : [];
+    leadsByMinistry = leaderUids.includes(uid) || leaderIds.includes(uid);
+  }
+  return leadsByUser || leadsByMinistry;
+}
+
 async function syncClaimsForUid(uid) {
   try {
     const roles = await getUserRoles(uid);
@@ -278,7 +298,7 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
     .get();
   if (!mins.empty) {
     const mData = mins.docs[0].data() || {};
-    // ⚠️ FIX: support both fields
+    // ⚠️ support both fields
     const fromLeaderUids = Array.isArray(mData.leaderUids) ? mData.leaderUids : [];
     const fromLeaderIds  = Array.isArray(mData.leaderIds)  ? mData.leaderIds  : [];
     ministryLeaderUids = uniq([...fromLeaderUids, ...fromLeaderIds].filter(Boolean));
@@ -763,7 +783,7 @@ exports.onPrayerRequestCreated = onDocumentCreated(
 );
 
 /* =========================================================
-   6) CALLABLES — role sync
+   6) CALLABLES — role sync (existing)
    ========================================================= */
 exports.setMemberPastorRole = onCall(async (req) => {
   const uid = req.auth?.uid;
@@ -848,4 +868,81 @@ exports.ensureMemberLeaderRole = onCall(async (req) => {
 
   await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
   return { ok: true };
+});
+
+/* =========================================================
+   7) NEW CALLABLE — leaders can promote/demote within their ministry
+   ========================================================= */
+exports.leaderSetMemberLeaderRole = onCall(async (req) => {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) throw new Error('unauthenticated');
+
+  const { memberId, ministryName, makeLeader } = req.data || {};
+  if (!memberId || !ministryName || typeof makeLeader !== 'boolean') {
+    throw new Error('invalid-argument');
+  }
+
+  // Allow if caller is pastor/admin OR a leader of this ministry
+  const privileged = await isUserPastorOrAdmin(callerUid);
+  const leadsThis = privileged ? true : await isUserLeaderOfMinistry(callerUid, ministryName);
+  if (!leadsThis) throw new Error('permission-denied');
+
+  // Resolve linked user (for claims + ministries.leaderUids sync)
+  const usersQ = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
+  const linkedUid = usersQ.empty ? null : usersQ.docs[0].id;
+
+  // Update member + (if present) user docs atomically
+  const memberRef = db.doc(`members/${memberId}`);
+  const batch = db.batch();
+
+  const memberUpdate = { updatedAt: ts() };
+  if (makeLeader) {
+    memberUpdate.roles = admin.firestore.FieldValue.arrayUnion('leader');
+    memberUpdate.leadershipMinistries = admin.firestore.FieldValue.arrayUnion(ministryName);
+  } else {
+    memberUpdate.roles = admin.firestore.FieldValue.arrayRemove('leader');
+    memberUpdate.leadershipMinistries = admin.firestore.FieldValue.arrayRemove(ministryName);
+  }
+  batch.set(memberRef, memberUpdate, { merge: true });
+
+  if (!usersQ.empty) {
+    const userRef = usersQ.docs[0].ref;
+    const userUpdate = { updatedAt: ts() };
+    if (makeLeader) {
+      userUpdate.roles = admin.firestore.FieldValue.arrayUnion('leader');
+      userUpdate.leadershipMinistries = admin.firestore.FieldValue.arrayUnion(ministryName);
+    } else {
+      userUpdate.roles = admin.firestore.FieldValue.arrayRemove('leader');
+      userUpdate.leadershipMinistries = admin.firestore.FieldValue.arrayRemove(ministryName);
+    }
+    batch.set(userRef, userUpdate, { merge: true });
+  }
+
+  // Optionally mirror to ministries.leaderUids if ministry exists
+  const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+  if (!mins.empty && linkedUid) {
+    const minRef = mins.docs[0].ref;
+    batch.set(
+      minRef,
+      makeLeader
+        ? { leaderUids: admin.firestore.FieldValue.arrayUnion(linkedUid), updatedAt: ts() }
+        : { leaderUids: admin.firestore.FieldValue.arrayRemove(linkedUid), updatedAt: ts() },
+      { merge: true }
+    );
+  }
+
+  await batch.commit();
+
+  if (linkedUid) {
+    await syncClaimsForUid(linkedUid);
+  }
+
+  logger.info('leaderSetMemberLeaderRole', {
+    callerUid,
+    memberId,
+    ministryName,
+    makeLeader,
+  });
+
+  return { ok: true, memberId, ministryName, leader: makeLeader };
 });
