@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -17,6 +18,8 @@ class PastorMinistryApprovalsPage extends StatefulWidget {
 class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPage> {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
+  final FirebaseFunctions _functions =
+  FirebaseFunctions.instanceFor(region: 'europe-west2');
 
   bool _loadingRole = true;
   bool _canModerate = false; // pastor || admin (users doc, claims, or member fallback)
@@ -126,10 +129,31 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     });
   }
 
+  /// Ensure the requester (by UID) has the 'leader' role on their member/user.
+  /// - Looks up users/{uid} → memberId
+  /// - Calls callable `ensureMemberLeaderRole` (server does the safe updates)
+  Future<void> _ensureRequesterLeaderRoleByUid(String requestedByUid) async {
+    try {
+      if (requestedByUid.trim().isEmpty) return;
+      final u = await _db.collection(FP.users).doc(requestedByUid).get();
+      final memberId = (u.data()?['memberId'] ?? '').toString();
+      if (memberId.isEmpty) return;
+
+      final callable = _functions.httpsCallable(
+        'ensureMemberLeaderRole',
+        options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
+      );
+      await callable.call(<String, dynamic>{'memberId': memberId});
+    } catch (_) {
+      // Non-fatal; creation already assigns leaderIds on the ministry.
+    }
+  }
+
   Future<void> _enqueueAction({
     required String requestId,
     required String action, // 'approve' | 'decline'
     String? reason,
+    String? requestedByUid,
   }) async {
     if (!_canModerate || _uid == null) return;
 
@@ -141,6 +165,12 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
       'createdAt': FieldValue.serverTimestamp(),
       'processed': false,
     });
+
+    // If approving, also ensure the requester gains 'leader' role on their profile.
+    if (action == 'approve' && (requestedByUid ?? '').trim().isNotEmpty) {
+      // Fire-and-forget; do not block UX on this auxiliary sync.
+      unawaited(_ensureRequesterLeaderRoleByUid(requestedByUid!.trim()));
+    }
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -173,6 +203,10 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
     }
   }
 
+  /// Resolve a nice display name for the requester:
+  /// - members/{memberId}: "firstName lastName" or fullName
+  /// - fallback: users/{uid}.email
+  /// - fallback: UID itself
   Future<String> _resolveRequesterName({
     required String requestedByUid,
     String? fallbackFullName,
@@ -191,9 +225,10 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
         final m = await _db.collection(FP.members).doc(memberId).get();
         if (m.exists) {
           final md = m.data() as Map<String, dynamic>;
+          final fullField = (md['fullName'] ?? '').toString().trim();
           final fn = (md['firstName'] ?? '').toString().trim();
           final ln = (md['lastName'] ?? '').toString().trim();
-          final full = [fn, ln].where((s) => s.isNotEmpty).join(' ').trim();
+          final full = fullField.isNotEmpty ? fullField : [fn, ln].where((s) => s.isNotEmpty).join(' ').trim();
           if (full.isNotEmpty) {
             _nameCache[requestedByUid] = full;
             return full;
@@ -216,7 +251,7 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     if (!_canModerate) {
-      final pretty = const JsonEncoder().convert(_debug);
+      final pretty = const JsonEncoder.withIndent('  ').convert(_debug);
       return Scaffold(
         appBar: AppBar(title: const Text('Ministry Approvals')),
         body: Center(
@@ -301,7 +336,12 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                             children: [
                               _Chip('Requester', name),
                               if (requesterEmail.isNotEmpty) _Chip('Email', requesterEmail),
-                              _Chip('Requested At', requestedAt?.toLocal().toString() ?? '—'),
+                              _Chip(
+                                'Requested At',
+                                requestedAt == null
+                                    ? '—'
+                                    : '${requestedAt.toLocal()}',
+                              ),
                             ],
                           );
                         },
@@ -317,7 +357,11 @@ class _PastorMinistryApprovalsPageState extends State<PastorMinistryApprovalsPag
                           ),
                           const SizedBox(width: 12),
                           ElevatedButton.icon(
-                            onPressed: () => _enqueueAction(requestId: id, action: 'approve'),
+                            onPressed: () => _enqueueAction(
+                              requestId: id,
+                              action: 'approve',
+                              requestedByUid: requestedByUid, // ensure leader role on requester
+                            ),
                             icon: const Icon(Icons.check_circle),
                             label: const Text('Approve'),
                           ),

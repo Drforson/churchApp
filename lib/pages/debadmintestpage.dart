@@ -439,8 +439,10 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     }
   }
 
-  Future<void> _setPastorRoleOnMember(_MemberResult m,
-      {required bool makePastor}) async {
+  Future<void> _setPastorRoleOnMember(
+      _MemberResult m, {
+        required bool makePastor,
+      }) async {
     if (!_isAdminNow) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Only admins can modify roles.')),
@@ -449,67 +451,73 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     }
 
     try {
-      bool cfWorked = false;
+      // 1) Try Cloud Function (keeps user & member in sync + claims)
+      final callable = _functions.httpsCallable(
+        'setMemberPastorRole',
+        options: HttpsCallableOptions(timeout: const Duration(seconds: 20)),
+      );
+      await callable.call(<String, dynamic>{'memberId': m.id, 'makePastor': makePastor});
+    } on FirebaseFunctionsException catch (_) {
+      // 2) Fallback to direct batched writes (still keeps both in sync)
       try {
-        final callable = _functions.httpsCallable(
-          'setMemberPastorRole',
-          options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
-        );
-        await callable
-            .call(<String, dynamic>{'memberId': m.id, 'makePastor': makePastor});
-        cfWorked = true;
-      } on FirebaseFunctionsException catch (_) {}
+        final db = FirebaseFirestore.instance;
+        final memberRef = db.collection('members').doc(m.id);
+        final usersQ = await db.collection('users').where('memberId', isEqualTo: m.id).limit(1).get();
+        final userRef = usersQ.docs.isNotEmpty ? usersQ.docs.first.reference : null;
 
-      if (!cfWorked) {
-        await FirebaseFirestore.instance.collection('members').doc(m.id).update({
-          'roles': makePastor
-              ? FieldValue.arrayUnion(['pastor'])
-              : FieldValue.arrayRemove(['pastor']),
-          'isPastor': makePastor,
-        });
-      }
-
-      final usersQ = await FirebaseFirestore.instance
-          .collection('users')
-          .where('memberId', isEqualTo: m.id)
-          .limit(1)
-          .get();
-
-      if (usersQ.docs.isNotEmpty) {
-        final uRef = usersQ.docs.first.reference;
-        await uRef.update({
-          'roles': makePastor
-              ? FieldValue.arrayUnion(['pastor'])
-              : FieldValue.arrayRemove(['pastor']),
-        });
-      }
-
-      setState(() {
-        final i = _searchResults.indexWhere((r) => r.id == m.id);
-        if (i != -1) {
-          final updated = List<String>.from(_searchResults[i].roles);
-          if (makePastor) {
-            if (!updated.map((e) => e.toLowerCase()).contains('pastor')) {
-              updated.add('pastor');
-            }
-          } else {
-            updated.removeWhere((r) => r.toLowerCase() == 'pastor');
+        final batch = db.batch();
+        if (makePastor) {
+          batch.update(memberRef, {
+            'roles': FieldValue.arrayUnion(['pastor']),
+            'isPastor': true,
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+          if (userRef != null) {
+            batch.update(userRef, {
+              'roles': FieldValue.arrayUnion(['pastor']),
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
           }
-          _searchResults[i] =
-              _searchResults[i].copyWith(roles: updated.toSet().toList());
+        } else {
+          batch.update(memberRef, {
+            'roles': FieldValue.arrayRemove(['pastor']),
+            'isPastor': false,
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+          if (userRef != null) {
+            batch.update(userRef, {
+              'roles': FieldValue.arrayRemove(['pastor']),
+              'updatedAt': FieldValue.serverTimestamp(),
+            });
+          }
         }
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text(
-                makePastor ? '✅ Pastor role granted' : '✅ Pastor role removed')),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('❌ Update failed: $e')),
-      );
+        await batch.commit();
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('❌ Update failed: $e')),
+        );
+        return;
+      }
     }
+
+    // Optimistic UI update
+    setState(() {
+      final idx = _searchResults.indexWhere((r) => r.id == m.id);
+      if (idx != -1) {
+        final cur = _searchResults[idx];
+        final next = cur.roles.map((e) => e.toLowerCase()).toSet();
+        makePastor ? next.add('pastor') : next.remove('pastor');
+        _searchResults[idx] = cur.copyWith(roles: next.toList());
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(makePastor
+            ? '✅ Pastor role granted (member + user)'
+            : '✅ Pastor role removed (member + user)'),
+      ),
+    );
   }
 
   // ===== NEW: GRANT PERMISSIONS =====
@@ -532,7 +540,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       return;
     }
 
-    // Avoid adding and removing the same role at once
+    // Avoid add/remove of same role
     final addSet = add.map((e) => e.toLowerCase()).toSet();
     final removeSet = remove.map((e) => e.toLowerCase()).toSet();
     final both = {...addSet}..retainAll(removeSet);
@@ -550,6 +558,20 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         'rolesRemove': removeSet.toList(),
       });
 
+      // ✅ Optimistic UI update for visible search results
+      setState(() {
+        for (final id in memberIds) {
+          final i = _searchResults.indexWhere((r) => r.id == id);
+          if (i != -1) {
+            final cur = _searchResults[i];
+            final next = cur.roles.map((e) => e.toLowerCase()).toSet();
+            next.addAll(addSet);
+            for (final r in removeSet) next.remove(r);
+            _searchResults[i] = cur.copyWith(roles: next.toList());
+          }
+        }
+      });
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -557,8 +579,6 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                 '✅ Updated ${memberIds.length} member(s): +[${addSet.join(', ')}] -[${removeSet.join(', ')}]'),
           ),
         );
-        // Refresh list to reflect new roles
-        setState(() {});
       }
     } on FirebaseFunctionsException catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -570,6 +590,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       );
     }
   }
+
 
   void _toggleRoleToGrant(String role) {
     setState(() {

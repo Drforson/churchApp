@@ -1,5 +1,6 @@
 /* functions/index.js */
 const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore');
+const { onCall } = require('firebase-functions/v2/https');
 const { setGlobalOptions, logger } = require('firebase-functions/v2');
 const admin = require('firebase-admin');
 
@@ -7,35 +8,53 @@ admin.initializeApp();
 const db = admin.firestore();
 const ts = admin.firestore.FieldValue.serverTimestamp;
 
-// Match your deployed region
 setGlobalOptions({ region: 'europe-west2' });
 
-/* ========= Helpers (robust) ========= */
+/* ========= Helpers ========= */
 const S = (v) => (v ?? '').toString().trim();
+const asArray = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
+const toLc = (s) => String(s).toLowerCase().trim();
+const uniq = (arr) => Array.from(new Set(arr));
+const normalizeRoles = (input) => {
+  const arr = Array.isArray(input)
+    ? input
+    : typeof input === 'string'
+    ? input.split(',')
+    : [];
+  return uniq(arr.map(toLc).filter(Boolean));
+};
 
-/** Users -> roles[] (lowercased) */
+async function getUser(uid) {
+  try {
+    const snap = await db.doc(`users/${uid}`).get();
+    return snap.exists ? { id: snap.id, ...snap.data() } : null;
+  } catch (e) {
+    logger.error('getUser failed', uid, e);
+    return null;
+  }
+}
+
 async function getUserRoles(uid) {
-  const snap = await db.doc(`users/${uid}`).get();
-  const raw = snap.data()?.roles ?? [];
-  const arr = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : []);
-  return arr.map((r) => String(r).toLowerCase().trim()).filter(Boolean);
+  const u = await getUser(uid);
+  return normalizeRoles(u?.roles ?? []);
 }
 
-/** Get memberId for a user (if linked) */
 async function getUserMemberId(uid) {
-  const snap = await db.doc(`users/${uid}`).get();
-  return snap.data()?.memberId || null;
+  const u = await getUser(uid);
+  return u?.memberId || null;
 }
 
-/** Load member doc (if any) */
-async function getMember(uid) {
-  const memberId = await getUserMemberId(uid);
+async function getMemberById(memberId) {
   if (!memberId) return null;
   const m = await db.doc(`members/${memberId}`).get();
   return m.exists ? { id: m.id, ...m.data() } : null;
 }
 
-/** List UIDs who have a role in users.roles (handle casing by querying a few variants) */
+async function getMember(uid) {
+  const memberId = await getUserMemberId(uid);
+  return memberId ? await getMemberById(memberId) : null;
+}
+
 async function listUidsByRole(roleLc) {
   const variants = [roleLc, roleLc.toUpperCase(), roleLc[0].toUpperCase() + roleLc.slice(1)];
   const results = await Promise.all(
@@ -46,7 +65,6 @@ async function listUidsByRole(roleLc) {
   return Array.from(set);
 }
 
-/** Map memberId[] -> user uid[] using users.memberId (chunked whereIn to 10) */
 async function uidsFromMemberIds(memberIds) {
   const out = new Set();
   for (let i = 0; i < memberIds.length; i += 10) {
@@ -57,11 +75,9 @@ async function uidsFromMemberIds(memberIds) {
   return Array.from(out);
 }
 
-/** Fallback: collect memberIds that look like pastors/admins */
+/* Fallback: discover pastor/admin from members */
 async function listMemberIdsByPastorOrAdmin() {
   const out = new Set();
-
-  // members.roles contains 'pastor' / 'admin' (all common casings)
   for (const val of ['pastor', 'Pastor', 'PASTOR']) {
     const qs = await db.collection('members').where('roles', 'array-contains', val).get();
     qs.docs.forEach((d) => out.add(d.id));
@@ -70,14 +86,10 @@ async function listMemberIdsByPastorOrAdmin() {
     const qs = await db.collection('members').where('roles', 'array-contains', val).get();
     qs.docs.forEach((d) => out.add(d.id));
   }
-
-  // members.isPastor == true
   {
     const qs = await db.collection('members').where('isPastor', '==', true).get();
     qs.docs.forEach((d) => out.add(d.id));
   }
-
-  // leadershipMinistries heuristic — fetch window and filter
   {
     const qs = await db.collection('members').where('leadershipMinistries', '!=', null).limit(500).get();
     qs.docs.forEach((d) => {
@@ -87,47 +99,54 @@ async function listMemberIdsByPastorOrAdmin() {
       }
     });
   }
-
   return Array.from(out);
 }
 
-/** Union of:
- *  - users with role=admin/pastor
- *  - users linked to member records that imply pastor/admin
- */
+/* Only pastors (users.roles or member signals) */
+async function listPastorUids() {
+  const fromUsers = await listUidsByRole('pastor');
+  const candidateMemberIds = await listMemberIdsByPastorOrAdmin();
+  const pastorMemberIds = new Set();
+  for (const mid of candidateMemberIds) {
+    const snap = await db.doc(`members/${mid}`).get();
+    if (!snap.exists) continue;
+    const m = snap.data() || {};
+    const roles = Array.isArray(m.roles) ? m.roles.map(toLc) : [];
+    const isPastor = m.isPastor === true || roles.includes('pastor');
+    const lead = Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : [];
+    const looksPastor = isPastor || lead.some((s) => String(s).toLowerCase().includes('pastor'));
+    if (looksPastor) pastorMemberIds.add(mid);
+  }
+  const fromMembers = pastorMemberIds.size ? await uidsFromMemberIds(Array.from(pastorMemberIds)) : [];
+  return Array.from(new Set([...fromUsers, ...fromMembers]));
+}
+
 async function listPastorAndAdminUids() {
   const [uPastors, uAdmins, memberIds] = await Promise.all([
     listUidsByRole('pastor'),
     listUidsByRole('admin'),
     listMemberIdsByPastorOrAdmin(),
   ]);
-
   const uidsFromMembers = memberIds.length ? await uidsFromMemberIds(memberIds) : [];
   const set = new Set([...uPastors, ...uAdmins, ...uidsFromMembers]);
   return Array.from(set);
 }
 
-/** Is this user a pastor/admin?
- * Checks users.roles, custom claims, and member fallback.
- */
 async function isUserPastorOrAdmin(uid) {
-  // users.roles
   const roles = await getUserRoles(uid);
   if (roles.includes('pastor') || roles.includes('admin')) return true;
 
-  // custom claims
   try {
     const rec = await admin.auth().getUser(uid);
     const c = rec.customClaims || {};
     if (c.pastor === true || c.admin === true || c.isPastor === true || c.isAdmin === true) {
       return true;
     }
-  } catch (_) { /* ignore */ }
+  } catch (_) {}
 
-  // member fallback
   const mem = await getMember(uid);
   if (mem) {
-    const mroles = Array.isArray(mem.roles) ? mem.roles.map((r) => String(r).toLowerCase()) : [];
+    const mroles = Array.isArray(mem.roles) ? mem.roles.map(toLc) : [];
     const lead = Array.isArray(mem.leadershipMinistries) ? mem.leadershipMinistries : [];
     if (mroles.includes('admin')) return true;
     if (mem.isPastor === true || mroles.includes('pastor')) return true;
@@ -136,22 +155,59 @@ async function isUserPastorOrAdmin(uid) {
   return false;
 }
 
-/**
- * Write a personal inbox event.
- * - Marks as unread (read:false)
- * - Supports optional dedupe with payload.dedupeKey (skip if exists)
- */
-async function writeInbox(uid, payload) {
-  await db.collection('inbox').doc(uid).set(
-    { lastSeenAt: ts() },
-    { merge: true }
-  );
+async function syncClaimsForUid(uid) {
+  try {
+    const roles = await getUserRoles(uid);
+    const claims = {
+      admin: roles.includes('admin') || undefined,
+      pastor: roles.includes('pastor') || undefined,
+      isAdmin: roles.includes('admin') || undefined,
+      isPastor: roles.includes('pastor') || undefined,
+      leader: roles.includes('leader') || undefined,
+      isLeader: roles.includes('leader') || undefined,
+    };
+    await admin.auth().setCustomUserClaims(uid, claims);
+  } catch (e) {
+    logger.error('syncClaimsForUid failed', uid, e);
+  }
+}
 
-  const toWrite = {
-    ...payload,
-    read: false,
-    createdAt: ts(),
-  };
+/* Update member + linked user with roles */
+async function updateMemberAndLinkedUserRoles(memberId, { add = [], remove = [], setFlags = {} } = {}) {
+  const addLc = normalizeRoles(add);
+  const remLc = normalizeRoles(remove);
+
+  const memberRef = db.doc(`members/${memberId}`);
+  const memberSnap = await memberRef.get();
+  if (!memberSnap.exists) throw new Error('member not found');
+
+  const batch = db.batch();
+  const memberUpdate = { updatedAt: ts() };
+  if (addLc.length) memberUpdate.roles = admin.firestore.FieldValue.arrayUnion(...addLc);
+  if (remLc.length) memberUpdate.roles = admin.firestore.FieldValue.arrayRemove(...remLc);
+  for (const [k, v] of Object.entries(setFlags)) memberUpdate[k] = v;
+  batch.update(memberRef, memberUpdate);
+
+  const usersQ = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
+  let uid = null;
+  if (!usersQ.empty) {
+    uid = usersQ.docs[0].id;
+    const userRef = usersQ.docs[0].ref;
+    const userUpdate = { updatedAt: ts() };
+    if (addLc.length) userUpdate.roles = admin.firestore.FieldValue.arrayUnion(...addLc);
+    if (remLc.length) userUpdate.roles = admin.firestore.FieldValue.arrayRemove(...remLc);
+    batch.update(userRef, userUpdate);
+  }
+
+  await batch.commit();
+  if (uid) await syncClaimsForUid(uid);
+}
+
+/* Inbox writer */
+async function writeInbox(uid, payload) {
+  await db.collection('inbox').doc(uid).set({ lastSeenAt: ts() }, { merge: true });
+
+  const toWrite = { ...payload, read: false, createdAt: ts() };
 
   if (payload && payload.dedupeKey) {
     const qs = await db
@@ -169,8 +225,7 @@ async function writeInbox(uid, payload) {
 }
 
 /* =========================================================
-   1) Process approval actions (approve | decline) – secure
-   Client writes to /ministry_approval_actions; server does the work.
+   1) Ministry approval actions (secure)
    ========================================================= */
 exports.processMinistryApprovalAction = onDocumentCreated(
   'ministry_approval_actions/{id}',
@@ -185,7 +240,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
       return;
     }
 
-    // Authorize actor (users.roles, claims, member fallback)
     const allowed = await isUserPastorOrAdmin(byUid);
     if (!allowed) {
       logger.warn('Unauthorized approval action by', byUid);
@@ -208,16 +262,19 @@ exports.processMinistryApprovalAction = onDocumentCreated(
     try {
       if (action === 'approve') {
         const minRef = db.collection('ministries').doc();
+        const ministryName = S(r.name);
+        const requestedByUid = S(r.requestedByUid) || byUid;
 
+        // Create ministry + mark request approved
         await db.runTransaction(async (txn) => {
           txn.set(minRef, {
             id: minRef.id,
-            name: S(r.name),
+            name: ministryName,
             description: S(r.description),
             approved: true,
             createdAt: ts(),
-            createdBy: S(r.requestedByUid) || byUid,
-            leaderIds: S(r.requestedByUid) ? [S(r.requestedByUid)] : [],
+            createdBy: requestedByUid,
+            leaderIds: requestedByUid ? [requestedByUid] : [],
           });
           txn.update(reqRef, {
             status: 'approved',
@@ -227,18 +284,43 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           });
         });
 
-        const requesterUid = S(r.requestedByUid);
-        if (requesterUid) {
-          await writeInbox(requesterUid, {
+        // 🔥 Make requester a MEMBER of that ministry and a LEADER in their profiles
+        if (requestedByUid) {
+          const memberId = await getUserMemberId(requestedByUid);
+          if (memberId) {
+            // Add ministry name to member profile (membership + leadership)
+            await db.doc(`members/${memberId}`).set({
+              ministries: admin.firestore.FieldValue.arrayUnion(ministryName),
+              leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
+              updatedAt: ts(),
+            }, { merge: true });
+
+            // Ensure 'leader' role on member & linked user
+            await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
+
+            // Also reflect leadershipMinistries on the user document
+            await db.doc(`users/${requestedByUid}`).set({
+              leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
+              roles: admin.firestore.FieldValue.arrayUnion('leader'),
+              updatedAt: ts(),
+            }, { merge: true });
+
+            await syncClaimsForUid(requestedByUid);
+          }
+        }
+
+        // Notify requester + actor
+        if (requestedByUid) {
+          await writeInbox(requestedByUid, {
             type: 'ministry_request_approved',
             channel: 'approvals',
             title: 'Your ministry was approved',
-            body: `"${S(r.name)}" is now live.`,
+            body: `"${ministryName}" is now live.`,
             ministryId: minRef.id,
-            ministryName: S(r.name),
-            payload: { requestId, ministryId: minRef.id, ministryName: S(r.name) },
+            ministryName,
+            payload: { requestId, ministryId: minRef.id, ministryName },
             route: '/view-ministry',
-            routeArgs: { ministryId: minRef.id, ministryName: S(r.name) },
+            routeArgs: { ministryId: minRef.id, ministryName },
             dedupeKey: `mcr_approved_${requestId}`,
           });
         }
@@ -247,9 +329,9 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           type: 'approval_action_processed',
           channel: 'approvals',
           title: 'Approved ministry request',
-          body: `"${S(r.name)}" approved.`,
+          body: `"${ministryName}" approved.`,
           ministryId: minRef.id,
-          ministryName: S(r.name),
+          ministryName,
           payload: { requestId, action: 'approve' },
           route: '/pastor-approvals',
           dedupeKey: `mcr_action_${requestId}_approve_${byUid}`,
@@ -308,8 +390,7 @@ exports.processMinistryApprovalAction = onDocumentCreated(
 );
 
 /* =========================================================
-   2) Notify pastors & admins when a new ministry request is submitted
-   (fires when leaders create /ministry_creation_requests doc)
+   2) Notify pastors/admins for new ministry creation requests
    ========================================================= */
 exports.onMinistryCreationRequestCreated = onDocumentCreated(
   'ministry_creation_requests/{id}',
@@ -344,7 +425,7 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated(
 );
 
 /* =========================================================
-   3) JOIN REQUESTS: notify ministry leaders when a join request is created
+   3) Notify leaders when a join request is created
    ========================================================= */
 exports.onJoinRequestCreated = onDocumentCreated(
   'join_requests/{id}',
@@ -353,10 +434,11 @@ exports.onJoinRequestCreated = onDocumentCreated(
     if (!doc) return;
     const jr = doc.data() || {};
     const memberId = S(jr.memberId);
-    const ministryName = S(jr.ministryId); // your app uses the ministry "name" here
+    const ministryName = S(jr.ministryId);
     if (!ministryName) return;
 
-    const mins = await db.collection('ministries')
+    const mins = await db
+      .collection('ministries')
       .where('name', '==', ministryName)
       .where('approved', '==', true)
       .limit(1)
@@ -367,7 +449,6 @@ exports.onJoinRequestCreated = onDocumentCreated(
     const ministry = minDoc.data() || {};
     const leaderIds = Array.isArray(ministry.leaderIds) ? ministry.leaderIds : [];
 
-    // Requester name
     let requesterName = 'Member';
     if (memberId) {
       const memSnap = await db.doc(`members/${memberId}`).get();
@@ -392,7 +473,7 @@ exports.onJoinRequestCreated = onDocumentCreated(
           payload: {
             joinRequestId: doc.id,
             memberId,
-            ministryId: ministryName, // legacy naming in app
+            ministryId: ministryName,
             ministryName,
             requesterName,
           },
@@ -405,7 +486,7 @@ exports.onJoinRequestCreated = onDocumentCreated(
 );
 
 /* =========================================================
-   4) JOIN REQUESTS: notify requester on status change
+   4) Notify requester when join request status changes
    ========================================================= */
 exports.onJoinRequestUpdated = onDocumentUpdated(
   'join_requests/{id}',
@@ -415,8 +496,8 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     if (!before || !after) return;
 
     const prev = S(before.status || 'pending');
-    const next = S(after.status || 'pending');
-    if (prev === next) return;
+    theNext = S(after.status || 'pending');
+    if (prev === theNext) return;
 
     const memberId = S(after.memberId);
     const ministryName = S(after.ministryId);
@@ -428,7 +509,7 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     }
     if (!toUid) return;
 
-    const pretty = next.charAt(0).toUpperCase() + next.slice(1);
+    const pretty = theNext.charAt(0).toUpperCase() + theNext.slice(1);
     await writeInbox(toUid, {
       type: 'join_request_status',
       channel: 'joinreq',
@@ -439,12 +520,146 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
       payload: {
         joinRequestId: event.params.id,
         memberId,
-        ministryId: ministryName, // legacy
+        ministryId: ministryName,
         ministryName,
-        status: next,
+        status: theNext,
       },
       route: '/my-join-requests',
-      dedupeKey: `jr_me_${event.params.id}_${next}_${toUid}`,
+      dedupeKey: `jr_me_${event.params.id}_${theNext}_${toUid}`,
     });
   }
 );
+
+/* =========================================================
+   5) Notify pastors when a prayer request is submitted
+   ========================================================= */
+exports.onPrayerRequestCreated = onDocumentCreated(
+  'prayerRequests/{id}',
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const r = snap.data() || {};
+    const name = S(r.name) || (r.isAnonymous ? 'Anonymous' : '');
+    const email = S(r.email);
+    const message = S(r.message || r.request);
+    const requesterUid = S(r.requestedByUid);
+    const channel = 'prayer';
+
+    const pastorUids = await listPastorUids();
+    if (!pastorUids.length) {
+      logger.warn('No pastors to notify for prayer request');
+      return;
+    }
+
+    const title = 'New prayer request';
+    const body = name ? `${name}: ${message}` : message;
+
+    await Promise.all(
+      pastorUids.map((uid) =>
+        writeInbox(uid, {
+          type: 'prayer_request_created',
+          channel,
+          title,
+          body,
+          payload: {
+            prayerRequestId: snap.id,
+            name: name || null,
+            email: email || null,
+            isAnonymous: !!r.isAnonymous,
+            requestedByUid: requesterUid || null,
+          },
+          route: '/prayer-requests',
+          dedupeKey: `pr_${snap.id}_${uid}`,
+        })
+      )
+    );
+  }
+);
+
+/* =========================================================
+   6) CALLABLES — role sync
+   ========================================================= */
+exports.setMemberPastorRole = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+  const { memberId, makePastor } = req.data || {};
+  if (!memberId || typeof makePastor !== 'boolean') throw new Error('invalid-argument');
+
+  const allowed = await isUserPastorOrAdmin(uid);
+  if (!allowed) throw new Error('permission-denied');
+
+  await updateMemberAndLinkedUserRoles(memberId, {
+    add: makePastor ? ['pastor'] : [],
+    remove: makePastor ? [] : ['pastor'],
+    setFlags: { isPastor: !!makePastor },
+  });
+
+  return { ok: true };
+});
+
+exports.setMemberRoles = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  const allowed = await isUserPastorOrAdmin(uid);
+  if (!allowed) throw new Error('permission-denied');
+
+  const memberIds = uniq(asArray(req.data?.memberIds).map(S).filter(Boolean));
+  const rolesAdd = normalizeRoles(req.data?.rolesAdd || []);
+  const rolesRemove = normalizeRoles(req.data?.rolesRemove || []);
+  if (!memberIds.length) throw new Error('invalid-argument: memberIds empty');
+
+  let setPastorFlag;
+  if (rolesAdd.includes('pastor') && !rolesRemove.includes('pastor')) setPastorFlag = true;
+  else if (rolesRemove.includes('pastor') && !rolesAdd.includes('pastor')) setPastorFlag = false;
+
+  for (const mid of memberIds) {
+    await updateMemberAndLinkedUserRoles(mid, {
+      add: rolesAdd,
+      remove: rolesRemove,
+      setFlags: setPastorFlag === undefined ? {} : { isPastor: setPastorFlag },
+    });
+  }
+  return { ok: true, updated: memberIds.length };
+});
+
+exports.promoteMeToAdmin = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  const existingAdmins = await listUidsByRole('admin');
+  if (existingAdmins.length > 0) {
+    const isAdmin = (await getUserRoles(uid)).includes('admin');
+    if (!isAdmin) throw new Error('permission-denied');
+  }
+
+  await db.doc(`users/${uid}`).set(
+    { roles: admin.firestore.FieldValue.arrayUnion('admin'), updatedAt: ts() },
+    { merge: true }
+  );
+
+  const memberId = await getUserMemberId(uid);
+  if (memberId) {
+    await db.doc(`members/${memberId}`).set(
+      { roles: admin.firestore.FieldValue.arrayUnion('admin'), updatedAt: ts() },
+      { merge: true }
+    );
+  }
+
+  await syncClaimsForUid(uid);
+  return { ok: true };
+});
+
+exports.ensureMemberLeaderRole = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+  const { memberId } = req.data || {};
+  if (!memberId) throw new Error('invalid-argument');
+
+  const isAdmin = (await getUserRoles(uid)).includes('admin');
+  const myMemberId = await getUserMemberId(uid);
+  if (!(isAdmin || myMemberId === memberId)) throw new Error('permission-denied');
+
+  await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
+  return { ok: true };
+});
