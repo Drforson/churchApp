@@ -6,7 +6,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import '../core/firestore_paths.dart';
+import '../core/firestore_paths.dart'; // keep if you use FP.* elsewhere
 import 'ministry_feed_page.dart';
 
 class MinistryDetailsPage extends StatefulWidget {
@@ -97,10 +97,17 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
     }
   }
 
-  Future<void> _notifyRequester(String requesterMemberId, String joinRequestId, String result) async {
+  /// Notify the requester (stored under /notifications)
+  Future<void> _notifyRequester(
+      String requesterMemberId,
+      String joinRequestId,
+      String result,
+      ) async {
     // Resolve requester uid
     String? requesterUid;
-    final qs = await _db.collection('users').where('memberId', isEqualTo: requesterMemberId).limit(1).get();
+    final qs = await _db.collection('users')
+        .where('memberId', isEqualTo: requesterMemberId)
+        .limit(1).get();
     if (qs.docs.isNotEmpty) requesterUid = qs.docs.first.id;
 
     await _db.collection('notifications').add({
@@ -110,7 +117,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       'memberId': requesterMemberId,
       'joinRequestId': joinRequestId,
       'result': result, // approved | rejected
-      'recipientUid': requesterUid,
+      if (requesterUid != null) 'recipientUid': requesterUid,
       'createdAt': FieldValue.serverTimestamp(),
     });
   }
@@ -144,7 +151,9 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       await _notifyRequester(memberId, requestId, 'approved');
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request approved')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Request approved')),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -163,7 +172,9 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       await _notifyRequester(memberId, requestId, 'rejected');
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request rejected')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Request rejected')),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -179,13 +190,6 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
     }
 
     if (!_canAccess) {
-      final canRequest =
-          _uid != null &&
-              !_roles.map((e) => e.toLowerCase()).contains('admin') &&
-              !_roles.map((e) => e.toLowerCase()).contains('pastor') &&
-              !_memberMinistriesByName.contains(widget.ministryName) &&
-              _latestJoinStatus != 'pending';
-
       return Scaffold(
         appBar: AppBar(title: Text(widget.ministryName)),
         body: Center(
@@ -196,10 +200,16 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
               children: [
                 const Icon(Icons.lock_outline, size: 56),
                 const SizedBox(height: 12),
-                const Text("You don't have access to this ministry yet.", textAlign: TextAlign.center),
+                const Text(
+                  "You don't have access to this ministry yet.",
+                  textAlign: TextAlign.center,
+                ),
                 const SizedBox(height: 8),
                 if (_latestJoinStatus == 'pending')
-                  const Text('Your join request is pending approval.', style: TextStyle(fontStyle: FontStyle.italic)),
+                  const Text(
+                    'Your join request is pending approval.',
+                    style: TextStyle(fontStyle: FontStyle.italic),
+                  ),
               ],
             ),
           ),
@@ -224,7 +234,10 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
             onApprove: approveJoin,
             onReject: rejectJoin,
           ),
-          MinistryFeedPage(ministryId: widget.ministryId, ministryName: widget.ministryName),
+          MinistryFeedPage(
+            ministryId: widget.ministryId,
+            ministryName: widget.ministryName,
+          ),
           _OverviewTab(ministryId: widget.ministryId, ministryName: widget.ministryName),
         ],
       ),
@@ -268,9 +281,12 @@ class _MembersTabState extends State<_MembersTab> {
     final u = await _db.collection('users').doc(uid).get();
     final data = u.data() ?? {};
     final roles = (data['roles'] is List) ? List<String>.from(data['roles']) : <String>[];
-    final leaderMins = (data['leadershipMinistries'] is List) ? List<String>.from(data['leadershipMinistries']) : <String>[];
+    final leaderMins = (data['leadershipMinistries'] is List)
+        ? List<String>.from(data['leadershipMinistries'])
+        : <String>[];
     final can = roles.map((e) => e.toLowerCase()).contains('admin') ||
-        (roles.map((e) => e.toLowerCase()).contains('leader') && leaderMins.contains(widget.ministryName));
+        (roles.map((e) => e.toLowerCase()).contains('leader') &&
+            leaderMins.contains(widget.ministryName));
     if (mounted) setState(() => _isLeaderOrAdmin = can);
   }
 
@@ -286,7 +302,11 @@ class _MembersTabState extends State<_MembersTab> {
         final last = (data['lastName'] ?? '').toString();
         final name = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
         final email = (data['email'] ?? '').toString();
-        return {'memberId': d.id, 'name': name.isEmpty ? 'Unnamed Member' : name, 'email': email};
+        return {
+          'memberId': d.id,
+          'name': name.isEmpty ? 'Unnamed Member' : name,
+          'email': email,
+        };
       }).toList();
     });
   }
@@ -303,7 +323,11 @@ class _MembersTabState extends State<_MembersTab> {
       for (final doc in qs.docs) {
         final r = doc.data();
         final memberId = (r['memberId'] ?? '').toString();
-        final requestedAt = (r['requestedAt'] is Timestamp) ? (r['requestedAt'] as Timestamp).toDate() : null;
+        final requestedAt = (r['requestedAt'] is Timestamp)
+            ? (r['requestedAt'] as Timestamp).toDate()
+            : null;
+
+        // Resolve full name now (so we show a human name, not the uid)
         String fullName = 'Unknown Member';
         if (memberId.isNotEmpty) {
           final m = await _db.collection('members').doc(memberId).get();
@@ -311,11 +335,19 @@ class _MembersTabState extends State<_MembersTab> {
             final md = m.data()!;
             final fn = (md['firstName'] ?? '').toString();
             final ln = (md['lastName'] ?? '').toString();
-            final nm = ('$fn $ln').trim();
-            if (nm.isNotEmpty) fullName = nm;
+            final fl = ('$fn $ln').trim();
+            fullName = (md['fullName'] is String && (md['fullName'] as String).trim().isNotEmpty)
+                ? (md['fullName'] as String).trim()
+                : (fl.isNotEmpty ? fl : fullName);
           }
         }
-        out.add({'id': doc.id, 'memberId': memberId, 'fullName': fullName, 'requestedAt': requestedAt});
+
+        out.add({
+          'id': doc.id,
+          'memberId': memberId,
+          'fullName': fullName,
+          'requestedAt': requestedAt,
+        });
       }
       return out;
     });
@@ -330,7 +362,8 @@ class _MembersTabState extends State<_MembersTab> {
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
             child: Align(
               alignment: Alignment.centerLeft,
-              child: Text('Pending Join Requests', style: Theme.of(context).textTheme.titleMedium),
+              child: Text('Pending Join Requests',
+                  style: Theme.of(context).textTheme.titleMedium),
             ),
           ),
         if (_isLeaderOrAdmin)
@@ -352,6 +385,7 @@ class _MembersTabState extends State<_MembersTab> {
                     final when = (r['requestedAt'] is DateTime)
                         ? DateFormat('dd MMM, HH:mm').format(r['requestedAt'] as DateTime)
                         : '—';
+
                     return SizedBox(
                       width: 300,
                       child: Card(
@@ -360,24 +394,45 @@ class _MembersTabState extends State<_MembersTab> {
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text(r['fullName'] ?? 'Unknown', style: Theme.of(context).textTheme.titleMedium),
-                              const SizedBox(height: 4),
-                              Text('Member: ${r['memberId']}', style: Theme.of(context).textTheme.bodySmall),
-                              Text('Requested: $when', style: Theme.of(context).textTheme.bodySmall),
+                              // Full name (not uid)
+                              Text(
+                                r['fullName'] ?? 'Unknown Member',
+                                style: Theme.of(context).textTheme.titleMedium,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              const SizedBox(height: 2),
+                              // Show memberId very subtly below, if you want to keep it.
+                              Text(
+                                'ID: ${r['memberId']}',
+                                style: Theme.of(context).textTheme.bodySmall,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'Requested: $when',
+                                style: Theme.of(context).textTheme.bodySmall,
+                                overflow: TextOverflow.ellipsis,
+                              ),
                               const Spacer(),
                               Row(
                                 mainAxisAlignment: MainAxisAlignment.end,
                                 children: [
-                                  TextButton.icon(
-                                    onPressed: () => widget.onReject(r['id'], r['memberId']),
-                                    icon: const Icon(Icons.cancel),
-                                    label: const Text('Reject'),
+                                  // RED X (reject)
+                                  IconButton(
+                                    tooltip: 'Reject',
+                                    onPressed: () =>
+                                        widget.onReject(r['id'], r['memberId']),
+                                    icon: const Icon(Icons.close),
+                                    color: Colors.red,
                                   ),
-                                  const SizedBox(width: 8),
-                                  ElevatedButton.icon(
-                                    onPressed: () => widget.onApprove(r['id'], r['memberId']),
+                                  const SizedBox(width: 6),
+                                  // GREEN CHECK (approve)
+                                  IconButton(
+                                    tooltip: 'Approve',
+                                    onPressed: () =>
+                                        widget.onApprove(r['id'], r['memberId']),
                                     icon: const Icon(Icons.check_circle),
-                                    label: const Text('Approve'),
+                                    color: Colors.green,
                                   ),
                                 ],
                               ),
@@ -429,40 +484,62 @@ class _OverviewTab extends StatelessWidget {
   Widget build(BuildContext context) {
     final db = FirebaseFirestore.instance;
 
-    final membersQ = db.collection('members').where('ministries', arrayContains: ministryName);
-    final leadersQ = db.collection('members').where('leadershipMinistries', arrayContains: ministryName);
-    final postsQ = db.collection('ministries').doc(ministryId).collection('posts')
-        .orderBy('createdAt', descending: true).limit(5);
+    final membersQ =
+    db.collection('members').where('ministries', arrayContains: ministryName);
+    final leadersQ =
+    db.collection('members').where('leadershipMinistries', arrayContains: ministryName);
+    final postsQ = db
+        .collection('ministries')
+        .doc(ministryId)
+        .collection('posts')
+        .orderBy('createdAt', descending: true)
+        .limit(5);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
-          FutureBuilder<QuerySnapshot>(future: membersQ.get(), builder: (context, snap) {
-            final count = snap.data?.docs.length ?? 0;
-            return _StatCard(label: 'Members', value: count.toString());
-          }),
+          FutureBuilder<QuerySnapshot>(
+            future: membersQ.get(),
+            builder: (context, snap) {
+              final count = snap.data?.docs.length ?? 0;
+              return _StatCard(label: 'Members', value: count.toString());
+            },
+          ),
           const SizedBox(height: 12),
-          FutureBuilder<QuerySnapshot>(future: leadersQ.get(), builder: (context, snap) {
-            final count = snap.data?.docs.length ?? 0;
-            return _StatCard(label: 'Leaders', value: count.toString());
-          }),
+          FutureBuilder<QuerySnapshot>(
+            future: leadersQ.get(),
+            builder: (context, snap) {
+              final count = snap.data?.docs.length ?? 0;
+              return _StatCard(label: 'Leaders', value: count.toString());
+            },
+          ),
           const SizedBox(height: 12),
-          Align(alignment: Alignment.centerLeft,
-              child: Text('Recent Posts', style: Theme.of(context).textTheme.titleMedium)),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text('Recent Posts', style: Theme.of(context).textTheme.titleMedium),
+          ),
           const SizedBox(height: 8),
           StreamBuilder<QuerySnapshot>(
             stream: postsQ.snapshots(),
             builder: (context, snap) {
-              if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+              if (!snap.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
               final docs = snap.data!.docs;
-              if (docs.isEmpty) return const Text('No posts yet.');
+              if (docs.isEmpty) {
+                return const Text('No posts yet.');
+              }
               return Column(
                 children: docs.map((d) {
                   final data = d.data() as Map<String, dynamic>;
                   final title = (data['title'] ?? 'Untitled').toString();
-                  final createdAt = (data['createdAt'] is Timestamp) ? (data['createdAt'] as Timestamp).toDate() : null;
-                  final when = createdAt != null ? DateFormat('dd MMM yyyy, HH:mm').format(createdAt) : '—';
+                  final createdAt = (data['createdAt'] is Timestamp)
+                      ? (data['createdAt'] as Timestamp).toDate()
+                      : null;
+                  final when = createdAt != null
+                      ? DateFormat('dd MMM yyyy, HH:mm').format(createdAt)
+                      : '—';
                   return ListTile(
                     contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.article),
