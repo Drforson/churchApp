@@ -322,7 +322,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
                             ],
                           ),
                         );
-                      }).toList(),
+                      }),
                     ],
                   ),
                 ),
@@ -390,7 +390,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
                   tooltip: 'Send Birthday Wish',
                 ),
               );
-            }).toList(),
+            }),
           ],
         );
       }).toList(),
@@ -420,7 +420,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
       Colors.cyan.shade200,
     ];
 
-    Icon _getMinistryIcon(String name) {
+    Icon getMinistryIcon(String name) {
       final lower = name.toLowerCase();
       if (lower.contains('choir')) return const Icon(Icons.music_note, color: Colors.black);
       if (lower.contains('usher')) return const Icon(Icons.event_seat, color: Colors.black);
@@ -460,7 +460,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
               ),
               child: Row(
                 children: [
-                  _getMinistryIcon(ministryName),
+                  getMinistryIcon(ministryName),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(

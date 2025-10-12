@@ -566,7 +566,9 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
             final cur = _searchResults[i];
             final next = cur.roles.map((e) => e.toLowerCase()).toSet();
             next.addAll(addSet);
-            for (final r in removeSet) next.remove(r);
+            for (final r in removeSet) {
+              next.remove(r);
+            }
             _searchResults[i] = cur.copyWith(roles: next.toList());
           }
         }
@@ -783,7 +785,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         // Members with no ministry
         final List<Map<String, dynamic>> noMinistry = filtered.where((m) {
           final mins = m['ministries'];
-          return !(mins is List) || mins.isEmpty;
+          return mins is! List || mins.isEmpty;
         }).toList();
 
         // 🔸 Compute roles present on selected members (allowed only)

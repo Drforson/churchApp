@@ -1,4 +1,4 @@
-import 'package:church_management_app/services/notification_center.dart';
+import 'package:church_management_app/pages/feedback_page.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -432,6 +432,10 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
 
     case '/success':
       return MaterialPageRoute(builder: (_) => const SuccessPage());
+
+    case '/feedback':
+      return MaterialPageRoute(builder: (_) => const FeedbackPage());
+
 
     default:
       return MaterialPageRoute(

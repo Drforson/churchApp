@@ -596,9 +596,7 @@ class _EventEditorSheetState extends State<EventEditorSheet> {
                     icon: const Icon(Icons.schedule),
                     label: Text(_start == null
                         ? 'Pick start'
-                        : MaterialLocalizations.of(context).formatFullDate(_start!) +
-                        ' • ' +
-                        TimeOfDay.fromDateTime(_start!).format(context)),
+                        : '${MaterialLocalizations.of(context).formatFullDate(_start!)} • ${TimeOfDay.fromDateTime(_start!).format(context)}'),
                   ),
                 ),
               ],
@@ -612,9 +610,7 @@ class _EventEditorSheetState extends State<EventEditorSheet> {
                     icon: const Icon(Icons.schedule_send),
                     label: Text(_end == null
                         ? 'Pick end (optional)'
-                        : MaterialLocalizations.of(context).formatFullDate(_end!) +
-                        ' • ' +
-                        TimeOfDay.fromDateTime(_end!).format(context)),
+                        : '${MaterialLocalizations.of(context).formatFullDate(_end!)} • ${TimeOfDay.fromDateTime(_end!).format(context)}'),
                   ),
                 ),
               ],

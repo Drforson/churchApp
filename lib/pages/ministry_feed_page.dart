@@ -141,7 +141,7 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
       // fallbacks if no member record
       authorName ??= user.displayName?.trim();
       authorName ??= (user.email ?? '').trim();
-      if (authorName!.isEmpty) authorName = 'Member';
+      if (authorName.isEmpty) authorName = 'Member';
 
       await _svc.createPost(
         ministryId: widget.ministryId,

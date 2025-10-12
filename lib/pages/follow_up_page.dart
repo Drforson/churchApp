@@ -17,9 +17,9 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   final _db = FirebaseFirestore.instance;
 
   // Role
-  bool _isAdmin = false;
-  bool _isLeader = false;
-  Set<String> _leadershipMinistries = {};
+  final bool _isAdmin = false;
+  final bool _isLeader = false;
+  final Set<String> _leadershipMinistries = {};
 
   // Date
   String? _selectedDateKey;
@@ -302,9 +302,9 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                       final ts = m['createdAt'] as Timestamp?;
                       if (ts == null || selectedDate == null) return false;
                       final created = ts.toDate();
-                      return created.year == selectedDate!.year &&
-                          created.month == selectedDate!.month &&
-                          created.day == selectedDate!.day;
+                      return created.year == selectedDate.year &&
+                          created.month == selectedDate.month &&
+                          created.day == selectedDate.day;
                     }).length;
 
                     // Birthdays in selected week
@@ -314,8 +314,8 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                       if (ts == null || selectedDate == null || weekStart == null) return false;
                       final b = ts.toDate();
                       // compare by month/day
-                      final inRange = !b.isBefore(weekStart) && !b.isAfter(selectedDate!);
-                      return inRange && (b.month == selectedDate!.month); // keep same month check (optional)
+                      final inRange = !b.isBefore(weekStart) && !b.isAfter(selectedDate);
+                      return inRange && (b.month == selectedDate.month); // keep same month check (optional)
                     }).length;
 
                     return Column(

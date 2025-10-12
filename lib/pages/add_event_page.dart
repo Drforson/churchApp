@@ -4,7 +4,7 @@ import 'package:intl/intl.dart';
 import '../models/event_model.dart';
 
 class AddEventPage extends StatefulWidget {
-  const AddEventPage({Key? key}) : super(key: key);
+  const AddEventPage({super.key});
 
   @override
   State<AddEventPage> createState() => _AddEventPageState();

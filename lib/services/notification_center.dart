@@ -31,16 +31,16 @@ class InboxEvent {
     DateTime? created;
     if (ts is Timestamp) created = ts.toDate();
 
-    String? _cleanStr(dynamic v) {
+    String? cleanStr(dynamic v) {
       final s = (v ?? '').toString().trim();
       return s.isEmpty ? null : s;
     }
 
     return InboxEvent(
       id: doc.id,
-      title: _cleanStr(data['title']),
-      body: _cleanStr(data['body']),
-      type: _cleanStr(data['type']),
+      title: cleanStr(data['title']),
+      body: cleanStr(data['body']),
+      type: cleanStr(data['type']),
       createdAt: created,
       read: (data['read'] is bool) ? data['read'] as bool : false,
       raw: data,

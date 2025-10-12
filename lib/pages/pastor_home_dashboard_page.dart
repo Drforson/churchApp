@@ -557,8 +557,9 @@ class _PastorActionsGrid extends StatelessWidget {
           '/manage-prayer-requests'),
       _PastorActionItem('Baptism', Icons.water_drop_rounded, '/manage-baptism'),
       _PastorActionItem('Profile', Icons.person_rounded, '/profile'),
-      _PastorActionItem('Post Announcement', Icons.campaign_rounded,
-          '/post-announcements'),
+      _PastorActionItem('Post Announcement', Icons.campaign_rounded,'/post-announcements'),
+          _PastorActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),
+
     ];
 
     return LayoutBuilder(

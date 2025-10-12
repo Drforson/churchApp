@@ -66,13 +66,6 @@ class _ExcelDatabaseUploaderState extends State<ExcelDatabaseUploader> {
     final excel = Excel.decodeBytes(bytes);
 
     final sheet = excel['Form responses 1'];
-    if (sheet == null) {
-      setState(() {
-        _uploading = false;
-        _statusMessage = 'Sheet not found in Excel file.';
-      });
-      return;
-    }
 
     final membersCollection = FirebaseFirestore.instance.collection('members');
     final ministriesCollection = FirebaseFirestore.instance.collection('ministries');

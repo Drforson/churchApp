@@ -105,7 +105,7 @@ class LinkPreviewService {
         title: ogTitle ?? twTitle ?? htmlTitle,
         description: ogDesc ?? twDesc ?? metaDesc,
         imageUrl: imageUrl,
-        faviconUrl: (favicon != null && favicon.isNotEmpty) ? favicon : null,
+        faviconUrl: (favicon.isNotEmpty) ? favicon : null,
       );
     } catch (_) {
       // CORS or site blocks scraping (esp. on Flutter web) → return null gracefully

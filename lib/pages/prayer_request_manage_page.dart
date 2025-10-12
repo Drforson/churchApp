@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 /// Must match the form page collection name
@@ -306,8 +305,9 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                 int cntNew = 0, cntPrayed = 0, cntArchived = 0;
                 for (final d in sorted) {
                   final s = (d.data()['status'] ?? 'new').toString().toLowerCase();
-                  if (s == 'prayed') cntPrayed++;
-                  else if (s == 'archived') cntArchived++;
+                  if (s == 'prayed') {
+                    cntPrayed++;
+                  } else if (s == 'archived') cntArchived++;
                   else cntNew++;
                 }
 

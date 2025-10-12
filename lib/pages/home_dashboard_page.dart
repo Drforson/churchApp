@@ -337,7 +337,7 @@ class _StatTile extends StatelessWidget {
           final week = List.generate(7, (i) => DateTime(now.year, now.month, now.day + i));
           int count = 0;
           for (final d in s.docs) {
-            final m = d.data() as Map<String, dynamic>;
+            final m = d.data();
             final ts = m['dateOfBirth'];
             if (ts is! Timestamp) continue;
             final dob = ts.toDate();
