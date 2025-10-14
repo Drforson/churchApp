@@ -57,9 +57,7 @@ async function getUser(uid) {
 /** NEW: single-role reader with legacy array fallback */
 async function getUserRole(uid) {
   const u = await getUser(uid);
-  // prefer single 'role'
   if (u && typeof u.role === 'string' && u.role) return toRole(u.role);
-  // legacy fallback from array 'roles'
   const arr = normalizeRoles(u?.roles ?? []);
   if (arr.includes('admin')) return 'admin';
   if (arr.includes('pastor')) return 'pastor';
@@ -93,18 +91,13 @@ async function getMember(uid) {
 /** UPDATED: list uids by role supports new single user.role and legacy users.roles[] */
 async function listUidsByRole(roleLc) {
   const set = new Set();
-
-  // New model: users where role == roleLc
   const q1 = await db.collection('users').where('role', '==', roleLc).get();
   q1.docs.forEach((d) => set.add(d.id));
-
-  // Legacy: users where roles array-contains variants
   const variants = [roleLc, roleLc.toUpperCase(), roleLc[0].toUpperCase() + roleLc.slice(1)];
   const legacyQs = await Promise.all(
     variants.map((r) => db.collection('users').where('roles', 'array-contains', r).get())
   );
   legacyQs.forEach((qs) => qs.docs.forEach((d) => set.add(d.id)));
-
   return Array.from(set);
 }
 
@@ -134,7 +127,6 @@ async function listMemberIdsByPastorOrAdmin() {
     qs.docs.forEach((d) => out.add(d.id));
   }
   {
-    // look for leadershipMinistries containing the word "pastor"
     const qs = await db.collection('members').where('leadershipMinistries', '!=', null).limit(500).get();
     qs.docs.forEach((d) => {
       const lm = d.data().leadershipMinistries || [];
@@ -177,11 +169,9 @@ async function listPastorAndAdminUids() {
 }
 
 async function isUserPastorOrAdmin(uid) {
-  // prefer single user.role
   const role = await getUserRole(uid);
   if (role === 'pastor' || role === 'admin') return true;
 
-  // custom claims
   try {
     const rec = await admin.auth().getUser(uid);
     const c = rec.customClaims || {};
@@ -190,7 +180,6 @@ async function isUserPastorOrAdmin(uid) {
     }
   } catch (_) {}
 
-  // member fallback
   const mem = await getMember(uid);
   if (mem) {
     const mroles = Array.isArray(mem.roles) ? mem.roles.map(toLc) : [];
@@ -286,14 +275,11 @@ async function updateMemberAndLinkedUserRoles(memberId, { add = [], remove = [],
   let uid = null;
   if (!usersQ.empty) {
     uid = usersQ.docs[0].id;
-
-    // We no longer write users.roles arrays. Let single role be recomputed from member.
     batch.set(usersQ.docs[0].ref, { updatedAt: ts() }, { merge: true });
   }
 
   await batch.commit();
 
-  // After member role changes, recompute user.role for a linked user (if present)
   if (uid) await recomputeAndWriteUserRole(uid);
 }
 
@@ -535,13 +521,8 @@ exports.processMinistryApprovalAction = onDocumentCreated(
         if (requestedByUid) {
           const memberId = await getUserMemberId(requestedByUid);
           if (memberId) {
-            // Add membership + leadership for requester
             await addMemberToMinistry(memberId, ministryName, { asLeader: true });
-
-            // Ensure 'leader' on member, then recompute single user.role
             await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
-
-            // Keep user.leadershipMinistries up to date (doesn't affect role)
             await db.doc(`users/${requestedByUid}`).set({
               leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
               updatedAt: ts(),
@@ -549,7 +530,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
           }
         }
 
-        // Notify requester & reviewer
         await notifyMinistryRequesterResult({
           requestId,
           requesterUid: requestedByUid || null,
@@ -611,6 +591,92 @@ exports.processMinistryApprovalAction = onDocumentCreated(
         processed: true,
         processedAt: new Date(),
       });
+    }
+  }
+);
+
+/* =========================================================
+   1b) ALSO handle direct status flip to "approved"
+   ========================================================= */
+exports.onMinistryRequestApproved = onDocumentUpdated(
+  'ministry_creation_requests/{id}',
+  async (event) => {
+    const before = event.data?.before?.data();
+    const after  = event.data?.after?.data();
+    if (!before || !after) return;
+
+    const prev = String(before.status || 'pending').toLowerCase();
+    const next = String(after.status  || 'pending').toLowerCase();
+
+    // Only act on actual transition to approved
+    if (prev === 'approved' || next !== 'approved') return;
+
+    const reqRef = event.data.after.ref;
+
+    // If already processed (has approvedMinistryId), do nothing (idempotent)
+    if (after.approvedMinistryId) return;
+
+    const ministryName   = (after.name || after.ministryName || '').toString().trim();
+    const description    = (after.description || '').toString();
+    const requestedByUid = (after.requestedByUid || '').toString().trim();
+    const reviewerUid    = (after.approvedByUid || '').toString().trim() || 'system';
+
+    if (!ministryName) {
+      await reqRef.update({ status: 'error', error: 'missing-ministry-name', updatedAt: ts() });
+      return;
+    }
+
+    // Prevent duplicate names: if ministry with this name exists, just bind it to the request
+    const existing = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+    if (!existing.empty) {
+      const minDoc = existing.docs[0];
+      await reqRef.update({
+        approvedMinistryId: minDoc.id,
+        updatedAt: ts(),
+      });
+
+      if (requestedByUid) {
+        const memberId = await getUserMemberId(requestedByUid);
+        if (memberId) {
+          await addMemberToMinistry(memberId, ministryName, { asLeader: true });
+          await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
+          await db.doc(`users/${requestedByUid}`).set({
+            leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
+            updatedAt: ts(),
+          }, { merge: true });
+        }
+      }
+      return;
+    }
+
+    // Create new ministry, link requester as leader (if we can resolve their member)
+    const minRef = db.collection('ministries').doc();
+    await db.runTransaction(async (txn) => {
+      txn.set(minRef, {
+        id: minRef.id,
+        name: ministryName,
+        description,
+        approved: true,
+        createdAt: ts(),
+        createdBy: reviewerUid || 'system',
+        leaderUids: requestedByUid ? [requestedByUid] : [],
+      });
+      txn.update(reqRef, {
+        approvedMinistryId: minRef.id,
+        updatedAt: ts(),
+      });
+    });
+
+    if (requestedByUid) {
+      const memberId = await getUserMemberId(requestedByUid);
+      if (memberId) {
+        await addMemberToMinistry(memberId, ministryName, { asLeader: true });
+        await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
+        await db.doc(`users/${requestedByUid}`).set({
+          leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
+          updatedAt: ts(),
+        }, { merge: true });
+      }
     }
   }
 );
@@ -729,7 +795,6 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
 
     const moderatorUid = S(after.moderatorUid) || null;
 
-    // Notify requester about the result
     if (theNext === 'approved' || theNext === 'rejected') {
       logger.info('join_requests STATUS CHANGE', {
         id: event.params.id, from: prev, to: theNext, memberId, ministryName,
@@ -745,7 +810,6 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
       });
     }
 
-    // If approved, add member to ministry memberships (idempotent)
     if (theNext === 'approved') {
       await addMemberToMinistry(memberId, ministryName, { asLeader: false });
     }
@@ -857,14 +921,12 @@ exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
   const uid = req.auth?.uid;
   if (!uid) throw new Error('unauthenticated');
 
-  // prefer Auth email
   const authUser = await admin.auth().getUser(uid);
   const emailLc = (authUser.email || '').trim().toLowerCase();
 
   let user = await getUser(uid);
   const now = ts();
 
-  // try resolve member by linked memberId or email
   let memberSnap = null;
   if (user?.memberId) {
     const m = await db.doc(`members/${user.memberId}`).get();
@@ -951,13 +1013,11 @@ exports.promoteMeToAdmin = onCall(async (req) => {
     if (myRole !== 'admin') throw new Error('permission-denied');
   }
 
-  // Set single user.role = 'admin'
   await db.doc(`users/${uid}`).set(
     { role: 'admin', updatedAt: ts() },
     { merge: true }
   );
 
-  // Ensure member has 'admin' in roles array (optional for church record)
   const memberId = await getUserMemberId(uid);
   if (memberId) {
     await db.doc(`members/${memberId}`).set(
@@ -980,16 +1040,13 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
     throw new Error('invalid-argument');
   }
 
-  // Allow if caller is pastor/admin OR a leader of this ministry
   const privileged = await isUserPastorOrAdmin(callerUid);
   const leadsThis = privileged ? true : await isUserLeaderOfMinistry(callerUid, ministryName);
   if (!leadsThis) throw new Error('permission-denied');
 
-  // Resolve linked user (for claims + ministries.leaderUids sync)
   const usersQ = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
   const linkedUid = usersQ.empty ? null : usersQ.docs[0].id;
 
-  // Update member doc
   const memberRef = db.doc(`members/${memberId}`);
   const batch = db.batch();
 
@@ -1003,7 +1060,6 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
   }
   batch.set(memberRef, memberUpdate, { merge: true });
 
-  // Keep user.leadershipMinistries in sync (doesn't control role directly)
   if (!usersQ.empty) {
     const userRef = usersQ.docs[0].ref;
     const userUpdate = { updatedAt: ts() };
@@ -1015,7 +1071,6 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
     batch.set(userRef, userUpdate, { merge: true });
   }
 
-  // Mirror to ministries.leaderUids if ministry exists
   const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
   if (!mins.empty && linkedUid) {
     const minRef = mins.docs[0].ref;
@@ -1030,7 +1085,6 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
 
   await batch.commit();
 
-  // After member change, recompute linked user's single role
   if (linkedUid) await recomputeAndWriteUserRole(linkedUid);
 
   logger.info('leaderSetMemberLeaderRole', {
