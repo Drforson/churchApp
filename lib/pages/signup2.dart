@@ -21,7 +21,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
   final _firstNameController = TextEditingController();
   final _lastNameController = TextEditingController();
   final _phoneNumberController = TextEditingController();
-  String? _selectedGender; // UI shows Title-case, we store lowercase on write
+  String? _selectedGender; // UI shows Title-case, store lowercase on write
   DateTime? _selectedDate;
   List<String> _ministries = [];
 
@@ -39,12 +39,20 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
     _loadMemberData();
   }
 
+  @override
+  void dispose() {
+    _firstNameController.dispose();
+    _lastNameController.dispose();
+    _phoneNumberController.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadMemberData() async {
     try {
-      // Try preload by email (the page’s identity signal)
+      final emailLc = widget.email.trim().toLowerCase();
       final snapshot = await FirebaseFirestore.instance
           .collection('members')
-          .where('email', isEqualTo: widget.email)
+          .where('email', isEqualTo: emailLc)
           .limit(1)
           .get();
 
@@ -92,7 +100,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
       setState(() => _phoneNumberConflict = false);
       return;
     }
-    final exists = await _authService.checkPhoneNumberExists(phoneNumber);
+    final exists = await _authService.checkPhoneNumberExists(phoneNumber.trim());
     setState(() => _phoneNumberConflict = exists);
   }
 
@@ -101,10 +109,10 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
       setState(() => _emailConflict = false);
       return;
     }
-
+    final emailLc = email.trim().toLowerCase();
     final snapshot = await FirebaseFirestore.instance
         .collection('members')
-        .where('email', isEqualTo: email)
+        .where('email', isEqualTo: emailLc)
         .get();
 
     bool conflict = false;
@@ -117,109 +125,74 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
     setState(() => _emailConflict = conflict);
   }
 
-  Future<void> _ensureUserDoc(String uid, String? authEmail) async {
-    await FirebaseFirestore.instance.collection('users').doc(uid).set(
-      {
-        'createdAt': FieldValue.serverTimestamp(),
-        if (authEmail != null && authEmail.isNotEmpty) 'email': authEmail.trim(),
-      },
-      SetOptions(merge: true),
-    );
-  }
-
   Future<void> _submit() async {
     if (!_isFormValid) return;
 
     setState(() => _loading = true);
 
-    final auth = FirebaseAuth.instance;
-    final user = auth.currentUser;
-    final uid = widget.uid;
-    final authEmail = user?.email ?? widget.email; // fallback to widget.email
-
     try {
-      // Always ensure users/{uid} exists before any member write (defensive for rules/helpers)
-      await _ensureUserDoc(uid, authEmail);
+      final auth = FirebaseAuth.instance;
+      final user = auth.currentUser;
+      final uid = widget.uid;
+      final authEmail = (user?.email ?? widget.email).trim().toLowerCase();
 
       final first = _firstNameController.text.trim();
       final last = _lastNameController.text.trim();
       final fullName = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
       final phone = _phoneNumberController.text.trim();
       final genderLower = (_selectedGender ?? '').toLowerCase().trim();
-
-      // Allowed profile fields for UPDATE
-      final updatePayload = <String, dynamic>{
-        'firstName': first,
-        'lastName': last,
-        'fullName': fullName,
-        'phoneNumber': phone,
-        'gender': genderLower,
-        'dateOfBirth': Timestamp.fromDate(_selectedDate!),
-        'updatedAt': FieldValue.serverTimestamp(),
-      };
+      final dobTs = Timestamp.fromDate(_selectedDate!);
+      final now = FieldValue.serverTimestamp();
 
       if (_isExistingMember && _existingMemberId != null) {
+        // ✅ Existing member path: link then self-update allowed fields
         final memberId = _existingMemberId!;
-        // ✅ RULE-ALIGNED: link first, then update member
+
+        // Link user → member (unblocks self-updates per rules)
         await FirebaseFirestore.instance.collection('users').doc(uid).set(
           {
             'memberId': memberId,
-            'linkedAt': FieldValue.serverTimestamp(),
+            'email': authEmail,
+            'updatedAt': now,
+            'linkedAt': now,
           },
           SetOptions(merge: true),
         );
+
+        // Self-editable fields (match Firestore rules allowlist)
+        final updatePayload = <String, dynamic>{
+          'firstName': first,
+          'lastName': last,
+          'fullName': fullName,
+          'email': authEmail,
+          'phoneNumber': phone,
+          'gender': genderLower,
+          'dateOfBirth': dobTs,
+          'updatedAt': now,
+        };
 
         await FirebaseFirestore.instance
             .collection('members')
             .doc(memberId)
             .update(updatePayload);
 
+        // Optional: force token refresh → claims/UI pick up latest
+        await auth.currentUser?.getIdToken(true);
       } else {
-        // ✅ RULE-ALIGNED CREATE: no 'id', no 'ministries', no 'email' on CREATE
-        final members = FirebaseFirestore.instance.collection('members');
-        final memberRef = members.doc();
-
-        final createMap = <String, dynamic>{
-          'firstName': first,
-          'lastName': last,
-          'fullName': fullName,
-          'phoneNumber': phone,
-          'gender': genderLower,
-          'dateOfBirth': Timestamp.fromDate(_selectedDate!),
-          'updatedAt': FieldValue.serverTimestamp(),
-          'createdAt': FieldValue.serverTimestamp(),
-          'createdByUid': uid,
-          'userUid': uid,
-          // (NO email, NO id, NO ministries here)
-        };
-
-        // Create
-        await memberRef.set(createMap);
-
-        // Link user → member (enables self-updates by rules)
-        await FirebaseFirestore.instance.collection('users').doc(uid).set(
-          {
-            'memberId': memberRef.id,
-            'linkedAt': FieldValue.serverTimestamp(),
-          },
-          SetOptions(merge: true),
+        // ✅ New member path: let AuthService handle creation + linking + role reconciliation
+        await _authService.completeMemberProfile(
+          uid: uid,
+          email: authEmail,
+          firstName: first,
+          lastName: last,
+          phoneNumber: phone,
+          gender: genderLower,
+          dateOfBirth: _selectedDate!,
         );
 
-        // (Optional) now set email in a separate UPDATE (self update allowed)
-        final typedEmail = widget.email.trim();
-        if (typedEmail.isNotEmpty) {
-          await memberRef.update({
-            'email': typedEmail,
-            'updatedAt': FieldValue.serverTimestamp(),
-          });
-        }
-
-        _existingMemberId = memberRef.id;
-        _isExistingMember = true;
+        // Optional: fresh token after claims sync
+        await FirebaseAuth.instance.currentUser?.getIdToken(true);
       }
-
-      // Token refresh is fine to keep
-      await auth.currentUser?.getIdToken(true);
 
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/success');
@@ -299,18 +272,21 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                       ),
                     ),
                   const SizedBox(height: 20),
+
                   TextFormField(
                     controller: _firstNameController,
                     decoration: const InputDecoration(labelText: 'First Name'),
                     validator: (val) => val == null || val.isEmpty ? 'First name is required' : null,
                   ),
                   const SizedBox(height: 12),
+
                   TextFormField(
                     controller: _lastNameController,
                     decoration: const InputDecoration(labelText: 'Last Name'),
                     validator: (val) => val == null || val.isEmpty ? 'Last name is required' : null,
                   ),
                   const SizedBox(height: 12),
+
                   TextFormField(
                     controller: _phoneNumberController,
                     decoration: InputDecoration(
@@ -321,7 +297,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                     ),
                     keyboardType: TextInputType.phone,
                     onChanged: (value) {
-                      if (value.length >= 9) _checkPhoneNumberConflict(value.trim());
+                      if (value.trim().length >= 9) _checkPhoneNumberConflict(value.trim());
                     },
                     validator: (val) {
                       if (val == null || val.isEmpty) return 'Phone number is required';
@@ -330,6 +306,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                     },
                   ),
                   const SizedBox(height: 12),
+
                   DropdownButtonFormField<String>(
                     decoration: const InputDecoration(labelText: 'Gender'),
                     items: const [
@@ -342,6 +319,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                     validator: (val) => val == null ? 'Please select gender' : null,
                   ),
                   const SizedBox(height: 12),
+
                   InkWell(
                     onTap: _selectDate,
                     child: InputDecorator(
@@ -357,7 +335,9 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                       ),
                     ),
                   ),
+
                   const SizedBox(height: 20),
+
                   if (_ministries.isNotEmpty)
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -379,7 +359,9 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
                     )
                   else
                     const Text('No ministries assigned yet.', style: TextStyle(color: Colors.grey)),
+
                   const SizedBox(height: 24),
+
                   ElevatedButton(
                     onPressed: _isFormValid && !_loading ? _submit : null,
                     style: ElevatedButton.styleFrom(

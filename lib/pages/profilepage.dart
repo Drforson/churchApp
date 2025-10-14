@@ -6,6 +6,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import 'package:church_management_app/services/auth_service.dart';
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -16,7 +18,8 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _auth = FirebaseAuth.instance;
   final _db = FirebaseFirestore.instance;
-  late final FirebaseFunctions _functions; // 👈 region-bound functions instance
+  late final FirebaseFunctions _functions; // 👈 europe-west2 functions
+  final _authService = AuthService();
 
   final _formKey = GlobalKey<FormState>();
 
@@ -48,14 +51,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-
-    // ✅ point to your deployed region (you set europe-west2 in index.js)
     _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
-
-    // If you use the emulator, uncomment ONE of these:
-    // _functions.useFunctionsEmulator('10.0.2.2', 5001); // Android emulator
-    // _functions.useFunctionsEmulator('localhost', 5001); // iOS sim / desktop
-
     _loadProfile();
   }
 
@@ -80,10 +76,10 @@ class _HomePageState extends State<HomePage> {
     }
 
     try {
-      // Ensure users/{uid} exists (safe for rules/helpers)
+      // Ensure users/{uid} exists (idempotent)
       await _db.collection('users').doc(user.uid).set({
         'createdAt': FieldValue.serverTimestamp(),
-        if (user.email != null) 'email': user.email!.trim(),
+        if (user.email != null) 'email': user.email!.trim().toLowerCase(),
       }, SetOptions(merge: true));
 
       if (_emailCtrl.text.trim().isEmpty && user.email != null) {
@@ -94,11 +90,12 @@ class _HomePageState extends State<HomePage> {
       final uSnap = await _db.collection('users').doc(user.uid).get();
       String? memberId = (uSnap.data()?['memberId'] as String?)?.trim();
 
-      // Try auto-attach by auth.email if not linked
-      if ((memberId == null || memberId.isEmpty) && user.email != null) {
+      // Try auto-link by email if not linked
+      final emailLc = (user.email ?? '').trim().toLowerCase();
+      if ((memberId == null || memberId.isEmpty) && emailLc.isNotEmpty) {
         final existing = await _db
             .collection('members')
-            .where('email', isEqualTo: user.email!.trim())
+            .where('email', isEqualTo: emailLc)
             .limit(1)
             .get();
         if (existing.docs.isNotEmpty) {
@@ -106,8 +103,13 @@ class _HomePageState extends State<HomePage> {
           await _db.collection('users').doc(user.uid).set({
             'memberId': foundId,
             'linkedAt': FieldValue.serverTimestamp(),
+            'updatedAt': FieldValue.serverTimestamp(),
           }, SetOptions(merge: true));
           memberId = foundId;
+
+          // Keep role & claims in sync immediately
+          await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call();
+          await user.getIdToken(true);
         }
       }
 
@@ -233,16 +235,22 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    final user = _auth.currentUser;
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Not signed in.')),
+      );
+      return;
+    }
+
     final first = _firstNameCtrl.text.trim();
     final last = _lastNameCtrl.text.trim();
     final fullName = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
-
-    // For updates (allowed profile fields)
     final Map<String, dynamic> profilePayload = {
       'firstName': first,
       'lastName': last,
       'fullName': fullName,
-      'email': _emailCtrl.text.trim(),
+      'email': _emailCtrl.text.trim().toLowerCase(),
       'phoneNumber': _phoneCtrl.text.trim(),
       'gender': (_genderStatus ?? '').trim(),
       'address': _addressCtrl.text.trim(),
@@ -258,46 +266,43 @@ class _HomePageState extends State<HomePage> {
     setState(() => _saving = true);
     try {
       if (_memberId == null) {
-        // ---------- CREATE via callable function (server-side) ----------
-        final user = _auth.currentUser;
-        if (user == null) throw Exception('Not signed in.');
+        // ---------- CREATE via AuthService (enforces email verification) ----------
+        final emailForMember = (_emailCtrl.text.trim().isNotEmpty
+            ? _emailCtrl.text.trim()
+            : (user.email ?? ''))
+            .toLowerCase();
 
-        // Ensure users/{uid} exists (harmless; function also merges)
-        await _db.collection('users').doc(user.uid).set({
-          'createdAt': FieldValue.serverTimestamp(),
-          if (user.email != null) 'email': user.email!.trim(),
-        }, SetOptions(merge: true));
+        await _authService.completeMemberProfile(
+          uid: user.uid,
+          email: emailForMember,
+          firstName: first,
+          lastName: last,
+          phoneNumber: _phoneCtrl.text.trim(),
+          gender: (_genderStatus ?? '').trim(),
+          dateOfBirth: _dob ?? DateTime(1900, 1, 1),
+        );
 
-        // 👇 Use region-bound instance
-        final callable = _functions.httpsCallable('createMember');
-        final res = await callable.call({
-          'firstName': first,
-          'lastName': last,
-          'fullName': fullName,
-          if (_phoneCtrl.text.trim().isNotEmpty) 'phoneNumber': _phoneCtrl.text.trim(),
-          if ((_genderStatus ?? '').trim().isNotEmpty) 'gender': (_genderStatus ?? '').trim(),
-          if (_addressCtrl.text.trim().isNotEmpty) 'address': _addressCtrl.text.trim(),
-          if (_emergencyNameCtrl.text.trim().isNotEmpty) 'emergencyContactName': _emergencyNameCtrl.text.trim(),
-          if (_emergencyPhoneCtrl.text.trim().isNotEmpty) 'emergencyContactNumber': _emergencyPhoneCtrl.text.trim(),
-          if ((_maritalStatus ?? '').trim().isNotEmpty) 'maritalStatus': (_maritalStatus ?? '').trim(),
-          if (_dob != null) 'dateOfBirth': _dob!.millisecondsSinceEpoch, // millis
-          if (_emailCtrl.text.trim().isNotEmpty) 'email': _emailCtrl.text.trim(),
-        });
+        // Re-sync role & claims immediately
+        await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call();
+        await user.getIdToken(true);
 
-        final data = Map<String, dynamic>.from(res.data as Map);
-        final newId = data['memberId'] as String;
-        setState(() => _memberId = newId);
+        // Fetch the linked memberId for local state
+        final uSnap = await _db.collection('users').doc(user.uid).get();
+        _memberId = uSnap.data()?['memberId'] as String?;
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(data['alreadyLinked'] == true
-                ? '✅ Already linked to your profile'
-                : '✅ Profile created & linked')),
+            const SnackBar(content: Text('✅ Profile created & linked')),
           );
         }
       } else {
         // ---------- UPDATE (client-side; allowed by rules) ----------
         await _db.collection('members').doc(_memberId!).update(profilePayload);
+
+        // Re-sync role & claims (in case member roles were edited elsewhere)
+        await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call();
+        await user.getIdToken(true);
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('✅ Profile updated')),
@@ -307,6 +312,11 @@ class _HomePageState extends State<HomePage> {
     } on FirebaseFunctionsException catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('❌ Cloud Function error: ${e.code} – ${e.message}')),
+      );
+    } on FirebaseAuthException catch (e) {
+      // This commonly catches the "email-not-verified" case from completeMemberProfile
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('❌ ${e.message ?? e.code}')),
       );
     } on FirebaseException catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -451,9 +461,7 @@ class _HomePageState extends State<HomePage> {
                   child: Row(
                     children: [
                       Text(
-                        _dob == null
-                            ? 'Tap to select'
-                            : DateFormat.yMMMMd().format(_dob!),
+                        _dob == null ? 'Tap to select' : DateFormat.yMMMMd().format(_dob!),
                         style: Theme.of(context).textTheme.bodyMedium,
                       ),
                       const Spacer(),
@@ -489,9 +497,7 @@ class _HomePageState extends State<HomePage> {
                   onPressed: _saving ? null : _save,
                   icon: const Icon(Icons.save_outlined),
                   label: Text(
-                    _saving
-                        ? 'Saving...'
-                        : (_memberId == null ? 'Create profile' : 'Save changes'),
+                    _saving ? 'Saving...' : (_memberId == null ? 'Create profile' : 'Save changes'),
                   ),
                 ),
               ),

@@ -69,20 +69,30 @@ class _MinistriesPageState extends State<MinistriesPage>
     try {
       final u = await _db.collection('users').doc(user.uid).get();
       final data = u.data() ?? {};
-      final roles = (data['roles'] is List)
-          ? List<String>.from((data['roles'] as List)
-          .map((e) => e.toString().toLowerCase()))
-          : <String>[];
 
-      _isAdmin = roles.contains('admin') || (data['isAdmin'] == true);
-      _isPastor = roles.contains('pastor') || (data['isPastor'] == true);
+      // ---- Single-role model (primary) ----
+      final role = (data['role'] ?? '').toString().toLowerCase().trim();
+
+      // ---- Legacy fallbacks tolerated by rules ----
+      final legacyRoles = (data['roles'] is List)
+          ? List<String>.from(
+          (data['roles'] as List).map((e) => e.toString().toLowerCase()))
+          : const <String>[];
+
+      _isAdmin = role == 'admin' || data['isAdmin'] == true || legacyRoles.contains('admin');
+      _isPastor = role == 'pastor' || data['isPastor'] == true || legacyRoles.contains('pastor');
 
       final lmUser = (data['leadershipMinistries'] is List)
           ? List<String>.from(
           (data['leadershipMinistries'] as List).map((e) => e.toString()))
-          : <String>[];
-      _isLeader = roles.contains('leader') ||
-          (data['isLeader'] == true) ||
+          : const <String>[];
+
+      // Treat admin/pastor as leaders for UI affordances
+      _isLeader = _isAdmin ||
+          _isPastor ||
+          role == 'leader' ||
+          data['isLeader'] == true ||
+          legacyRoles.contains('leader') ||
           lmUser.isNotEmpty;
 
       final mid = (data['memberId'] ?? '').toString().trim();
@@ -132,7 +142,7 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   bool _canAccessByName(String name) {
-    if (_isAdmin || _isPastor) return true;
+    if (_isAdmin || _isPastor) return true; // full access
     return _leaderMinistries.contains(name) || _memberMinistries.contains(name);
   }
 
@@ -202,11 +212,11 @@ class _MinistriesPageState extends State<MinistriesPage>
 
       final u = await _db.collection('users').doc(uid).get();
       final data = u.data() ?? {};
-      final email = data['email'] ?? '';
-      final mid = data['memberId'] ?? '';
+      final email = (data['email'] ?? '').toString();
+      final mid = (data['memberId'] ?? '').toString();
       String? fullName;
 
-      if (mid != null && mid.toString().isNotEmpty) {
+      if (mid.isNotEmpty) {
         final m = await _db.collection('members').doc(mid).get();
         final md = m.data() ?? {};
         fullName = (md['fullName'] ?? '').toString().trim();
@@ -259,8 +269,8 @@ class _MinistriesPageState extends State<MinistriesPage>
     }
 
     await _db.collection('join_requests').add({
-      'memberId': _memberId,
-      'ministryId': name,
+      'memberId': _memberId,            // must equal requesterMemberId() for rules
+      'ministryId': name,               // ministry NAME per your rules
       'requestedByUid': _uid,
       'status': 'pending',
       'requestedAt': FieldValue.serverTimestamp(),
@@ -275,10 +285,12 @@ class _MinistriesPageState extends State<MinistriesPage>
       .collection('ministries')
       .orderBy('name')
       .snapshots()
-      .map((qs) => qs.docs.map((d) {
-    final data = d.data();
-    return {'id': d.id, 'name': (data['name'] ?? '').toString()};
-  }).toList());
+      .map((qs) => qs.docs
+      .map((d) => {
+    'id': d.id,
+    'name': (d.data()['name'] ?? '').toString(),
+  })
+      .toList());
 
   Stream<List<Map<String, dynamic>>> _myCreationRequestsStream() {
     if (_uid == null) return const Stream.empty();
@@ -410,7 +422,16 @@ class _MinistriesPageState extends State<MinistriesPage>
                 if (!snap.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
-                final all = snap.data!;
+                // Filter by search query (case-insensitive)
+                final all = snap.data!
+                    .where((m) => _query.isEmpty
+                    ? true
+                    : m['name']
+                    .toString()
+                    .toLowerCase()
+                    .contains(_query.toLowerCase()))
+                    .toList();
+
                 final fullAccess = _isAdmin || _isPastor;
 
                 final mySet = fullAccess
@@ -424,7 +445,7 @@ class _MinistriesPageState extends State<MinistriesPage>
 
                 return ListView(
                   children: [
-                    // 🔸 Pending Requests Section (NEW)
+                    // 🔸 Pending Requests Section (leaders)
                     if (_isLeader)
                       StreamBuilder<List<Map<String, dynamic>>>(
                         stream: _myCreationRequestsStream(),
@@ -440,11 +461,10 @@ class _MinistriesPageState extends State<MinistriesPage>
                                 child: ListTile(
                                   title: Text(r['name']),
                                   trailing: Chip(
-                                    label: Text(r['status']
-                                        .toString()
-                                        .toUpperCase()),
-                                    backgroundColor: _statusColor(r['status'])
-                                        .withOpacity(0.15),
+                                    label: Text(
+                                        r['status'].toString().toUpperCase()),
+                                    backgroundColor:
+                                    _statusColor(r['status']).withOpacity(0.15),
                                     labelStyle: TextStyle(
                                         color: _statusColor(r['status'])),
                                   ),
@@ -498,8 +518,7 @@ class _MinistriesPageState extends State<MinistriesPage>
                         child: ListTile(
                           title: Text(r['name']),
                           trailing: Chip(
-                            label:
-                            Text(r['status'].toString().toUpperCase()),
+                            label: Text(r['status'].toString().toUpperCase()),
                             backgroundColor:
                             _statusColor(r['status']).withOpacity(0.15),
                             labelStyle:

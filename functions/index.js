@@ -14,6 +14,22 @@ const ts = admin.firestore.FieldValue.serverTimestamp;
 
 setGlobalOptions({ region: 'europe-west2' });
 
+/* ========= Role precedence (single user.role) ========= */
+const ROLE_ORDER = ['member', 'usher', 'leader', 'pastor', 'admin']; // ascending
+const toRole = (s) => (s ? String(s).toLowerCase().trim() : 'member');
+
+/** Highest by precedence from a user.role + member.roles + isPastor */
+function highestRoleFromArrays({ userRole, memberRoles = [], isPastorFlag = false }) {
+  const u = toRole(userRole);
+  const m = (Array.isArray(memberRoles) ? memberRoles : []).map(toRole);
+  if (isPastorFlag && !m.includes('pastor')) m.push('pastor');
+
+  const pool = new Set([u, ...m].filter(Boolean));
+  let best = 'member';
+  for (const r of ROLE_ORDER) if (pool.has(r)) best = r;
+  return best;
+}
+
 /* ========= Helpers ========= */
 const S = (v) => (v ?? '').toString().trim();
 const asArray = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
@@ -38,7 +54,22 @@ async function getUser(uid) {
   }
 }
 
-async function getUserRoles(uid) {
+/** NEW: single-role reader with legacy array fallback */
+async function getUserRole(uid) {
+  const u = await getUser(uid);
+  // prefer single 'role'
+  if (u && typeof u.role === 'string' && u.role) return toRole(u.role);
+  // legacy fallback from array 'roles'
+  const arr = normalizeRoles(u?.roles ?? []);
+  if (arr.includes('admin')) return 'admin';
+  if (arr.includes('pastor')) return 'pastor';
+  if (arr.includes('leader')) return 'leader';
+  if (arr.includes('usher')) return 'usher';
+  return 'member';
+}
+
+/** legacy: array roles reader retained for compatibility paths */
+async function getUserRolesLegacy(uid) {
   const u = await getUser(uid);
   return normalizeRoles(u?.roles ?? []);
 }
@@ -59,13 +90,21 @@ async function getMember(uid) {
   return memberId ? await getMemberById(memberId) : null;
 }
 
+/** UPDATED: list uids by role supports new single user.role and legacy users.roles[] */
 async function listUidsByRole(roleLc) {
+  const set = new Set();
+
+  // New model: users where role == roleLc
+  const q1 = await db.collection('users').where('role', '==', roleLc).get();
+  q1.docs.forEach((d) => set.add(d.id));
+
+  // Legacy: users where roles array-contains variants
   const variants = [roleLc, roleLc.toUpperCase(), roleLc[0].toUpperCase() + roleLc.slice(1)];
-  const results = await Promise.all(
+  const legacyQs = await Promise.all(
     variants.map((r) => db.collection('users').where('roles', 'array-contains', r).get())
   );
-  const set = new Set();
-  results.forEach((qs) => qs.docs.forEach((d) => set.add(d.id)));
+  legacyQs.forEach((qs) => qs.docs.forEach((d) => set.add(d.id)));
+
   return Array.from(set);
 }
 
@@ -107,7 +146,7 @@ async function listMemberIdsByPastorOrAdmin() {
   return Array.from(out);
 }
 
-/* Only pastors (users.roles or member signals) */
+/* Only pastors (user.role or member signals) */
 async function listPastorUids() {
   const fromUsers = await listUidsByRole('pastor');
   const candidateMemberIds = await listMemberIdsByPastorOrAdmin();
@@ -138,9 +177,11 @@ async function listPastorAndAdminUids() {
 }
 
 async function isUserPastorOrAdmin(uid) {
-  const roles = await getUserRoles(uid);
-  if (roles.includes('pastor') || roles.includes('admin')) return true;
+  // prefer single user.role
+  const role = await getUserRole(uid);
+  if (role === 'pastor' || role === 'admin') return true;
 
+  // custom claims
   try {
     const rec = await admin.auth().getUser(uid);
     const c = rec.customClaims || {};
@@ -149,6 +190,7 @@ async function isUserPastorOrAdmin(uid) {
     }
   } catch (_) {}
 
+  // member fallback
   const mem = await getMember(uid);
   if (mem) {
     const mroles = Array.isArray(mem.roles) ? mem.roles.map(toLc) : [];
@@ -180,25 +222,51 @@ async function isUserLeaderOfMinistry(uid, ministryName) {
   return leadsByUser || leadsByMinistry;
 }
 
+/* UPDATED: sync claims from single user.role */
 async function syncClaimsForUid(uid) {
   try {
-    const roles = await getUserRoles(uid);
+    const role = await getUserRole(uid);
     const claims = {
-      admin: roles.includes('admin') || undefined,
-      pastor: roles.includes('pastor') || undefined,
-      isAdmin: roles.includes('admin') || undefined,
-      isPastor: roles.includes('pastor') || undefined,
-      leader: roles.includes('leader') || undefined,
-      isLeader: roles.includes('leader') || undefined,
+      admin: role === 'admin' || undefined,
+      isAdmin: role === 'admin' || undefined,
+      pastor: role === 'pastor' || undefined,
+      isPastor: role === 'pastor' || undefined,
+      leader: role === 'leader' || undefined,
+      isLeader: role === 'leader' || undefined,
     };
     await admin.auth().setCustomUserClaims(uid, claims);
-    logger.info('syncClaimsForUid', { uid, claims });
+    logger.info('syncClaimsForUid', { uid, role, claims });
   } catch (e) {
     logger.error('syncClaimsForUid failed', { uid, error: e });
   }
 }
 
-/* Update member + linked user with roles */
+/* Helper: recompute & write user.role from linked member (if any) */
+async function recomputeAndWriteUserRole(uid) {
+  const user = await getUser(uid);
+  if (!user) return;
+
+  let memberSnap = null;
+  if (user.memberId) {
+    const m = await db.doc(`members/${user.memberId}`).get();
+    if (m.exists) memberSnap = m;
+  }
+
+  const memberData = memberSnap?.data() || null;
+  const highest = highestRoleFromArrays({
+    userRole: user.role || 'member',
+    memberRoles: memberData?.roles || [],
+    isPastorFlag: !!memberData?.isPastor,
+  });
+
+  await db.doc(`users/${uid}`).set(
+    { role: highest, updatedAt: ts() },
+    { merge: true }
+  );
+  await syncClaimsForUid(uid);
+}
+
+/* Update member + linked user (legacy roles arrays still supported) */
 async function updateMemberAndLinkedUserRoles(memberId, { add = [], remove = [], setFlags = {} } = {}) {
   const addLc = normalizeRoles(add);
   const remLc = normalizeRoles(remove);
@@ -218,18 +286,18 @@ async function updateMemberAndLinkedUserRoles(memberId, { add = [], remove = [],
   let uid = null;
   if (!usersQ.empty) {
     uid = usersQ.docs[0].id;
-    const userRef = usersQ.docs[0].ref;
-    const userUpdate = { updatedAt: ts() };
-    if (addLc.length) userUpdate.roles = admin.firestore.FieldValue.arrayUnion(...addLc);
-    if (remLc.length) userUpdate.roles = admin.firestore.FieldValue.arrayRemove(...remLc);
-    batch.update(userRef, userUpdate);
+
+    // We no longer write users.roles arrays. Let single role be recomputed from member.
+    batch.set(usersQ.docs[0].ref, { updatedAt: ts() }, { merge: true });
   }
 
   await batch.commit();
-  if (uid) await syncClaimsForUid(uid);
+
+  // After member role changes, recompute user.role for a linked user (if present)
+  if (uid) await recomputeAndWriteUserRole(uid);
 }
 
-/* Inbox writer (legacy) */
+/* Inbox writer */
 async function writeInbox(uid, payload) {
   await db.collection('inbox').doc(uid).set({ lastSeenAt: ts() }, { merge: true });
 
@@ -298,7 +366,6 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
     .get();
   if (!mins.empty) {
     const mData = mins.docs[0].data() || {};
-    // ⚠️ support both fields
     const fromLeaderUids = Array.isArray(mData.leaderUids) ? mData.leaderUids : [];
     const fromLeaderIds  = Array.isArray(mData.leaderIds)  ? mData.leaderIds  : [];
     ministryLeaderUids = uniq([...fromLeaderUids, ...fromLeaderIds].filter(Boolean));
@@ -455,7 +522,6 @@ exports.processMinistryApprovalAction = onDocumentCreated(
             approved: true,
             createdAt: ts(),
             createdBy: reviewerUid,
-            // Write to leaderUids (preferred). We’ll also read legacy leaderIds elsewhere.
             leaderUids: requestedByUid ? [requestedByUid] : [],
           });
           txn.update(reqRef, {
@@ -472,14 +538,14 @@ exports.processMinistryApprovalAction = onDocumentCreated(
             // Add membership + leadership for requester
             await addMemberToMinistry(memberId, ministryName, { asLeader: true });
 
-            // Ensure 'leader' role on both member & linked user, and sync claims
+            // Ensure 'leader' on member, then recompute single user.role
             await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
+
+            // Keep user.leadershipMinistries up to date (doesn't affect role)
             await db.doc(`users/${requestedByUid}`).set({
               leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
-              roles: admin.firestore.FieldValue.arrayUnion('leader'),
               updatedAt: ts(),
             }, { merge: true });
-            await syncClaimsForUid(requestedByUid);
           }
         }
 
@@ -737,7 +803,7 @@ exports.onJoinRequestDeleted = onDocumentDeleted(
 );
 
 /* =========================================================
-   5) Notify pastors when a prayer request is submitted (legacy inbox)
+   5) Notify pastors when a prayer request is submitted
    ========================================================= */
 exports.onPrayerRequestCreated = onDocumentCreated(
   'prayerRequests/{id}',
@@ -783,8 +849,54 @@ exports.onPrayerRequestCreated = onDocumentCreated(
 );
 
 /* =========================================================
-   6) CALLABLES — role sync (existing)
+   6) CALLABLES — role/claims & admin paths
    ========================================================= */
+
+/** NEW: called after signup + every login (client) */
+exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  // prefer Auth email
+  const authUser = await admin.auth().getUser(uid);
+  const emailLc = (authUser.email || '').trim().toLowerCase();
+
+  let user = await getUser(uid);
+  const now = ts();
+
+  // try resolve member by linked memberId or email
+  let memberSnap = null;
+  if (user?.memberId) {
+    const m = await db.doc(`members/${user.memberId}`).get();
+    if (m.exists) memberSnap = m;
+  }
+  if (!memberSnap && emailLc) {
+    const q = await db.collection('members').where('email', '==', emailLc).limit(1).get();
+    if (!q.empty) memberSnap = q.docs[0];
+  }
+
+  const memberData = memberSnap?.data() || null;
+
+  const highest = highestRoleFromArrays({
+    userRole: user?.role || 'member',
+    memberRoles: memberData?.roles || [],
+    isPastorFlag: !!memberData?.isPastor,
+  });
+
+  const userRef = db.doc(`users/${uid}`);
+  const write = {
+    role: highest,
+    email: emailLc || user?.email || null,
+    updatedAt: now,
+  };
+  if (memberSnap && !user?.memberId) write.memberId = memberSnap.id;
+
+  await userRef.set(write, { merge: true });
+  await syncClaimsForUid(uid);
+
+  return { ok: true, role: highest, linkedMemberId: write.memberId || user?.memberId || null };
+});
+
 exports.setMemberPastorRole = onCall(async (req) => {
   const uid = req.auth?.uid;
   if (!uid) throw new Error('unauthenticated');
@@ -835,15 +947,17 @@ exports.promoteMeToAdmin = onCall(async (req) => {
 
   const existingAdmins = await listUidsByRole('admin');
   if (existingAdmins.length > 0) {
-    const isAdmin = (await getUserRoles(uid)).includes('admin');
-    if (!isAdmin) throw new Error('permission-denied');
+    const myRole = await getUserRole(uid);
+    if (myRole !== 'admin') throw new Error('permission-denied');
   }
 
+  // Set single user.role = 'admin'
   await db.doc(`users/${uid}`).set(
-    { roles: admin.firestore.FieldValue.arrayUnion('admin'), updatedAt: ts() },
+    { role: 'admin', updatedAt: ts() },
     { merge: true }
   );
 
+  // Ensure member has 'admin' in roles array (optional for church record)
   const memberId = await getUserMemberId(uid);
   if (memberId) {
     await db.doc(`members/${memberId}`).set(
@@ -856,23 +970,7 @@ exports.promoteMeToAdmin = onCall(async (req) => {
   return { ok: true };
 });
 
-exports.ensureMemberLeaderRole = onCall(async (req) => {
-  const uid = req.auth?.uid;
-  if (!uid) throw new Error('unauthenticated');
-  const { memberId } = req.data || {};
-  if (!memberId) throw new Error('invalid-argument');
-
-  const isAdmin = (await getUserRoles(uid)).includes('admin');
-  const myMemberId = await getUserMemberId(uid);
-  if (!(isAdmin || myMemberId === memberId)) throw new Error('permission-denied');
-
-  await updateMemberAndLinkedUserRoles(memberId, { add: ['leader'] });
-  return { ok: true };
-});
-
-/* =========================================================
-   7) NEW CALLABLE — leaders can promote/demote within their ministry
-   ========================================================= */
+/* Leaders can toggle member's leader role within a ministry */
 exports.leaderSetMemberLeaderRole = onCall(async (req) => {
   const callerUid = req.auth?.uid;
   if (!callerUid) throw new Error('unauthenticated');
@@ -891,7 +989,7 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
   const usersQ = await db.collection('users').where('memberId', '==', memberId).limit(1).get();
   const linkedUid = usersQ.empty ? null : usersQ.docs[0].id;
 
-  // Update member + (if present) user docs atomically
+  // Update member doc
   const memberRef = db.doc(`members/${memberId}`);
   const batch = db.batch();
 
@@ -905,20 +1003,19 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
   }
   batch.set(memberRef, memberUpdate, { merge: true });
 
+  // Keep user.leadershipMinistries in sync (doesn't control role directly)
   if (!usersQ.empty) {
     const userRef = usersQ.docs[0].ref;
     const userUpdate = { updatedAt: ts() };
     if (makeLeader) {
-      userUpdate.roles = admin.firestore.FieldValue.arrayUnion('leader');
       userUpdate.leadershipMinistries = admin.firestore.FieldValue.arrayUnion(ministryName);
     } else {
-      userUpdate.roles = admin.firestore.FieldValue.arrayRemove('leader');
       userUpdate.leadershipMinistries = admin.firestore.FieldValue.arrayRemove(ministryName);
     }
     batch.set(userRef, userUpdate, { merge: true });
   }
 
-  // Optionally mirror to ministries.leaderUids if ministry exists
+  // Mirror to ministries.leaderUids if ministry exists
   const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
   if (!mins.empty && linkedUid) {
     const minRef = mins.docs[0].ref;
@@ -933,9 +1030,8 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
 
   await batch.commit();
 
-  if (linkedUid) {
-    await syncClaimsForUid(linkedUid);
-  }
+  // After member change, recompute linked user's single role
+  if (linkedUid) await recomputeAndWriteUserRole(linkedUid);
 
   logger.info('leaderSetMemberLeaderRole', {
     callerUid,

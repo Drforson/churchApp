@@ -19,6 +19,7 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
 
   bool _loading = false;
   bool _emailExists = false;
+  bool _obscure = true;
 
   @override
   void dispose() {
@@ -37,10 +38,9 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
       setState(() {
         _emailExists = methods.isNotEmpty;
       });
-    } catch (e) {
-      setState(() {
-        _emailExists = false;
-      });
+    } catch (_) {
+      // On error, don’t block signup UI — just clear the warning.
+      setState(() => _emailExists = false);
     }
   }
 
@@ -49,43 +49,58 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
 
     setState(() => _loading = true);
 
-    try {
-      final userCred = await _authService.signUp(
-        _emailController.text.trim(),
-        _passwordController.text.trim(),
-      );
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
 
+    try {
+      final userCred = await _authService.signUp(email, password);
       final user = userCred.user;
       if (user == null) {
-        throw Exception('Signup failed. No user returned.');
+        throw FirebaseAuthException(code: 'unknown', message: 'Signup failed. No user returned.');
       }
 
-      // Associate user with member if already exists
-      await _authService.associateMemberWithUser(user.uid, _emailController.text.trim());
-
-      // 🔥 Send Email Verification
+      // Send Email Verification (AuthService does not send it automatically)
       if (!user.emailVerified) {
         await user.sendEmailVerification();
       }
-
       await user.reload();
 
-      // ✅ Go to Email Verification Page
+      // Go to Email Verification Page
+      if (!mounted) return;
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
           builder: (_) => EmailVerificationPage(
             uid: user.uid,
-            email: user.email!,
+            email: user.email ?? email,
           ),
         ),
       );
-    } catch (e) {
+    } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}'), backgroundColor: Colors.red),
+        SnackBar(content: Text(_friendlyAuthError(e)), backgroundColor: Colors.red),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
       );
     } finally {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  String _friendlyAuthError(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'email-already-in-use':
+        return 'That email is already registered.';
+      case 'invalid-email':
+        return 'Please enter a valid email.';
+      case 'weak-password':
+        return 'Please choose a stronger password (min 6 characters).';
+      default:
+        return e.message ?? 'Authentication error.';
     }
   }
 
@@ -97,7 +112,7 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
         padding: const EdgeInsets.all(24),
         child: Form(
           key: _formKey,
-          onChanged: () => setState(() {}),
+          onChanged: () => setState(() {}), // live-enable button
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -108,53 +123,58 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 30),
+
+              // Email
               TextFormField(
                 controller: _emailController,
                 decoration: InputDecoration(
                   labelText: 'Email Address',
                   prefixIcon: const Icon(Icons.email),
-                  suffixIcon: _emailExists
+                  suffixIcon: _emailController.text.isEmpty
+                      ? null
+                      : (_emailExists
                       ? const Icon(Icons.warning, color: Colors.red)
-                      : const Icon(Icons.check_circle, color: Colors.green),
+                      : const Icon(Icons.check_circle, color: Colors.green)),
                 ),
                 keyboardType: TextInputType.emailAddress,
+                textInputAction: TextInputAction.next,
                 onChanged: (value) {
-                  if (value.contains('@')) {
-                    _checkEmailExists(value.trim());
-                  }
+                  final v = value.trim();
+                  if (v.contains('@')) _checkEmailExists(v);
                 },
                 validator: (val) {
-                  if (val == null || val.isEmpty) {
-                    return 'Email is required';
-                  }
-                  if (!val.contains('@')) {
-                    return 'Enter a valid email';
-                  }
-                  if (_emailExists) {
-                    return 'Email already registered';
-                  }
+                  final v = (val ?? '').trim();
+                  if (v.isEmpty) return 'Email is required';
+                  final ok = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(v);
+                  if (!ok) return 'Enter a valid email';
+                  if (_emailExists) return 'Email already registered';
                   return null;
                 },
               ),
               const SizedBox(height: 20),
+
+              // Password
               TextFormField(
                 controller: _passwordController,
-                obscureText: true,
-                decoration: const InputDecoration(
+                obscureText: _obscure,
+                decoration: InputDecoration(
                   labelText: 'Password',
-                  prefixIcon: Icon(Icons.lock),
+                  prefixIcon: const Icon(Icons.lock),
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off),
+                    onPressed: () => setState(() => _obscure = !_obscure),
+                  ),
                 ),
                 validator: (val) {
-                  if (val == null || val.isEmpty) {
-                    return 'Password is required';
-                  }
-                  if (val.length < 6) {
-                    return 'Password must be at least 6 characters';
-                  }
+                  if (val == null || val.isEmpty) return 'Password is required';
+                  if (val.length < 6) return 'Password must be at least 6 characters';
                   return null;
                 },
               ),
+
               const SizedBox(height: 40),
+
+              // Continue
               ElevatedButton(
                 onPressed: _isFormValid && !_loading ? _handleSignup : null,
                 style: ElevatedButton.styleFrom(
@@ -163,7 +183,9 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 ),
                 child: _loading
-                    ? const CircularProgressIndicator(color: Colors.white)
+                    ? const SizedBox(
+                  width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                )
                     : const Text('Continue', style: TextStyle(color: Colors.white)),
               ),
             ],
