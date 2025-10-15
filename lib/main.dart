@@ -10,7 +10,7 @@ import 'package:flutter_stripe/flutter_stripe.dart';
 
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-
+import "pages/attendance_setup_page.dart";
 // Pages (core auth / onboarding)
 import 'pages/login_page.dart';
 import 'pages/signup1.dart';
@@ -426,6 +426,9 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
 
     case '/testadmin':
       return MaterialPageRoute(builder: (_) => const DebugAdminSetterPage());
+
+    case '/attendance-setup':
+      return MaterialPageRoute(builder: (_) => const AttendanceSetupPage());
 
     case '/profile':
       return MaterialPageRoute(builder: (_) => HomePage());

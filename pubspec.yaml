@@ -20,6 +20,10 @@ dependencies:
   firebase_messaging: ^15.2.5
   firebase_app_check: ^0.3.0
 
+  # Location & Places (NEW)
+  geolocator: ^13.0.1
+  flutter_google_places_sdk: ^0.3.8
+
   # UI / notifications / charts
   flutter_local_notifications: ^14.1.1
   fl_chart: ^0.71.0
@@ -48,7 +52,7 @@ dependencies:
   excel: ^4.0.6
   syncfusion_flutter_xlsio: ^29.1.38
 
-  # Device/app info (pin to null-safe versions)
+  # Device/app info
   device_info_plus: ^11.1.0
   package_info_plus: ^8.0.2
   path: ^1.9.0

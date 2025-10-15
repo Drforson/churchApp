@@ -5,6 +5,7 @@ const {
   onDocumentDeleted,
 } = require('firebase-functions/v2/firestore');
 const { onCall } = require('firebase-functions/v2/https');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { setGlobalOptions, logger } = require('firebase-functions/v2');
 const admin = require('firebase-admin');
 
@@ -606,10 +607,10 @@ exports.onMinistryRequestApproved = onDocumentUpdated(
     if (!before || !after) return;
 
     const prev = String(before.status || 'pending').toLowerCase();
-    const next = String(after.status  || 'pending').toLowerCase();
+    theNext = String(after.status  || 'pending').toLowerCase();
 
     // Only act on actual transition to approved
-    if (prev === 'approved' || next !== 'approved') return;
+    if (prev === 'approved' || theNext !== 'approved') return;
 
     const reqRef = event.data.after.ref;
 
@@ -1133,4 +1134,238 @@ exports.leaderSetMemberLeaderRole = onCall(async (req) => {
   });
 
   return { ok: true, memberId, ministryName, leader: makeLeader };
+});
+
+/* ---------------------------------------------------------
+   AUTOMATIC ATTENDANCE (geofence-based, fully automatic)
+   --------------------------------------------------------- */
+
+// ---- Geo helper: distance in meters between two {lat,lng} points
+function haversineMeters(a, b) {
+  const R = 6371000; // meters
+  const toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(Number(b.lat) - Number(a.lat));
+  const dLng = toRad(Number(b.lng) - Number(a.lng));
+  const lat1 = toRad(Number(a.lat));
+  const lat2 = toRad(Number(b.lat));
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/** Create/Update attendance window (admin/pastor/leader) */
+exports.upsertAttendanceWindow = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  const role = await getUserRole(uid);
+  const allowed = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!allowed) throw new Error('permission-denied');
+
+  const {
+    id,                   // optional (update)
+    title,
+    dateKey,              // 'YYYY-MM-DD'
+    startsAt,             // epoch ms (UTC)
+    endsAt,               // epoch ms (UTC)
+    churchPlaceId,
+    churchAddress,
+    churchLocation,       // { lat, lng }
+    radiusMeters = 500,
+  } = req.data || {};
+
+  if (
+    !dateKey || !startsAt || !endsAt ||
+    !churchPlaceId || !churchLocation?.lat || !churchLocation?.lng
+  ) throw new Error('invalid-argument');
+
+  const ref = id
+    ? db.collection('attendance_windows').doc(id)
+    : db.collection('attendance_windows').doc();
+
+  await ref.set({
+    title: title || 'Service',
+    dateKey,
+    startsAt: new Date(Number(startsAt)),
+    endsAt: new Date(Number(endsAt)),
+    churchPlaceId,
+    churchAddress: churchAddress || null,
+    churchLocation: { lat: Number(churchLocation.lat), lng: Number(churchLocation.lng) },
+    radiusMeters: Number(radiusMeters) || 500,
+    pingSent: false,     // set when broadcast goes out
+    closed: false,       // set after finalizer runs
+    createdAt: ts(),
+    updatedAt: ts(),
+  }, { merge: true });
+
+  return { ok: true, id: ref.id };
+});
+
+/** Scheduler: broadcast a data FCM ping at window start */
+exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
+  const now = new Date();
+  // 60s tolerance for scheduler jitter
+  const startFrom = new Date(now.getTime() - 30 * 1000);
+  const startTo   = new Date(now.getTime() + 30 * 1000);
+
+  const qs = await db.collection('attendance_windows')
+    .where('startsAt', '>=', startFrom)
+    .where('startsAt', '<=', startTo)
+    .where('pingSent', '==', false)
+    .limit(20)
+    .get();
+
+  if (qs.empty) return;
+
+  for (const doc of qs.docs) {
+    const w = doc.data();
+    const payload = {
+      data: {
+        type: 'attendance_window_ping',
+        windowId: doc.id,
+        dateKey: String(w.dateKey),
+        startsAt: String(w.startsAt.toDate().getTime()),
+        endsAt:   String(w.endsAt.toDate().getTime()),
+        lat: String(w.churchLocation.lat),
+        lng: String(w.churchLocation.lng),
+        radius: String(w.radiusMeters || 500),
+      }
+    };
+
+    // Broadcast to all devices; clients subscribe to this topic after login
+    await admin.messaging().sendToTopic('all_members', payload);
+
+    await doc.ref.set({ pingSent: true, updatedAt: ts() }, { merge: true });
+  }
+});
+
+/** Callable: client sends one-shot GPS; server validates + writes authoritative record */
+exports.processAttendanceCheckin = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  const { windowId, deviceLocation, accuracy } = req.data || {};
+  if (!windowId || !deviceLocation?.lat || !deviceLocation?.lng)
+    throw new Error('invalid-argument');
+
+  const winSnap = await db.doc(`attendance_windows/${windowId}`).get();
+  if (!winSnap.exists) throw new Error('window-not-found');
+  const w = winSnap.data();
+
+  const now = new Date();
+  if (now < w.startsAt.toDate() || now > w.endsAt.toDate())
+    throw new Error('outside-window');
+
+  const u = await db.doc(`users/${uid}`).get();
+  const memberId = u.exists ? (u.data().memberId || null) : null;
+  if (!memberId) throw new Error('member-not-linked');
+
+  const dist = Math.round(haversineMeters(
+    { lat: Number(deviceLocation.lat), lng: Number(deviceLocation.lng) },
+    { lat: Number(w.churchLocation.lat), lng: Number(w.churchLocation.lng) }
+  ));
+  const present = dist <= (w.radiusMeters || 500);
+
+  // Audit trail
+  await db.collection('attendance_submissions').add({
+    userUid: uid,
+    memberId,
+    windowId,
+    at: ts(),
+    deviceLocation: {
+      lat: Number(deviceLocation.lat),
+      lng: Number(deviceLocation.lng),
+      accuracy: accuracy ?? null,
+    },
+    result: present ? 'present' : 'absent',
+  });
+
+  // Authoritative record (leaders/admin path per your rules)
+  const recRef = db.collection('attendance').doc(w.dateKey)
+                   .collection('records').doc(memberId);
+  await recRef.set({
+    windowId,
+    status: present ? 'present' : 'absent',
+    checkedAt: ts(),
+    distanceMeters: dist,
+    by: 'auto'
+  }, { merge: true });
+
+  return { ok: true, status: present ? 'present' : 'absent', distanceMeters: dist };
+});
+
+/** Finalizer: after window ends, mark everyone else absent (optional but recommended) */
+exports.closeAttendanceWindow = onSchedule('every 5 minutes', async () => {
+  const now = new Date();
+  const qs = await db.collection('attendance_windows')
+    .where('endsAt', '<=', now)
+    .where('closed', '==', false)
+    .limit(5)
+    .get();
+
+  if (qs.empty) return;
+
+  for (const doc of qs.docs) {
+    const w = doc.data();
+
+    // Expected attendees: all users that have a memberId (installed app)
+    const users = await db.collection('users')
+      .where('memberId', '!=', null)
+      .select('memberId').get();
+
+    const presentRecs = await db.collection('attendance').doc(w.dateKey)
+      .collection('records').get();
+    const presentSet = new Set(presentRecs.docs.map(d => d.id));
+
+    // Batch absent writes
+    let batch = db.batch();
+    let count = 0;
+
+    for (const u of users.docs) {
+      const mid = u.data().memberId;
+      if (!mid || presentSet.has(mid)) continue;
+
+      const ref = db.collection('attendance').doc(w.dateKey).collection('records').doc(mid);
+      batch.set(ref, {
+        windowId: doc.id,
+        status: 'absent',
+        by: 'auto',
+        closedAt: ts()
+      }, { merge: true });
+
+      count++;
+      if (count % 400 === 0) { // stay under 500 ops/batch
+        await batch.commit();
+        batch = db.batch();
+      }
+    }
+    await batch.commit();
+
+    await doc.ref.set({ closed: true, updatedAt: ts() }, { merge: true });
+  }
+});
+
+/** Override by usher/pastor/leader */
+exports.overrideAttendanceStatus = onCall(async (req) => {
+  const uid = req.auth?.uid; if (!uid) throw new Error('unauthenticated');
+
+  const role = await getUserRole(uid);
+  const privileged = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!privileged) throw new Error('permission-denied');
+
+  const { dateKey, memberId, status, reason } = req.data || {};
+  if (!dateKey || !memberId || !['present','absent'].includes(status))
+    throw new Error('invalid-argument');
+
+  const ref = db.collection('attendance').doc(dateKey).collection('records').doc(memberId);
+  await ref.set({
+    status,
+    overriddenBy: uid,
+    overriddenAt: ts(),
+    reason: reason || null,
+    by: 'override'
+  }, { merge: true });
+
+  return { ok: true };
 });

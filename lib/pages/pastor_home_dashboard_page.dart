@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:church_management_app/widgets/notificationbell_widget.dart';
 import 'package:intl/intl.dart';
 
+import 'attendance_setup_page.dart';
 import 'notification_center_page.dart'; // <— added
 import 'pastor_ministry_approvals_page.dart';
 
@@ -559,6 +560,16 @@ class _PastorActionsGrid extends StatelessWidget {
       _PastorActionItem('Profile', Icons.person_rounded, '/profile'),
       _PastorActionItem('Post Announcement', Icons.campaign_rounded,'/post-announcements'),
           _PastorActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),
+      // 👉 NEW: Attendance Setup
+      _PastorActionItem(
+        'Attendance Setup',
+        Icons.how_to_reg, // pick any icon you like
+        null,
+        onTap: (ctx) => Navigator.push(
+          ctx,
+          MaterialPageRoute(builder: (_) => const AttendanceSetupPage()),
+        ),
+      ),
 
     ];
 

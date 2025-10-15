@@ -2,6 +2,7 @@
 import 'package:church_management_app/pages/signup1.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import '../services/auth_service.dart';
 
@@ -35,6 +36,31 @@ class _LoginPageState extends State<LoginPage> {
     super.dispose();
   }
 
+  /// Subscribes this device to broadcast pings and syncs backend user doc & claims.
+  Future<void> _postLoginBootstrap() async {
+    // iOS: ask user; Android auto-grants if already allowed
+    try {
+      await FirebaseMessaging.instance.requestPermission();
+    } catch (_) {
+      // Non-fatal if permissions prompt fails (e.g., Android)
+    }
+
+    // Subscribe to global attendance topic so this device receives start pings
+    try {
+      await FirebaseMessaging.instance.subscribeToTopic('all_members');
+    } catch (_) {
+      // Not critical; attendance still works via future app sessions
+    }
+
+    // Ensure server-side user doc exists/updated (Admin SDK; bypasses rules)
+    await _functions.httpsCallable('ensureUserDoc').call(<String, dynamic>{});
+
+    // Sync single-role + custom claims from linked member record (non-fatal)
+    try {
+      await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call(<String, dynamic>{});
+    } catch (_) {}
+  }
+
   Future<void> _handleLogin() async {
     if (!_formKey.currentState!.validate()) return;
     if (mounted) setState(() => _loading = true);
@@ -53,15 +79,8 @@ class _LoginPageState extends State<LoginPage> {
       // Ensure the callable gets a fresh ID token
       await user.getIdToken(true);
 
-      // ✅ Create/update users/{uid} via Admin SDK (bypasses Firestore rules)
-      await _functions.httpsCallable('ensureUserDoc').call(<String, dynamic>{});
-
-      // (Optional) Immediately sync role & custom claims from linked member
-      try {
-        await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call(<String, dynamic>{});
-      } catch (_) {
-        // Non-fatal — continue even if this callable fails
-      }
+      // Post-login bootstrap: topic subscribe + ensureUserDoc + sync role/claims
+      await _postLoginBootstrap();
 
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/');
@@ -218,4 +237,3 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 }
-
