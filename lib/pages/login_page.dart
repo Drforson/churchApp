@@ -1,8 +1,9 @@
+// lib/pages/login_page.dart
 import 'package:church_management_app/pages/signup1.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import '../services/auth_service.dart';
-
 
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -18,6 +19,15 @@ class _LoginPageState extends State<LoginPage> {
   final _password = TextEditingController();
   bool _loading = false;
 
+  late final FirebaseFunctions _functions;
+
+  @override
+  void initState() {
+    super.initState();
+    // Match your deployed region for Functions
+    _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
+  }
+
   @override
   void dispose() {
     _email.dispose();
@@ -27,7 +37,8 @@ class _LoginPageState extends State<LoginPage> {
 
   Future<void> _handleLogin() async {
     if (!_formKey.currentState!.validate()) return;
-    setState(() => _loading = true);
+    if (mounted) setState(() => _loading = true);
+
     try {
       final userCred = await _authService.signIn(
         _email.text.trim(),
@@ -39,13 +50,38 @@ class _LoginPageState extends State<LoginPage> {
         throw FirebaseAuthException(code: 'no-user', message: 'No user returned.');
       }
 
+      // Ensure the callable gets a fresh ID token
+      await user.getIdToken(true);
+
+      // ✅ Create/update users/{uid} via Admin SDK (bypasses Firestore rules)
+      await _functions.httpsCallable('ensureUserDoc').call(<String, dynamic>{});
+
+      // (Optional) Immediately sync role & custom claims from linked member
+      try {
+        await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call(<String, dynamic>{});
+      } catch (_) {
+        // Non-fatal — continue even if this callable fails
+      }
+
+      if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/');
+    } on FirebaseFunctionsException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message ?? 'Server error'), backgroundColor: Colors.red),
+      );
     } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(e.message ?? 'Login failed'), backgroundColor: Colors.red),
       );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Login failed: $e'), backgroundColor: Colors.red),
+      );
     } finally {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -53,12 +89,12 @@ class _LoginPageState extends State<LoginPage> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text('Forgot Password'),
-        content: Text('Password reset is not implemented yet.'),
+        title: const Text('Forgot Password'),
+        content: const Text('Password reset is not implemented yet.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: Text('OK'),
+            child: const Text('OK'),
           ),
         ],
       ),
@@ -70,7 +106,7 @@ class _LoginPageState extends State<LoginPage> {
     return Scaffold(
       extendBodyBehindAppBar: true,
       body: Container(
-        decoration: BoxDecoration(
+        decoration: const BoxDecoration(
           gradient: LinearGradient(
             colors: [Color(0xFF6A11CB), Color(0xFF2575FC)],
             begin: Alignment.topLeft,
@@ -87,7 +123,7 @@ class _LoginPageState extends State<LoginPage> {
                 decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.95),
                   borderRadius: BorderRadius.circular(16),
-                  boxShadow: [
+                  boxShadow: const [
                     BoxShadow(
                       color: Colors.black26,
                       blurRadius: 10,
@@ -100,9 +136,9 @@ class _LoginPageState extends State<LoginPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      Icon(Icons.church, size: 80, color: Colors.deepPurple),
+                      const Icon(Icons.church, size: 80, color: Colors.deepPurple),
                       const SizedBox(height: 16),
-                      Text(
+                      const Text(
                         'Welcome to Resurrection Church',
                         textAlign: TextAlign.center,
                         style: TextStyle(
@@ -112,13 +148,13 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                       const SizedBox(height: 8),
-                      Text(
+                      const Text(
                         'Join us in worship and community',
                         textAlign: TextAlign.center,
                         style: TextStyle(fontSize: 16, color: Colors.black87),
                       ),
                       const SizedBox(height: 30),
-                      SizedBox(height: 12),
+                      const SizedBox(height: 12),
                       TextFormField(
                         controller: _email,
                         decoration: const InputDecoration(
@@ -144,8 +180,16 @@ class _LoginPageState extends State<LoginPage> {
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple),
                         onPressed: _loading ? null : _handleLogin,
                         child: _loading
-                            ? SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
-                            : Text('Login', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white)),
+                            ? const SizedBox(
+                            width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Text(
+                          'Login',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
+                          ),
+                        ),
                       ),
                       TextButton(
                         style: TextButton.styleFrom(foregroundColor: Colors.deepPurple),
@@ -174,3 +218,4 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 }
+

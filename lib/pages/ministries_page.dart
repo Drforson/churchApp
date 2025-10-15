@@ -2,7 +2,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-
+import 'package:cloud_functions/cloud_functions.dart'; // ✅ for optional callable delete
 import 'ministries_details_page.dart'; // adjust path as needed
 
 class MinistriesPage extends StatefulWidget {
@@ -16,6 +16,7 @@ class _MinistriesPageState extends State<MinistriesPage>
     with TickerProviderStateMixin {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
+  final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2'); // ✅
 
   bool _loading = true;
 
@@ -280,6 +281,63 @@ class _MinistriesPageState extends State<MinistriesPage>
         .showSnackBar(SnackBar(content: Text('Join request sent for "$name".')));
   }
 
+  // ======== Delete Ministry (Pastor/Admin only) ========
+  Future<void> _confirmDeleteMinistry({
+    required String ministryId,
+    required String ministryName,
+  }) async {
+    if (!(_isPastor || _isAdmin)) return;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete ministry'),
+        content: Text(
+          'Are you sure you want to delete "$ministryName"?\n\n'
+              'This will remove the ministry record. '
+              'If you have a Cloud Function to clean up memberships/feeds, it will run. '
+              'This action cannot be undone.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok != true) return;
+
+    try {
+      // Prefer callable (server-side audit & cascade), fallback to direct delete.
+      try {
+        final callable = _functions.httpsCallable('adminDeleteMinistry');
+        await callable.call({
+          'ministryId': ministryId,
+          'ministryName': ministryName,
+        });
+      } on Exception {
+        // Fallback if function not deployed or blocked by region/permissions.
+        await _db.collection('ministries').doc(ministryId).delete();
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Deleted "$ministryName".')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    }
+  }
+
   // ======== Streams ========
   Stream<List<Map<String, dynamic>>> _ministriesStream() => _db
       .collection('ministries')
@@ -318,27 +376,54 @@ class _MinistriesPageState extends State<MinistriesPage>
 
   Widget _ministryTile(Map<String, dynamic> m) {
     final name = (m['name'] ?? '').toString().trim();
+    final id = (m['id'] ?? '').toString();
     final canAccess = _canAccessByName(name);
     final signedIn = _uid != null;
+    final canDelete = _isPastor || _isAdmin;
+
+    // Decide trailing widget:
+    Widget? trailing;
+    if (!canAccess && signedIn && !_isAdmin && !_isPastor) {
+      trailing = TextButton.icon(
+        icon: const Icon(Icons.person_add_alt_1),
+        label: const Text('Join'),
+        onPressed: () => _showJoinPrompt(name),
+      );
+    } else if (canDelete) {
+      trailing = PopupMenuButton<String>(
+        onSelected: (v) {
+          if (v == 'delete') {
+            _confirmDeleteMinistry(ministryId: id, ministryName: name);
+          }
+        },
+        itemBuilder: (context) => [
+          const PopupMenuItem(
+            value: 'delete',
+            child: Row(
+              children: [
+                Icon(Icons.delete, size: 18),
+                SizedBox(width: 8),
+                Text('Delete'),
+              ],
+            ),
+          ),
+        ],
+        tooltip: 'More',
+      );
+    }
 
     return Card(
       child: ListTile(
         leading: Icon(canAccess ? Icons.groups : Icons.lock_outline),
         title: Text(name),
-        trailing: (!canAccess && signedIn && !_isAdmin && !_isPastor)
-            ? TextButton.icon(
-          icon: const Icon(Icons.person_add_alt_1),
-          label: const Text('Join'),
-          onPressed: () => _showJoinPrompt(name),
-        )
-            : null,
+        trailing: trailing,
         onTap: () {
           if (canAccess) {
             Navigator.push(
               context,
               MaterialPageRoute(
                 builder: (_) =>
-                    MinistryDetailsPage(ministryId: m['id'], ministryName: name),
+                    MinistryDetailsPage(ministryId: id, ministryName: name),
               ),
             );
           } else if (signedIn) {

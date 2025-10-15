@@ -916,6 +916,44 @@ exports.onPrayerRequestCreated = onDocumentCreated(
    6) CALLABLES — role/claims & admin paths
    ========================================================= */
 
+/** ✅ GUARANTEED FIX: create/update users/{uid} AFTER login via Admin SDK (bypasses rules) */
+exports.ensureUserDoc = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  // Prefer Auth record for canonical email
+  let email = null;
+  try {
+    const authUser = await admin.auth().getUser(uid);
+    email = (authUser.email || req.auth?.token?.email || '').trim().toLowerCase() || null;
+  } catch {
+    email = (req.auth?.token?.email || '').trim().toLowerCase() || null;
+  }
+
+  const ref = db.collection('users').doc(uid);
+  const snap = await ref.get();
+
+  if (!snap.exists) {
+    await ref.set(
+      {
+        email,
+        role: 'member',            // default; will be recomputed below if linked member suggests higher
+        createdAt: ts(),
+        updatedAt: ts(),
+      },
+      { merge: true }
+    );
+  } else {
+    await ref.set({ email, updatedAt: ts() }, { merge: true });
+  }
+
+  // Optional but recommended: recompute single role + sync claims
+  await recomputeAndWriteUserRole(uid);
+
+  logger.info('ensureUserDoc ok', { uid, email });
+  return { ok: true };
+});
+
 /** NEW: called after signup + every login (client) */
 exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
   const uid = req.auth?.uid;
