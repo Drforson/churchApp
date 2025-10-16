@@ -2,6 +2,7 @@ import 'package:church_management_app/pages/feedback_page.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import 'package:flutter/foundation.dart'; // for kReleaseMode
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -143,12 +144,36 @@ Future<void> _activateAppCheckDebug() async {
   await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
 }
 
+
+Future<void> _activateAppCheck() async {
+  await FirebaseAppCheck.instance.activate(
+    androidProvider: kReleaseMode
+        ? AndroidProvider.playIntegrity   // release
+        : AndroidProvider.debug,          // debug/dev
+    appleProvider: kReleaseMode
+        ? AppleProvider.appAttest         // or AppleProvider.deviceCheck if App Attest isn't available
+        : AppleProvider.debug,
+    // Omit webProvider entirely on mobile
+  );
+
+  // Optional: pull a token once so you see useful logs
+  try {
+    final t = await FirebaseAppCheck.instance.getToken(true);
+    debugPrint('[AppCheck] token len=${t?.length ?? 0}');
+  } catch (e) {
+    debugPrint('[AppCheck] getToken (expected if debug token not yet registered): $e');
+  }
+
+  await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
+}
+
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   // 🔐 App Check — enable DEBUG providers for Android & Apple
-  await _activateAppCheckDebug();
+  await _activateAppCheck();
 
   // Auth language
   try {

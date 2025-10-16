@@ -7,7 +7,7 @@ import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:intl/intl.dart';
 
 /// TODO: move this to a safer place (env/remote config/secret manager).
-const String kGooglePlacesApiKey = 'YOUR_PLACES_API_KEY_HERE';
+const String kGooglePlacesApiKey = 'AIzaSyD5fz8C7ktANql7kBzZDucqj15Mf-D3awE';
 
 class AttendanceSetupPage extends StatefulWidget {
   const AttendanceSetupPage({super.key});
