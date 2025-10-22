@@ -35,49 +35,81 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
   }
 
   /// Pull roles + best-effort name from users + members
+  /// Pull roles + best-effort name from users + members + auth claims
   Future<void> _primeRole() async {
-    final uid = _uid;
+    final uid = _auth.currentUser?.uid;
     if (uid == null) return;
 
-    final u = await _db.collection('users').doc(uid).get();
-    final data = u.data() ?? {};
-    final roles = List<String>.from(data['roles'] ?? const []);
-    final memberId = data['memberId'] as String?;
-    final fromUsers = List<String>.from(data['leadershipMinistries'] ?? const []);
+    // 1) Read auth claims (set by your Functions via setCustomUserClaims)
+    final claims = await _auth.currentUser!.getIdTokenResult(true);
+    final tok = claims.claims ?? const {};
 
-    // Try to get name from users first
-    String? name = (data['displayName'] ?? data['name'])?.toString();
-    bool isPastor = roles.contains('pastor');
+    bool claimAdmin  = (tok['admin'] == true)  || (tok['isAdmin'] == true);
+    bool claimPastor = (tok['pastor'] == true) || (tok['isPastor'] == true);
+    bool claimLeader = (tok['leader'] == true) || (tok['isLeader'] == true);
 
-    var isAdmin = roles.contains('admin');
-    var isLeader = roles.contains('leader');
-    final mins = <String>{...fromUsers};
+    // 2) Read users/{uid}
+    final userSnap = await _db.collection('users').doc(uid).get();
+    final u = userSnap.data() ?? {};
 
-    Map<String, dynamic> md = {};
-    if (memberId != null) {
-      final m = await _db.collection('members').doc(memberId).get();
-      md = m.data() ?? {};
-      final fromMembers = List<String>.from(md['leadershipMinistries'] ?? const []);
-      mins.addAll(fromMembers);
-      if (!isAdmin && fromMembers.isNotEmpty) isLeader = true;
+    // Single role (preferred)
+    final singleRole = (u['role'] as String?)?.trim().toLowerCase();
 
-      // If users doc had no name, fallback to members fields
-      name ??= (md['fullName'] ??
-          ([md['firstName'], md['lastName']]
-              .where((e) => (e ?? '').toString().trim().isNotEmpty)
-              .join(' ')
-              .trim()))
-          .toString();
+    // Legacy roles array
+    final rolesArr = (u['roles'] is List)
+        ? List<String>.from((u['roles'] as List).map((e) => e.toString().toLowerCase()))
+        : const <String>[];
 
-      // Check pastoral role on members too
-      final memberRoles = List<String>.from(md['roles'] ?? const []);
-      isPastor = isPastor || memberRoles.contains('pastor') || (md['isPastor'] == true);
+    // Leadership (user doc)
+    final userLeadMins = (u['leadershipMinistries'] is List)
+        ? List<String>.from((u['leadershipMinistries'] as List).map((e) => e.toString()))
+        : const <String>[];
+
+    String? name = (u['displayName'] ?? u['name'])?.toString();
+    final memberId = u['memberId'] as String?;
+
+    // 3) Derive admin/leader/pastor from users doc (single + array + claims)
+    bool isAdmin  = claimAdmin  || singleRole == 'admin'  || rolesArr.contains('admin');
+    bool isLeader = claimLeader || singleRole == 'leader' || rolesArr.contains('leader') || userLeadMins.isNotEmpty;
+    bool isPastor = claimPastor || singleRole == 'pastor' || rolesArr.contains('pastor');
+
+    // 4) Merge with members/{memberId} (roles, flags, name, leadership)
+    final mins = <String>{...userLeadMins};
+    if (memberId != null && memberId.isNotEmpty) {
+      final mSnap = await _db.collection('members').doc(memberId).get();
+      final md = mSnap.data() ?? {};
+
+      // Leadership from member doc
+      final memberLeadMins = (md['leadershipMinistries'] is List)
+          ? List<String>.from((md['leadershipMinistries'] as List).map((e) => e.toString()))
+          : const <String>[];
+      mins.addAll(memberLeadMins);
+
+      // Roles from member doc
+      final memberRoles = (md['roles'] is List)
+          ? List<String>.from((md['roles'] as List).map((e) => e.toString().toLowerCase()))
+          : const <String>[];
+
+      final memberIsPastorFlag = (md['isPastor'] == true);
+
+      // Upgrade derived booleans if member doc indicates so
+      isAdmin  = isAdmin  || memberRoles.contains('admin');
+      isLeader = isLeader || memberRoles.contains('leader') || memberLeadMins.isNotEmpty;
+      isPastor = isPastor || memberIsPastorFlag || memberRoles.contains('pastor');
+
+      // Name fallback from members
+      if (name == null || name.trim().isEmpty) {
+        final first = (md['firstName'] ?? '').toString();
+        final last  = (md['lastName']  ?? '').toString();
+        final full  = ('$first $last').trim();
+        name = full.isNotEmpty ? full : (md['fullName'] ?? '').toString();
+      }
     }
 
-    // Final fallback to auth displayName/email local-part if still null
-    name ??= _auth.currentUser?.displayName ??
-        _auth.currentUser?.email?.split('@').first ??
-        'Member';
+    // 5) Final fallback for name
+    name ??= _auth.currentUser?.displayName
+        ?? _auth.currentUser?.email?.split('@').first
+        ?? 'Member';
 
     if (!mounted) return;
     setState(() {
@@ -85,9 +117,10 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       _isLeader = isLeader;
       _isPastor = isPastor;
       _leadershipMinistries = mins;
-      _displayName = name;
+      _displayName = name!;
     });
   }
+
 
   Future<void> _logout(BuildContext context) async {
     await _auth.signOut();
@@ -558,6 +591,9 @@ class _ActionsGrid extends StatelessWidget {
       _ActionItem('Sunday Follow-Up', Icons.person_off, '/follow-up'),
       _ActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),
      // FeedbackQuickButton(padding: EdgeInsets.only(left: 8)),
+    //  if (role == 'admin' || role == 'leader')
+       // _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin'),
+
       if (isPastor) _ActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin', requireManage: true),
     ].where((i) => !i.requireManage || canManage).toList();
