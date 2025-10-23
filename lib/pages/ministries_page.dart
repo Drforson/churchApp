@@ -33,6 +33,9 @@ class _MinistriesPageState extends State<MinistriesPage>
   final _searchCtrl = TextEditingController();
   String _query = '';
 
+  // Locally dismissed request ids for tap-to-disintegrate effect
+  final Set<String> _dismissedReqIds = {};
+
   @override
   void initState() {
     super.initState();
@@ -80,8 +83,10 @@ class _MinistriesPageState extends State<MinistriesPage>
           (data['roles'] as List).map((e) => e.toString().toLowerCase()))
           : const <String>[];
 
-      _isAdmin = role == 'admin' || data['isAdmin'] == true || legacyRoles.contains('admin');
-      _isPastor = role == 'pastor' || data['isPastor'] == true || legacyRoles.contains('pastor');
+      _isAdmin =
+          role == 'admin' || data['isAdmin'] == true || legacyRoles.contains('admin');
+      _isPastor =
+          role == 'pastor' || data['isPastor'] == true || legacyRoles.contains('pastor');
 
       final lmUser = (data['leadershipMinistries'] is List)
           ? List<String>.from(
@@ -96,7 +101,7 @@ class _MinistriesPageState extends State<MinistriesPage>
           legacyRoles.contains('leader') ||
           lmUser.isNotEmpty;
 
-      final mid = (data['memberId'] ?? '').toString().trim();
+      final mid = (data['memberId'] ?? '').toString();
       Set<String> memberMins = {};
       final Set<String> leaderMins = {
         ...lmUser.map((e) => e.trim()).where((e) => e.isNotEmpty)
@@ -194,6 +199,7 @@ class _MinistriesPageState extends State<MinistriesPage>
 
   Future<void> _submitNewMinistryRequest(String name, String desc) async {
     if (!_isLeader) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Only leaders can create new ministries.')),
       );
@@ -201,6 +207,7 @@ class _MinistriesPageState extends State<MinistriesPage>
     }
 
     if (name.isEmpty) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Ministry name is required.')),
       );
@@ -233,10 +240,12 @@ class _MinistriesPageState extends State<MinistriesPage>
         'requestedAt': FieldValue.serverTimestamp(),
       });
 
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Request submitted for "$name". Pastor notified.')),
       );
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error: $e')),
       );
@@ -263,6 +272,7 @@ class _MinistriesPageState extends State<MinistriesPage>
 
   Future<void> _sendJoinRequest(String name) async {
     if (_uid == null || _memberId == null) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Sign in first to join a ministry.')),
       );
@@ -277,6 +287,7 @@ class _MinistriesPageState extends State<MinistriesPage>
       'requestedAt': FieldValue.serverTimestamp(),
     });
 
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text('Join request sent for "$name".')));
   }
@@ -350,6 +361,25 @@ class _MinistriesPageState extends State<MinistriesPage>
   })
       .toList());
 
+  // Pending-only (auto-vanish when approved/rejected); keep ids for local dismiss.
+  Stream<List<Map<String, dynamic>>> _myPendingCreationRequestsStream() {
+    if (_uid == null) return const Stream.empty();
+    return _db
+        .collection('ministry_creation_requests')
+        .where('requestedByUid', isEqualTo: _uid)
+        .where('status', isEqualTo: 'pending')
+        .orderBy('requestedAt', descending: true)
+        .snapshots()
+        .map((qs) => qs.docs
+        .map((d) => {
+      'id': d.id,
+      'name': d['name'],
+      'status': d['status'],
+    })
+        .toList());
+  }
+
+  // All requests for the second tab (history view)
   Stream<List<Map<String, dynamic>>> _myCreationRequestsStream() {
     if (_uid == null) return const Stream.empty();
     return _db
@@ -357,11 +387,16 @@ class _MinistriesPageState extends State<MinistriesPage>
         .where('requestedByUid', isEqualTo: _uid)
         .orderBy('requestedAt', descending: true)
         .snapshots()
-        .map((qs) =>
-        qs.docs.map((d) => {'name': d['name'], 'status': d['status']}).toList());
+        .map((qs) => qs.docs
+        .map((d) => {
+      'id': d.id,
+      'name': d['name'],
+      'status': d['status'],
+    })
+        .toList());
   }
 
-  // ======== UI ========
+  // ======== UI helpers ========
   Color _statusColor(String s) {
     switch (s) {
       case 'approved':
@@ -372,6 +407,26 @@ class _MinistriesPageState extends State<MinistriesPage>
       default:
         return Colors.orange;
     }
+  }
+
+  Widget _disintegrateTile({
+    required String id,
+    required Widget child,
+  }) {
+    final dismissed = _dismissedReqIds.contains(id);
+
+    return AnimatedOpacity(
+      key: ValueKey('req_$id'),
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOut,
+      opacity: dismissed ? 0 : 1,
+      child: AnimatedSize(
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeInOut,
+        alignment: Alignment.topCenter,
+        child: dismissed ? const SizedBox.shrink() : child,
+      ),
+    );
   }
 
   Widget _ministryTile(Map<String, dynamic> m) {
@@ -396,8 +451,8 @@ class _MinistriesPageState extends State<MinistriesPage>
             _confirmDeleteMinistry(ministryId: id, ministryName: name);
           }
         },
-        itemBuilder: (context) => [
-          const PopupMenuItem(
+        itemBuilder: (context) => const [
+          PopupMenuItem(
             value: 'delete',
             child: Row(
               children: [
@@ -507,6 +562,7 @@ class _MinistriesPageState extends State<MinistriesPage>
                 if (!snap.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
+
                 // Filter by search query (case-insensitive)
                 final all = snap.data!
                     .where((m) => _query.isEmpty
@@ -530,31 +586,53 @@ class _MinistriesPageState extends State<MinistriesPage>
 
                 return ListView(
                   children: [
-                    // 🔸 Pending Requests Section (leaders)
+                    // 🔸 Pending Requests Section (leaders; pending-only; tap to disintegrate)
                     if (_isLeader)
                       StreamBuilder<List<Map<String, dynamic>>>(
-                        stream: _myCreationRequestsStream(),
+                        stream: _myPendingCreationRequestsStream(),
                         builder: (context, reqSnap) {
                           if (!reqSnap.hasData || reqSnap.data!.isEmpty) {
                             return const SizedBox.shrink();
                           }
+
+                          // Filter out locally dismissed ones (post-tap disintegration)
+                          final reqs = reqSnap.data!
+                              .where((r) =>
+                          !_dismissedReqIds.contains(r['id'] as String))
+                              .toList();
+
+                          if (reqs.isEmpty) return const SizedBox.shrink();
+
                           return Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               _sectionHeader('Pending Ministry Requests'),
-                              ...reqSnap.data!.map((r) => Card(
-                                child: ListTile(
-                                  title: Text(r['name']),
-                                  trailing: Chip(
-                                    label: Text(
-                                        r['status'].toString().toUpperCase()),
-                                    backgroundColor:
-                                    _statusColor(r['status']).withOpacity(0.15),
-                                    labelStyle: TextStyle(
-                                        color: _statusColor(r['status'])),
+                              ...reqs.map((r) {
+                                final id = r['id'] as String;
+                                final name = r['name'] as String? ?? '';
+
+                                return _disintegrateTile(
+                                  id: id,
+                                  child: Card(
+                                    child: ListTile(
+                                      title: Text(name),
+                                      subtitle:
+                                      const Text('Awaiting pastoral approval'),
+                                      trailing: Chip(
+                                        label: const Text('PENDING'),
+                                        backgroundColor:
+                                        Colors.orange.withOpacity(0.15),
+                                        labelStyle: const TextStyle(
+                                            color: Colors.orange),
+                                      ),
+                                      // 👇 Tap to disintegrate locally (pure UX; no write)
+                                      onTap: () {
+                                        setState(() => _dismissedReqIds.add(id));
+                                      },
+                                    ),
                                   ),
-                                ),
-                              )),
+                                );
+                              }),
                             ],
                           );
                         },
@@ -584,7 +662,7 @@ class _MinistriesPageState extends State<MinistriesPage>
               },
             ),
 
-            // ---- TAB 2: Creation Requests (leaders only) ----
+            // ---- TAB 2: Creation Requests (leaders only; full history) ----
             if (_isLeader)
               StreamBuilder<List<Map<String, dynamic>>>(
                 stream: _myCreationRequestsStream(),
@@ -599,15 +677,16 @@ class _MinistriesPageState extends State<MinistriesPage>
                   return ListView(
                     padding: const EdgeInsets.all(12),
                     children: reqs.map((r) {
+                      final status = (r['status'] ?? '').toString();
                       return Card(
                         child: ListTile(
-                          title: Text(r['name']),
+                          title: Text((r['name'] ?? '').toString()),
                           trailing: Chip(
-                            label: Text(r['status'].toString().toUpperCase()),
+                            label: Text(status.toUpperCase()),
                             backgroundColor:
-                            _statusColor(r['status']).withOpacity(0.15),
+                            _statusColor(status).withOpacity(0.15),
                             labelStyle:
-                            TextStyle(color: _statusColor(r['status'])),
+                            TextStyle(color: _statusColor(status)),
                           ),
                         ),
                       );

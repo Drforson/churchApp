@@ -144,28 +144,28 @@ Future<void> _activateAppCheckDebug() async {
   await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
 }
 
-
 Future<void> _activateAppCheck() async {
   await FirebaseAppCheck.instance.activate(
     androidProvider: kReleaseMode
-        ? AndroidProvider.playIntegrity   // release
-        : AndroidProvider.debug,          // debug/dev
+        ? AndroidProvider.playIntegrity
+        : AndroidProvider.debug,
+    // Use deviceCheck for stability unless App Attest is configured end-to-end
     appleProvider: kReleaseMode
-        ? AppleProvider.appAttest         // or AppleProvider.deviceCheck if App Attest isn't available
+        ? AppleProvider.deviceCheck
         : AppleProvider.debug,
-    // Omit webProvider entirely on mobile
   );
 
-  // Optional: pull a token once so you see useful logs
+  // Force an App Check token now so the first callable won’t race
   try {
     final t = await FirebaseAppCheck.instance.getToken(true);
     debugPrint('[AppCheck] token len=${t?.length ?? 0}');
   } catch (e) {
-    debugPrint('[AppCheck] getToken (expected if debug token not yet registered): $e');
+    debugPrint('[AppCheck] getToken warn: $e');
   }
 
   await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
 }
+
 
 
 Future<void> main() async {

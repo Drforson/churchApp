@@ -560,6 +560,8 @@ class _PastorActionsGrid extends StatelessWidget {
       _PastorActionItem('Profile', Icons.person_rounded, '/profile'),
       _PastorActionItem('Post Announcement', Icons.campaign_rounded,'/post-announcements'),
           _PastorActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),
+      _PastorActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin',
+       ),
       // 👉 NEW: Attendance Setup
       _PastorActionItem(
         'Attendance Setup',

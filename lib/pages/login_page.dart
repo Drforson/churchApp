@@ -38,28 +38,23 @@ class _LoginPageState extends State<LoginPage> {
 
   /// Subscribes this device to broadcast pings and syncs backend user doc & claims.
   Future<void> _postLoginBootstrap() async {
-    // iOS: ask user; Android auto-grants if already allowed
+    // 1) Notifications: ask permission + best-effort topic subscribe
     try {
       await FirebaseMessaging.instance.requestPermission();
-    } catch (_) {
-      // Non-fatal if permissions prompt fails (e.g., Android)
-    }
-
-    // Subscribe to global attendance topic so this device receives start pings
+    } catch (_) {/* ignore */}
     try {
       await FirebaseMessaging.instance.subscribeToTopic('all_members');
-    } catch (_) {
-      // Not critical; attendance still works via future app sessions
-    }
+    } catch (_) {/* ignore */}
 
-    // Ensure server-side user doc exists/updated (Admin SDK; bypasses rules)
-    await _functions.httpsCallable('ensureUserDoc').call(<String, dynamic>{});
-
-    // Sync single-role + custom claims from linked member record (non-fatal)
+    // 2) Best-effort claim sync (callable). DO NOT block login on error.
     try {
       await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call(<String, dynamic>{});
-    } catch (_) {}
+    } catch (e) {
+      // Log locally; do not show a red error that implies login failed.
+      debugPrint('syncUserRoleFromMemberOnLogin failed (non-fatal): $e');
+    }
   }
+
 
   Future<void> _handleLogin() async {
     if (!_formKey.currentState!.validate()) return;
@@ -71,24 +66,14 @@ class _LoginPageState extends State<LoginPage> {
         _password.text.trim(),
       );
 
-      final user = userCred.user;
-      if (user == null) {
-        throw FirebaseAuthException(code: 'no-user', message: 'No user returned.');
-      }
+      // Force fresh ID token before calling any callable
+      await userCred.user!.getIdToken(true);
 
-      // Ensure the callable gets a fresh ID token
-      await user.getIdToken(true);
-
-      // Post-login bootstrap: topic subscribe + ensureUserDoc + sync role/claims
+      // Post-login tasks should never block login
       await _postLoginBootstrap();
 
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/');
-    } on FirebaseFunctionsException catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message ?? 'Server error'), backgroundColor: Colors.red),
-      );
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -96,13 +81,15 @@ class _LoginPageState extends State<LoginPage> {
       );
     } catch (e) {
       if (!mounted) return;
+      // This catch now *only* covers unexpected errors before navigation.
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Login failed: $e'), backgroundColor: Colors.red),
+        const SnackBar(content: Text('Login failed. Please try again.'), backgroundColor: Colors.red),
       );
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
+
 
   void _showForgotPasswordDialog() {
     showDialog(

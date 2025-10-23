@@ -19,7 +19,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
   FirebaseFunctions.instanceFor(region: 'europe-west2');
 
   // Roles we expose in the Grant tab (server will validate anyway)
-  // ✅ Updated to include 'admin' so a pastor can grant admin
+  // ✅ Includes 'admin' so a pastor can grant admin
   static const Set<String> _allowedRoles = {'pastor', 'usher', 'media', 'admin'};
 
   // ======= Identity / state =======
@@ -37,19 +37,26 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
 
   bool _loading = false;
 
-  // Admin check (from legacy role arrays + single role)
-  bool get _isAdminNow {
-    final hasArrayAdmin =
-        _rolesFromUsers.map((e) => e.toLowerCase()).contains('admin') ||
-            _rolesFromMembers.map((e) => e.toLowerCase()).contains('admin');
-    final singleAdmin = (_userSingleRole ?? '').toLowerCase() == 'admin';
-    return hasArrayAdmin || singleAdmin;
+  bool _hasRoleLocal(String role) {
+    final r = role.toLowerCase();
+    final single = (_userSingleRole ?? '').toLowerCase() == r;
+    final fromUsers = _rolesFromUsers.map((e) => e.toLowerCase()).contains(r);
+    final fromMembers =
+    _rolesFromMembers.map((e) => e.toLowerCase()).contains(r);
+    return single || fromUsers || fromMembers;
   }
+
+  // Admin & Pastor checks
+  bool get _isAdminNow => _hasRoleLocal('admin');
+  bool get _isPastorNow => _hasRoleLocal('pastor');
+
+  // 🔑 New unified gate for role management
+  bool get _canManageRoles => _isAdminNow || _isPastorNow;
 
   // ======= Tabs =======
   late final TabController _tabController;
 
-  // Pastor role manager search
+  // Pastor/Admin search
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _debounce;
   bool _searching = false;
@@ -64,12 +71,12 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
   final Set<String> _rolesToRemove = <String>{};
 
   bool get _canGrant =>
-      _selectedMemberIds.isNotEmpty && _rolesToGrant.isNotEmpty;
+      _selectedMemberIds.isNotEmpty && _rolesToGrant.isNotEmpty && _canManageRoles;
 
   // NOTE: we dynamically enable “Remove” if either remove-chips are chosen OR
   // roles exist on selected members (computed at build time).
   bool get _canRemove =>
-      _selectedMemberIds.isNotEmpty && _rolesToRemove.isNotEmpty;
+      _selectedMemberIds.isNotEmpty && _canManageRoles && _rolesToRemove.isNotEmpty;
 
   @override
   void initState() {
@@ -170,7 +177,8 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
 
         _userSingleRole = (singleRole ?? '').trim();
         _rolesFromUsers = rolesFromUsers.map((e) => e.toLowerCase()).toSet().toList();
-        _rolesFromMembers = rolesFromMembers.map((e) => e.toLowerCase()).toSet().toList();
+        _rolesFromMembers =
+            rolesFromMembers.map((e) => e.toLowerCase()).toSet().toList();
         _leadershipMinistriesFromUsers = lmFromUsers;
         _leadershipMinistriesFromMembers = lmFromMembers;
         _isLeader = isLeader || lmFromUsers.isNotEmpty;
@@ -217,7 +225,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
 
       final callable = _functions.httpsCallable(
         'ensureMemberLeaderRole',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 20)),
+        options:  HttpsCallableOptions(timeout: Duration(seconds: 20)),
       );
       await callable.call(<String, dynamic>{'memberId': _linkedMemberId});
 
@@ -254,7 +262,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     try {
       final callable = _functions.httpsCallable(
         'promoteMeToAdmin',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 20)),
+        options:  HttpsCallableOptions(timeout: Duration(seconds: 20)),
       );
       await callable.call(<String, dynamic>{});
       await user.getIdToken(true);
@@ -285,7 +293,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     try {
       final callable = _functions.httpsCallable(
         'setMemberRoles',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 20)),
+        options:  HttpsCallableOptions(timeout: Duration(seconds: 20)),
       );
       await callable.call(<String, dynamic>{
         'memberIds': [_linkedMemberId],
@@ -363,7 +371,14 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
 
   // ===== Pastor/Admin search =====
   Future<void> _runSearch(String query) async {
-    if (!_isAdminNow) return;
+    if (query.isEmpty) {
+      setState(() {
+        _searchResults = [];
+        _searchError = '';
+      });
+      return;
+    }
+
     setState(() {
       _searching = true;
       _searchError = '';
@@ -374,9 +389,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       final col = FirebaseFirestore.instance.collection('members');
       List<QueryDocumentSnapshot<Map<String, dynamic>>> docs = [];
 
-      if (query.isEmpty) {
-        docs = [];
-      } else if (query.contains('@')) {
+      if (query.contains('@')) {
         final qs = await col.where('email', isEqualTo: query.toLowerCase()).limit(10).get();
         docs = qs.docs;
       } else {
@@ -439,9 +452,9 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       _MemberResult m, {
         required bool makePastor,
       }) async {
-    if (!_isAdminNow) {
+    if (!_canManageRoles) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only admins can modify roles.')),
+        const SnackBar(content: Text('Only admins or pastors can modify roles.')),
       );
       return;
     }
@@ -450,7 +463,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
       // Prefer Cloud Function that syncs user+member & claims
       final callable = _functions.httpsCallable(
         'setMemberPastorRole',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 20)),
+        options: HttpsCallableOptions(timeout: Duration(seconds: 20)),
       );
       await callable.call(<String, dynamic>{
         'memberId': m.id,
@@ -478,6 +491,12 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           ),
         );
       }
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('❌ Cloud Function failed: ${e.code} ${e.message ?? ''}')),
+        );
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -487,14 +506,14 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     }
   }
 
-  /// ✅ NEW: Admin grant/removal on a specific member (for pastors/admins)
+  /// ✅ Admin OR Pastor grant/removal on a specific member
   Future<void> _setAdminRoleOnMember(
       _MemberResult m, {
         required bool makeAdmin,
       }) async {
-    if (!_isAdminNow) {
+    if (!_canManageRoles) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only admins can modify roles.')),
+        const SnackBar(content: Text('Only admins or pastors can modify roles.')),
       );
       return;
     }
@@ -502,7 +521,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     try {
       final callable = _functions.httpsCallable(
         'setMemberRoles',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 20)),
+        options: HttpsCallableOptions(timeout: Duration(seconds: 20)),
       );
       await callable.call(<String, dynamic>{
         'memberIds': [m.id],
@@ -547,15 +566,14 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
   }
 
   // ===== NEW: GRANT PERMISSIONS (bulk) =====
-
   Future<void> _bulkApplyRoles({
     required Iterable<String> memberIds,
     required Iterable<String> add,
     required Iterable<String> remove,
   }) async {
-    if (!_isAdminNow) {
+    if (!_canManageRoles) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only admins can modify roles.')),
+        const SnackBar(content: Text('Only admins or pastors can modify roles.')),
       );
       return;
     }
@@ -578,7 +596,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     try {
       final callable = _functions.httpsCallable(
         'setMemberRoles',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 30)),
+        options: HttpsCallableOptions(timeout: Duration(seconds: 30)),
       );
       await callable.call(<String, dynamic>{
         'memberIds': memberIds.toList(),
@@ -815,7 +833,8 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
         }
 
         final bool canRemoveNow = _selectedMemberIds.isNotEmpty &&
-            (_rolesToRemove.isNotEmpty || rolesPresentOnSelection.isNotEmpty);
+            (_rolesToRemove.isNotEmpty || rolesPresentOnSelection.isNotEmpty) &&
+            _canManageRoles;
 
         // Pretty colors
         final colors = [
@@ -860,6 +879,13 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                     canRemoveNow: canRemoveNow,
                     inferredRolesToRemove: rolesPresentOnSelection,
                   ),
+                  if (!_canManageRoles) ...[
+                    const SizedBox(height: 8),
+                    const Text(
+                      'You are not an Admin or Pastor. Role changes are disabled.',
+                      style: TextStyle(color: Colors.redAccent),
+                    ),
+                  ]
                 ],
               ),
             ),
@@ -884,7 +910,9 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                     final groupMembers = filtered.where((m) {
                       final mins = m['ministries'];
                       return mins is List &&
-                          mins.map((e) => e.toString()).contains(ministryName);
+                          mins
+                              .map((e) => e.toString())
+                              .contains(ministryName);
                     }).toList();
 
                     if (groupMembers.isEmpty) {
@@ -1042,8 +1070,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                         fontWeight: FontWeight.bold, fontSize: 20)),
                 const SizedBox(height: 20),
                 Text("👤 User ID: ${_userId ?? 'Not logged in'}"),
-                Text(
-                    "🆔 Linked Member ID: ${_linkedMemberId ?? 'Not linked'}"),
+                Text("🆔 Linked Member ID: ${_linkedMemberId ?? 'Not linked'}"),
                 if (_linkedMemberName != null) ...[
                   const SizedBox(height: 8),
                   Text("📛 Member Name: $_linkedMemberName"),
@@ -1180,36 +1207,48 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
                           OutlinedButton.icon(
                             icon: const Icon(Icons.remove),
                             label: const Text('Remove Pastor'),
-                            onPressed: () => _setPastorRoleOnMember(
-                                m,
-                                makePastor: false),
+                            onPressed: _canManageRoles
+                                ? () => _setPastorRoleOnMember(
+                              m,
+                              makePastor: false,
+                            )
+                                : null,
                           )
                         else
                           ElevatedButton.icon(
                             icon: const Icon(Icons.add),
                             label: const Text('Grant Pastor'),
-                            onPressed: () => _setPastorRoleOnMember(
-                                m,
-                                makePastor: true),
+                            onPressed: _canManageRoles
+                                ? () => _setPastorRoleOnMember(
+                              m,
+                              makePastor: true,
+                            )
+                                : null,
                           ),
-                        // ✅ Admin controls per member
+                        // ✅ Admin controls per member (Admin OR Pastor)
                         if (m.roles
                             .map((e) => e.toLowerCase())
                             .contains('admin'))
                           OutlinedButton.icon(
                             icon: const Icon(Icons.shield),
                             label: const Text('Remove Admin'),
-                            onPressed: () => _setAdminRoleOnMember(
-                                m,
-                                makeAdmin: false),
+                            onPressed: _canManageRoles
+                                ? () => _setAdminRoleOnMember(
+                              m,
+                              makeAdmin: false,
+                            )
+                                : null,
                           )
                         else
                           ElevatedButton.icon(
                             icon: const Icon(Icons.shield),
                             label: const Text('Grant Admin'),
-                            onPressed: () => _setAdminRoleOnMember(
-                                m,
-                                makeAdmin: true),
+                            onPressed: _canManageRoles
+                                ? () => _setAdminRoleOnMember(
+                              m,
+                              makeAdmin: true,
+                            )
+                                : null,
                           ),
                       ],
                     ),
