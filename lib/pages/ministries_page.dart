@@ -361,21 +361,30 @@ class _MinistriesPageState extends State<MinistriesPage>
   })
       .toList());
 
-  // Pending-only (auto-vanish when approved/rejected); keep ids for local dismiss.
+  // Pending-only (defensive normalization too)
   Stream<List<Map<String, dynamic>>> _myPendingCreationRequestsStream() {
     if (_uid == null) return const Stream.empty();
+
     return _db
         .collection('ministry_creation_requests')
         .where('requestedByUid', isEqualTo: _uid)
-        .where('status', isEqualTo: 'pending')
+        .where('status', isEqualTo: 'pending') // server-side filter
         .orderBy('requestedAt', descending: true)
         .snapshots()
         .map((qs) => qs.docs
-        .map((d) => {
-      'id': d.id,
-      'name': d['name'],
-      'status': d['status'],
+        .map((d) {
+      final map = d.data();
+      final rawStatus = (map['status'] ?? '').toString();
+      final status = rawStatus.trim().toLowerCase(); // normalize
+      final name = (map['name'] ?? '').toString();
+      return {
+        'id': d.id,
+        'name': name,
+        'status': status,
+      };
     })
+    // client-side defensive filter (ignores stale/odd-cased docs)
+        .where((m) => (m['status'] as String) == 'pending')
         .toList());
   }
 
@@ -388,10 +397,13 @@ class _MinistriesPageState extends State<MinistriesPage>
         .orderBy('requestedAt', descending: true)
         .snapshots()
         .map((qs) => qs.docs
-        .map((d) => {
-      'id': d.id,
-      'name': d['name'],
-      'status': d['status'],
+        .map((d) {
+      final map = d.data();
+      return {
+        'id': d.id,
+        'name': (map['name'] ?? '').toString(),
+        'status': (map['status'] ?? '').toString().trim().toLowerCase(),
+      };
     })
         .toList());
   }
@@ -595,10 +607,12 @@ class _MinistriesPageState extends State<MinistriesPage>
                             return const SizedBox.shrink();
                           }
 
-                          // Filter out locally dismissed ones (post-tap disintegration)
+                          // Filter out locally dismissed AND ensure status is truly 'pending'
                           final reqs = reqSnap.data!
                               .where((r) =>
-                          !_dismissedReqIds.contains(r['id'] as String))
+                          !_dismissedReqIds.contains(r['id'] as String) &&
+                              (r['status'] as String).trim().toLowerCase() ==
+                                  'pending')
                               .toList();
 
                           if (reqs.isEmpty) return const SizedBox.shrink();
@@ -622,8 +636,8 @@ class _MinistriesPageState extends State<MinistriesPage>
                                         label: const Text('PENDING'),
                                         backgroundColor:
                                         Colors.orange.withOpacity(0.15),
-                                        labelStyle: const TextStyle(
-                                            color: Colors.orange),
+                                        labelStyle:
+                                        const TextStyle(color: Colors.orange),
                                       ),
                                       // 👇 Tap to disintegrate locally (pure UX; no write)
                                       onTap: () {
