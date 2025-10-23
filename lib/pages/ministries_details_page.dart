@@ -672,7 +672,7 @@ class _MembersTabState extends State<_MembersTab> {
   }
 
   String _initials(String name) {
-    final parts = name.trim().split(RegExp(r'\s+'));
+    final parts = name.trim().split(RegExp(r'\\s+'));
     if (parts.isEmpty) return '?';
     if (parts.length == 1) return parts.first.characters.take(2).toString().toUpperCase();
     return (parts.first.characters.take(1).toString() + parts.last.characters.take(1).toString()).toUpperCase();
@@ -1131,15 +1131,18 @@ class _FeedTabState extends State<_FeedTab> {
                                 color: youLiked ? Colors.redAccent : null,
                                 tooltip: youLiked ? 'Unlike' : 'Like',
                               ),
+                              Text(' ${likes.length} likes', style: const TextStyle(color: Colors.black54)),
+                              const Spacer(),
                               StreamBuilder<QuerySnapshot>(
                                 stream: d.reference.collection('comments').orderBy('createdAt', descending: false).snapshots(),
                                 builder: (context, csnap) {
                                   final count = csnap.data?.size ?? 0;
-                                  return Text('$count comments', style: const TextStyle(color: Colors.black54));
+                                  return Padding(
+                                    padding: const EdgeInsets.only(right: 6.0),
+                                    child: Text('$count comments', style: const TextStyle(color: Colors.black54)),
+                                  );
                                 },
                               ),
-                              const Spacer(),
-                              Text('${likes.length} likes', style: const TextStyle(color: Colors.black54)),
                               IconButton(
                                 tooltip: 'Comments',
                                 onPressed: () => _openComments(d.reference),
