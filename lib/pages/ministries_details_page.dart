@@ -1,5 +1,7 @@
+// lib/pages/ministries_details_page.dart
+// Drop-in page: Members (with leader star + moderation) + Feed (emoji reactions, comments)
+// and resilient link previews (YouTube thumbnail + social host card fallbacks).
 
-// lib/pages/ministries_details_page.dart (MERGED + Likes/Comments + Rich Previews + Leader star)
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -8,7 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-// Feed dependencies (existing in your project)
+// Your existing project deps
 import '../models/post_model.dart';
 import '../services/post_service.dart';
 import '../services/link_preview_service.dart';
@@ -71,7 +73,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
 }
 
 // ===================================================================
-// Members Tab (modern UI + leader tools)
+// Members Tab (leader star + moderation)
 // ===================================================================
 class _MembersTab extends StatefulWidget {
   final String ministryId;
@@ -104,7 +106,9 @@ class _MembersTabState extends State<_MembersTab> {
     final userSnap = await _db.collection('users').doc(uid).get();
     final data = userSnap.data() ?? {};
     _myMemberId = data['memberId'] as String?;
-    final mins = (data['leadershipMinistries'] is List) ? List<String>.from(data['leadershipMinistries']) : <String>[];
+    final mins = (data['leadershipMinistries'] is List)
+        ? List<String>.from(data['leadershipMinistries'])
+        : <String>[];
     setState(() {
       _isLeaderHere = mins.map((e) => e.toLowerCase()).contains(widget.ministryName.toLowerCase());
     });
@@ -186,7 +190,12 @@ class _MembersTabState extends State<_MembersTab> {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        if (_isLeaderHere) _JoinRequestsCard(stream: _joinRequestsStream(), onApprove: _approveJoin, onReject: _rejectJoin),
+        if (_isLeaderHere)
+          _JoinRequestsCard(
+            stream: _joinRequestsStream(),
+            onApprove: _approveJoin,
+            onReject: _rejectJoin,
+          ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
           child: TextField(
@@ -265,6 +274,7 @@ class _MembersTabState extends State<_MembersTab> {
                     return ListTile(
                       contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                       leading: Stack(
+                        clipBehavior: Clip.none,
                         children: [
                           _Avatar(initials: m.initials, photoUrl: m.photoUrl),
                           if (isLeaderHere)
@@ -275,13 +285,16 @@ class _MembersTabState extends State<_MembersTab> {
                             ),
                         ],
                       ),
-                      title: Text(m.fullName ?? 'Unknown',
-                          style: const TextStyle(fontWeight: FontWeight.w600)),
+                      title: Text(
+                        m.fullName ?? 'Unknown',
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
                       subtitle: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           if (m.email != null && m.email!.isNotEmpty) Text(m.email!),
-                          if (m.phoneNumber != null && m.phoneNumber!.isNotEmpty) Text(m.phoneNumber!),
+                          if (m.phoneNumber != null && m.phoneNumber!.isNotEmpty)
+                            Text(m.phoneNumber!),
                           Wrap(
                             spacing: 8,
                             runSpacing: -6,
@@ -299,22 +312,35 @@ class _MembersTabState extends State<_MembersTab> {
                           try {
                             if (value == 'promote') {
                               await _promoteToLeader(m.id);
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Promoted to leader.')));
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Promoted to leader.')),
+                              );
                             } else if (value == 'demote') {
                               await _demoteLeader(m.id);
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Demoted from leader.')));
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Demoted from leader.')),
+                              );
                             } else if (value == 'remove') {
                               await _removeFromMinistry(m.id);
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Removed from ministry.')));
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Removed from ministry.')),
+                              );
                             }
                           } catch (e) {
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Action failed: $e')));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('Action failed: $e')),
+                            );
                           }
                         },
                         itemBuilder: (context) => [
-                          if (!isLeaderHere) const PopupMenuItem(value: 'promote', child: Text('Promote to leader')),
-                          if (isLeaderHere) const PopupMenuItem(value: 'demote', child: Text('Demote leader')),
-                          const PopupMenuItem(value: 'remove', child: Text('Remove from ministry')),
+                          if (!isLeaderHere)
+                            const PopupMenuItem(
+                                value: 'promote', child: Text('Promote to leader')),
+                          if (isLeaderHere)
+                            const PopupMenuItem(
+                                value: 'demote', child: Text('Demote leader')),
+                          const PopupMenuItem(
+                              value: 'remove', child: Text('Remove from ministry')),
                         ],
                         icon: const Icon(Icons.more_vert),
                       )
@@ -372,7 +398,8 @@ class _JoinRequestsCard extends StatelessWidget {
                 const SizedBox(height: 8),
                 ...pending.map((d) {
                   final data = d.data();
-                  final requesterName = (data['memberName'] ?? data['requesterName'] ?? 'Member').toString();
+                  final requesterName =
+                  (data['memberName'] ?? data['requesterName'] ?? 'Member').toString();
                   return ListTile(
                     dense: true,
                     leading: const Icon(Icons.person_add_alt_1_outlined),
@@ -403,7 +430,7 @@ class _JoinRequestsCard extends StatelessWidget {
 }
 
 // ===================================================================
-// Feed Tab (with Likes + Comments + Rich link fallback for YouTube)
+// Feed Tab (emoji reactions + comments + resilient link preview)
 // ===================================================================
 class _FeedTab extends StatefulWidget {
   final String ministryId;   // ministries/{id}
@@ -509,21 +536,16 @@ class _FeedTabState extends State<_FeedTab> {
       String? authorName;
       String? authorPhotoUrl;
 
-      final userDoc = await FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .get();
+      final userDoc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
       final memberId = userDoc.data()?['memberId'] as String?;
 
       if (memberId != null && memberId.isNotEmpty) {
-        final memberDoc = await FirebaseFirestore.instance
-            .collection('members')
-            .doc(memberId)
-            .get();
+        final memberDoc =
+        await FirebaseFirestore.instance.collection('members').doc(memberId).get();
         final m = memberDoc.data() ?? {};
         final first = (m['firstName'] ?? '').toString().trim();
-        final last  = (m['lastName']  ?? '').toString().trim();
-        final full  = ('$first $last').trim();
+        final last = (m['lastName'] ?? '').toString().trim();
+        final full = ('$first $last').trim();
         authorName = full.isEmpty ? null : full;
 
         if ((m['photoUrl'] ?? '').toString().isNotEmpty) {
@@ -535,13 +557,16 @@ class _FeedTabState extends State<_FeedTab> {
       authorName ??= (user.email ?? '').trim();
       if (authorName.isEmpty) authorName = 'Member';
 
+      // Normalize link to ensure scheme so previews don't fail
+      final normalizedLink = hasLink ? _ensureScheme(_linkCtrl.text.trim()) : null;
+
       await _svc.createPost(
         ministryId: widget.ministryId,
         authorId: user.uid,
         authorName: authorName,
         authorPhotoUrl: authorPhotoUrl,
         text: hasText ? _textCtrl.text.trim() : null,
-        linkUrl: hasLink ? _linkCtrl.text.trim() : null,
+        linkUrl: normalizedLink,
         imageFile: hasImage ? _imageFile : null,
       );
 
@@ -760,8 +785,7 @@ class _PostCard extends StatelessWidget {
             // Header
             ListTile(
               leading: CircleAvatar(
-                backgroundImage:
-                (post.authorPhotoUrl != null && post.authorPhotoUrl!.isNotEmpty)
+                backgroundImage: (post.authorPhotoUrl != null && post.authorPhotoUrl!.isNotEmpty)
                     ? NetworkImage(post.authorPhotoUrl!)
                     : null,
                 child: (post.authorPhotoUrl == null || post.authorPhotoUrl!.isEmpty)
@@ -823,53 +847,11 @@ class _PostCard extends StatelessWidget {
                 child: Text(post.text!.trim()),
               ),
 
-            // Link preview with YouTube fallback
-            if ((post.linkUrl ?? '').isNotEmpty)
+            // Resilient Link Preview
+            if ((post.linkUrl ?? '').trim().isNotEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12.0),
-                child: FutureBuilder(
-                  future: LinkPreviewService.instance.fetch(post.linkUrl!.trim()),
-                  builder: (context, snap) {
-                    if (snap.connectionState == ConnectionState.waiting) {
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 8.0),
-                        child: Row(
-                          children: const [
-                            SizedBox(
-                              height: 18,
-                              width: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                            SizedBox(width: 8),
-                            Text('Fetching preview...'),
-                          ],
-                        ),
-                      );
-                    }
-                    final preview = snap.data;
-                    if (preview == null) {
-                      final url = post.linkUrl!.trim();
-                      final ytId = _youtubeId(url);
-                      if (ytId != null) {
-                        // Fallback: show YouTube thumbnail with play icon
-                        return _YouTubeThumb(url: url, videoId: ytId);
-                      }
-                      // Fallback: clickable host chip
-                      return Align(
-                        alignment: Alignment.centerLeft,
-                        child: ActionChip(
-                          avatar: const Icon(Icons.link),
-                          label: Text(Uri.parse(url).host),
-                          onPressed: () => launchUrl(
-                            Uri.parse(url),
-                            mode: LaunchMode.externalApplication,
-                          ),
-                        ),
-                      );
-                    }
-                    return LinkPreviewCard(preview: preview);
-                  },
-                ),
+                child: _LinkPreviewArea(url: post.linkUrl!.trim()),
               ),
 
             // Image
@@ -885,11 +867,9 @@ class _PostCard extends StatelessWidget {
               ),
             ],
 
-            // Actions: Like / Comment
-            _PostActions(
-              ministryId: ministryId,
-              postId: post.id,
-            ),
+            // Reactions + Comments
+            _EmojiReactions(ministryId: ministryId, postId: post.id),
+            _CommentBar(ministryId: ministryId, postId: post.id),
           ],
         ),
       ),
@@ -897,85 +877,123 @@ class _PostCard extends StatelessWidget {
   }
 }
 
-// ========= Actions Row (likes & comments) =========
-class _PostActions extends StatelessWidget {
+// ========= Emoji Reactions =========
+// Stored as: ministries/{ministryId}/posts/{postId}/reactions/{uid_emoji}
+// { authorUid, emoji, createdAt, updatedAt }
+class _EmojiReactions extends StatelessWidget {
+  static const List<String> emojis = ['👍', '❤️', '😂', '🙏', '🔥'];
+
   final String ministryId;
   final String postId;
-  const _PostActions({required this.ministryId, required this.postId});
+  const _EmojiReactions({required this.ministryId, required this.postId});
+
+  String _docId(String uid, String emoji) => '${uid}_${emoji.codeUnits.join("-")}';
+
+  Future<void> _toggle(String emoji) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    final postRef =
+    FirebaseFirestore.instance.collection('ministries').doc(ministryId).collection('posts').doc(postId);
+    final docId = _docId(uid, emoji);
+    final reactRef = postRef.collection('reactions').doc(docId);
+
+    final snap = await reactRef.get();
+    if (snap.exists) {
+      await reactRef.delete();
+      if (emoji == '❤️') {
+        await postRef.update({'likes': FieldValue.arrayRemove([uid])});
+      }
+    } else {
+      await reactRef.set({
+        'authorUid': uid,
+        'emoji': emoji,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      if (emoji == '❤️') {
+        await postRef.update({'likes': FieldValue.arrayUnion([uid])});
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    final postRef = FirebaseFirestore.instance
-        .collection('ministries')
-        .doc(ministryId)
-        .collection('posts')
-        .doc(postId);
+    final postRef =
+    FirebaseFirestore.instance.collection('ministries').doc(ministryId).collection('posts').doc(postId);
 
-    final commentsQuery = postRef.collection('comments').orderBy('createdAt', descending: true);
-
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: postRef.snapshots(),
-      builder: (context, docSnap) {
-        final data = docSnap.data()?.data() ?? {};
-        final likes = (data['likes'] is List) ? List<String>.from(data['likes']) : <String>[];
-        final myLiked = uid != null && likes.contains(uid);
-        final likeCount = likes.length;
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: postRef.collection('reactions').snapshots(),
+      builder: (context, snap) {
+        final counts = <String, int>{for (final e in emojis) e: 0};
+        final mine = <String, bool>{for (final e in emojis) e: false};
+        if (snap.hasData) {
+          for (final d in snap.data!.docs) {
+            final data = d.data();
+            final e = (data['emoji'] ?? '').toString();
+            if (emojis.contains(e)) {
+              counts[e] = (counts[e] ?? 0) + 1;
+              if (data['authorUid'] == uid) {
+                mine[e] = true;
+              }
+            }
+          }
+        }
 
         return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8.0),
-          child: Row(
-            children: [
-              IconButton(
-                icon: Icon(myLiked ? Icons.favorite : Icons.favorite_border),
-                color: myLiked ? Colors.red : null,
-                onPressed: uid == null
-                    ? null
-                    : () async {
-                  try {
-                    if (myLiked) {
-                      await postRef.update({
-                        'likes': FieldValue.arrayRemove([uid])
-                      });
-                    } else {
-                      await postRef.update({
-                        'likes': FieldValue.arrayUnion([uid])
-                      });
-                    }
-                  } catch (e) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Failed to update like: $e')),
-                    );
-                  }
-                },
-              ),
-              Text('$likeCount'),
-              const SizedBox(width: 16),
-              IconButton(
-                icon: const Icon(Icons.mode_comment_outlined),
-                onPressed: () {
-                  showModalBottomSheet(
-                    context: context,
-                    isScrollControlled: true,
-                    useSafeArea: true,
-                    builder: (_) => _CommentsSheet(ministryId: ministryId, postId: postId),
-                  );
-                },
-              ),
-              // live comment count (lightweight aggregate using withConverter to not load bodies)
-              StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                stream: commentsQuery.limit(1).snapshots(),
-                builder: (context, snap) {
-                  // We don't have count without aggregate; show placeholder icon text
-                  // You can store commentCount on post via CF for accuracy.
-                  // Here we just show a dash to keep the UI consistent.
-                  return const Text('');
-                },
-              ),
-            ],
+          padding: const EdgeInsets.symmetric(horizontal: 4.0),
+          child: Wrap(
+            spacing: 6,
+            children: emojis.map((e) {
+              final active = mine[e] == true;
+              final c = counts[e] ?? 0;
+              return OutlinedButton(
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: active ? Colors.blue : Theme.of(context).dividerColor),
+                  backgroundColor: active ? Colors.blue.withOpacity(0.08) : null,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  minimumSize: const Size(0, 0),
+                ),
+                onPressed: uid == null ? null : () => _toggle(e),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(e, style: const TextStyle(fontSize: 16)),
+                    const SizedBox(width: 6),
+                    Text(c.toString(), style: const TextStyle(fontSize: 13)),
+                  ],
+                ),
+              );
+            }).toList(),
           ),
         );
       },
+    );
+  }
+}
+
+// ========= Comment Bar (opens sheet) =========
+class _CommentBar extends StatelessWidget {
+  final String ministryId;
+  final String postId;
+  const _CommentBar({required this.ministryId, required this.postId});
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: () {
+          showModalBottomSheet(
+            context: context,
+            isScrollControlled: true,
+            useSafeArea: true,
+            builder: (_) => _CommentsSheet(ministryId: ministryId, postId: postId),
+          );
+        },
+        icon: const Icon(Icons.mode_comment_outlined),
+        label: const Text('Comments'),
+      ),
     );
   }
 }
@@ -1016,7 +1034,9 @@ class _CommentsSheetState extends State<_CommentsSheet> {
       });
       _textCtrl.clear();
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+      }
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -1045,7 +1065,11 @@ class _CommentsSheetState extends State<_CommentsSheet> {
           mainAxisSize: MainAxisSize.min,
           children: [
             const SizedBox(height: 8),
-            Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey.shade400, borderRadius: BorderRadius.circular(4))),
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(color: Colors.grey.shade400, borderRadius: BorderRadius.circular(4)),
+            ),
             const SizedBox(height: 8),
             Text('Comments', style: Theme.of(context).textTheme.titleMedium),
             const Divider(height: 16),
@@ -1071,7 +1095,6 @@ class _CommentsSheetState extends State<_CommentsSheet> {
                       final text = (c['text'] ?? '').toString();
                       final ts = c['createdAt'];
                       return ListTile(
-                        dense: false,
                         leading: const CircleAvatar(child: Icon(Icons.person_outline)),
                         title: Text(text),
                         subtitle: Text(ts is Timestamp ? ts.toDate().toLocal().toString() : ''),
@@ -1127,7 +1150,7 @@ class _YouTubeThumb extends StatelessWidget {
         alignment: Alignment.center,
         children: [
           AspectRatio(
-            aspectRatio: 16/9,
+            aspectRatio: 16 / 9,
             child: Image.network(
               thumb,
               fit: BoxFit.cover,
@@ -1135,7 +1158,7 @@ class _YouTubeThumb extends StatelessWidget {
             ),
           ),
           Container(
-            decoration: BoxDecoration(
+            decoration: const BoxDecoration(
               color: Colors.black54,
               shape: BoxShape.circle,
             ),
@@ -1143,6 +1166,116 @@ class _YouTubeThumb extends StatelessWidget {
             child: const Icon(Icons.play_arrow, color: Colors.white, size: 36),
           )
         ],
+      ),
+    );
+  }
+}
+
+// --- Link helpers & resilient preview ---
+String _ensureScheme(String u) {
+  final t = u.trim();
+  if (t.isEmpty) return t;
+  if (t.startsWith('http://') || t.startsWith('https://')) return t;
+  return 'https://$t';
+}
+
+bool _isYouTubeHost(String h) => h.contains('youtube.com') || h.contains('youtu.be');
+bool _isInstagramHost(String h) => h.contains('instagram.com');
+bool _isXHost(String h) => h == 'x.com' || h.contains('twitter.com');
+bool _isTikTokHost(String h) => h.contains('tiktok.com');
+bool _isFacebookHost(String h) => h.contains('facebook.com');
+
+Future<dynamic> _safeFetchPreview(String url) async {
+  try {
+    return await LinkPreviewService.instance.fetch(url);
+  } catch (_) {
+    return null;
+  }
+}
+
+class _LinkPreviewArea extends StatelessWidget {
+  final String url;
+  const _LinkPreviewArea({required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    final normalized = _ensureScheme(url);
+    Uri? uri;
+    try {
+      uri = Uri.parse(normalized);
+    } catch (_) {}
+
+    // If YouTube, reliably show thumbnail even if preview fetch fails
+    if (uri != null && _isYouTubeHost(uri.host)) {
+      final ytId = _youtubeId(normalized);
+      if (ytId != null) return _YouTubeThumb(url: normalized, videoId: ytId);
+    }
+
+    return FutureBuilder(
+      future: _safeFetchPreview(normalized),
+      builder: (context, snap) {
+        // 1) Your service returned rich preview
+        if (snap.hasData && snap.data != null) {
+          return LinkPreviewCard(preview: snap.data);
+        }
+
+        // 2) Social fallbacks for hosts that usually block OG scraping (esp. on Web)
+        if (uri != null) {
+          final host = uri.host;
+          final path = '/${uri.pathSegments.join('/')}';
+          if (_isInstagramHost(host) || _isXHost(host) || _isTikTokHost(host) || _isFacebookHost(host)) {
+            return _SocialHostCard(
+              host: host,
+              path: path.isEmpty ? '/' : path,
+              onOpen: () => launchUrl(uri!, mode: LaunchMode.externalApplication),
+            );
+          }
+        }
+
+        // 3) Generic fallback
+        final hostLabel = (uri?.host ?? 'Open link');
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: ActionChip(
+            avatar: const Icon(Icons.link),
+            label: Text(hostLabel),
+            onPressed: () => launchUrl(Uri.parse(normalized), mode: LaunchMode.externalApplication),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SocialHostCard extends StatelessWidget {
+  final String host;
+  final String path;
+  final VoidCallback onOpen;
+
+  const _SocialHostCard({
+    required this.host,
+    required this.path,
+    required this.onOpen,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.only(top: 8),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ListTile(
+        leading: const CircleAvatar(child: Icon(Icons.public)),
+        title: Text(host, style: const TextStyle(fontWeight: FontWeight.w600)),
+        subtitle: Text(
+          path,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+        ),
+        trailing: FilledButton(
+          onPressed: onOpen,
+          child: const Text('Open'),
+        ),
       ),
     );
   }
@@ -1245,7 +1378,7 @@ class _Member {
   static String _composeName(Map<String, dynamic> d) {
     final f = (d['firstName'] ?? '').toString().trim();
     final l = (d['lastName'] ?? '').toString().trim();
-    final both = (f + ' ' + l).trim();
+    final both = ('$f $l').trim();
     return both.isEmpty ? 'Member' : both;
   }
 
@@ -1257,7 +1390,7 @@ class _Member {
     if (n.isEmpty) return '?';
     final parts = n.split(RegExp(r'\s+')).where((p) => p.isNotEmpty).toList();
     if (parts.length == 1) return parts.first.substring(0, 1).toUpperCase();
-    return (parts.first.substring(0,1) + parts.last.substring(0,1)).toUpperCase();
+    return (parts.first.substring(0, 1) + parts.last.substring(0, 1)).toUpperCase();
   }
 
   bool hasRole(String role) {
@@ -1267,9 +1400,11 @@ class _Member {
 
   bool isLeaderOf(String ministryName) {
     final m = ministryName.toLowerCase();
-    final inLeaderMins = leadershipMinistries.map((e) => e.toString().toLowerCase()).contains(m);
+    final inLeaderMins =
+    leadershipMinistries.map((e) => e.toString().toLowerCase()).contains(m);
     final hasLeaderRole = hasRole('leader');
-    final inThisMinistry = ministries.map((e) => e.toString().toLowerCase()).contains(m);
+    final inThisMinistry =
+    ministries.map((e) => e.toString().toLowerCase()).contains(m);
     return inLeaderMins || (hasLeaderRole && inThisMinistry);
   }
 }
@@ -1281,11 +1416,11 @@ class _Avatar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final radius = 22.0;
+    const radius = 22.0;
     if (photoUrl != null && photoUrl!.isNotEmpty) {
       return CircleAvatar(radius: radius, backgroundImage: NetworkImage(photoUrl!));
     }
-    return CircleAvatar(radius: radius, child: Text(initials));
+    return const CircleAvatar(radius: radius, child: Icon(Icons.person_outline));
   }
 }
 
