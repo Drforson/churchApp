@@ -296,8 +296,10 @@ async function writeNotification(payload) {
 }
 
 /* =========================
-   Ministries utilities
+   Ministries / join helpers
    ========================= */
+
+/** Add (and optionally lead) a member to a ministry, by NAME */
 async function addMemberToMinistry(memberId, ministryName, { asLeader = false } = {}) {
   if (!memberId || !ministryName) return;
   const updates = {
@@ -308,6 +310,93 @@ async function addMemberToMinistry(memberId, ministryName, { asLeader = false } 
     updates.leadershipMinistries = admin.firestore.FieldValue.arrayUnion(ministryName);
   }
   await db.doc(`members/${memberId}`).set(updates, { merge: true });
+}
+
+/** Remove member from ministry (and leadership if present), by NAME */
+async function removeMemberFromMinistryByName(memberId, ministryName) {
+  if (!memberId || !ministryName) return;
+  await db.doc(`members/${memberId}`).set({
+    ministries: admin.firestore.FieldValue.arrayRemove(ministryName),
+    leadershipMinistries: admin.firestore.FieldValue.arrayRemove(ministryName),
+    updatedAt: ts(),
+  }, { merge: true });
+}
+
+/**
+ * Resolve ministry by a flexible payload coming from a join request or direct args.
+ * Accepts:
+ *   - jr.ministryName (string)
+ *   - jr.ministryId   (either DOC ID or NAME)
+ *   - jr.ministryDocId (doc id)
+ *   - jr.ministry     (string name OR object { id, name })
+ * Returns { ministryName, ministryDocId } where possible (at least name if exists).
+ */
+async function resolveMinistryFromJoin(jr) {
+  // direct known fields
+  let ministryName = S(jr.ministryName);
+  let ministryDocId = S(jr.ministryDocId) || '';
+
+  // support jr.ministry being a string or object
+  if (!ministryName && jr?.ministry) {
+    if (typeof jr.ministry === 'string') {
+      ministryName = S(jr.ministry);
+    } else if (typeof jr.ministry === 'object') {
+      ministryName = S(jr.ministry.name);
+      ministryDocId = ministryDocId || S(jr.ministry.id);
+    }
+  }
+
+  // legacy / flexible "ministryId" that could be either a docId or a name
+  const rawId = S(jr.ministryId);
+  if (!ministryName && rawId) {
+    // Try as doc id first
+    try {
+      const doc = await db.doc(`ministries/${rawId}`).get();
+      if (doc.exists) {
+        ministryDocId = doc.id;
+        const d = doc.data() || {};
+        ministryName = S(d.name) || ministryName;
+      }
+    } catch (_) {}
+    // If still no name, treat rawId as NAME (legacy)
+    if (!ministryName) {
+      ministryName = rawId;
+    }
+  }
+
+  // If we still don't have a doc id, try find by name
+  if (!ministryDocId && ministryName) {
+    const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+    if (!mins.empty) {
+      ministryDocId = mins.docs[0].id;
+    }
+  }
+
+  return {
+    ministryName: ministryName || null,
+    ministryDocId: ministryDocId || null,
+  };
+}
+
+/** Resolve a ministry from a single string that may be a name or a doc id */
+async function resolveMinistryByNameOrId(nameOrId) {
+  const candidate = S(nameOrId);
+  if (!candidate) return { ministryName: null, ministryDocId: null };
+  // Try doc id
+  try {
+    const d = await db.doc(`ministries/${candidate}`).get();
+    if (d.exists) {
+      const data = d.data() || {};
+      return { ministryName: S(data.name) || null, ministryDocId: d.id };
+    }
+  } catch (_) {}
+  // Treat as name
+  const q = await db.collection('ministries').where('name', '==', candidate).limit(1).get();
+  if (!q.empty) {
+    return { ministryName: candidate, ministryDocId: q.docs[0].id };
+  }
+  // Unknown ministry; still return the name we were given
+  return { ministryName: candidate, ministryDocId: null };
 }
 
 async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
@@ -569,7 +658,7 @@ exports.onMinistryRequestApproved = onDocumentUpdated(
     if (!before || !after) return;
 
     const prev = toLc(S(before.status || 'pending'));
-    const theNext = toLc(S(after.status  || 'pending'));
+    theNext = toLc(S(after.status  || 'pending'));
 
     if (prev === 'approved' || theNext !== 'approved') return;
 
@@ -702,15 +791,10 @@ exports.onJoinRequestCreated = onDocumentCreated(
     if (!doc) return;
     const jr = doc.data() || {};
     const memberId = S(jr.memberId);
-    const ministryName = S(jr.ministryId); // NAME (matches members[].ministries)
     const requestedByUid = S(jr.requestedByUid);
-    if (!ministryName) return;
 
-    let ministryDocId = null;
-    const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
-    if (!mins.empty) {
-      ministryDocId = mins.docs[0].id;
-    }
+    const { ministryName, ministryDocId } = await resolveMinistryFromJoin(jr);
+    if (!ministryName) return;
 
     logger.info('join_requests CREATED', { id: doc.id, ministryName, memberId });
 
@@ -749,14 +833,8 @@ exports.onJoinRequestUpdated = onDocumentUpdated(
     if (prev === theNext) return;
 
     const memberId = S(after.memberId);
-    const ministryName = S(after.ministryId);
+    const { ministryName, ministryDocId } = await resolveMinistryFromJoin(after);
     if (!memberId || !ministryName) return;
-
-    let ministryDocId = S(after.ministryDocId) || null;
-    if (!ministryDocId) {
-      const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
-      if (!mins.empty) ministryDocId = mins.docs[0].id;
-    }
 
     const moderatorUid = S(after.moderatorUid) || null;
 
@@ -791,20 +869,14 @@ exports.onJoinRequestDeleted = onDocumentDeleted(
     const status = toLc(r.status || 'pending');
     if (status !== 'pending') return;
 
-    const ministryName = S(r.ministryId);
-    let ministryDocId = S(r.ministryDocId) || null;
     const requesterMemberId = S(r.memberId);
     const requestedByUid = S(r.requestedByUid);
     const joinRequestId = event.params.id;
 
+    const { ministryName, ministryDocId } = await resolveMinistryFromJoin(r);
     if (!ministryName || !requesterMemberId) return;
 
-    if (!ministryDocId) {
-      const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
-      if (!mins.empty) ministryDocId = mins.docs[0].id;
-    }
-
-    logger.info('join_requests CANCELLED', { id: joinRequestId, ministryName, requesterMemberId });
+    logger.info('join_requests CANCELLED (delete)', { id: joinRequestId, ministryName, requesterMemberId });
 
     await writeLeaderBroadcast({
       ministryName,
@@ -1308,3 +1380,450 @@ exports.overrideAttendanceStatus = onCall(async (req) => {
 
   return { ok: true };
 });
+
+
+/* ===== Leader/Ministry moderation helpers & callables ===== */
+async function isLeaderOfMinistry(uid, ministryName) {
+  if (!uid || !ministryName) return false;
+  try {
+    const uSnap = await db.doc(`users/${uid}`).get();
+    const u = uSnap.data() || {};
+    const roles = Array.isArray(u.roles) ? u.roles.map(toLc) : [];
+    const leadMins = Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : [];
+    const isAdmin = roles.includes('admin');
+    const isLeaderHere = roles.includes('leader') && leadMins.includes(ministryName);
+    return isAdmin || isLeaderHere;
+  } catch (e) {
+    logger.error('isLeaderOfMinistry failed', { uid, ministryName, error: e });
+    return false;
+  }
+}
+
+async function countLeadersInMinistry(ministryName) {
+  const qs = await db.collection('members').where('leadershipMinistries', 'array-contains', ministryName).get();
+  return qs.size;
+}
+
+/** New: Pastor/Admin parity for ministry moderation */
+async function hasMinistryModerationRights(uid, ministryName) {
+  if (!uid || !ministryName) return false;
+  if (await isUserPastorOrAdmin(uid)) return true;
+  return await isLeaderOfMinistry(uid, ministryName);
+}
+
+/**
+ * Leader/Pastor/Admin moderation of a join request (approve/reject).
+ * Accepts either jr.ministryName or jr.ministryId (name or doc id).
+ */
+exports.leaderModerateJoinRequest = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const { requestId, action } = req.data || {};
+  const act = toLc(action);
+  if (!requestId || !['approve','reject'].includes(act)) {
+    throw Object.assign(new Error('INVALID_ARGUMENTS'), { code: 'invalid-argument' });
+  }
+
+  const jrRef = db.collection('join_requests').doc(requestId);
+  const jrSnap = await jrRef.get();
+  if (!jrSnap.exists) throw Object.assign(new Error('NOT_FOUND'), { code: 'not-found' });
+  const jr = jrSnap.data() || {};
+
+  const memberId = S(jr.memberId);
+  const { ministryName } = await resolveMinistryFromJoin(jr);
+  if (!memberId || !ministryName)
+    throw Object.assign(new Error('bad-request'), { code: 'invalid-argument' });
+
+  const allowed = await hasMinistryModerationRights(uid, ministryName);
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const status = toLc(jr.status || 'pending');
+  if (status !== 'pending') throw Object.assign(new Error('ALREADY_PROCESSED'), { code: 'failed-precondition' });
+
+  if (act === 'approve') {
+    const mRef = db.doc(`members/${memberId}`);
+    await db.runTransaction(async (tx) => {
+      const mSnap = await tx.get(mRef);
+      if (!mSnap.exists) throw Object.assign(new Error('MEMBER_NOT_FOUND'), { code: 'not-found' });
+      const m = mSnap.data() || {};
+      const mins = Array.isArray(m.ministries) ? m.ministries.slice() : [];
+      if (!mins.includes(ministryName)) mins.push(ministryName);
+      tx.update(mRef, { ministries: mins, updatedAt: ts() });
+      tx.update(jrRef, { status: 'approved', moderatorUid: uid, updatedAt: ts() });
+    });
+  } else {
+    await jrRef.update({ status: 'rejected', moderatorUid: uid, updatedAt: ts() });
+  }
+
+  try {
+    const { ministryDocId } = await resolveMinistryFromJoin(jr);
+    await notifyRequesterResult({
+      ministryName,
+      ministryDocId,
+      joinRequestId: requestId,
+      requesterMemberId: memberId,
+      result: act === 'approve' ? 'approved' : 'rejected',
+      moderatorUid: uid,
+    });
+  } catch (e) {
+    logger.warn('notifyRequesterResult failed', { requestId, error: e });
+  }
+
+  return { ok: true };
+});
+
+/**
+ * Promote/Demote a member to/from LEADER for a given ministry.
+ * Parity: Pastor/Admin OR leaders of that ministry may promote/demote.
+ * Body:
+ *   - memberId (required)
+ *   - ministryId OR ministryName (required - either)
+ *   - makeLeader: boolean (true=promote, false=demote)
+ *   - allowLastLeader: boolean (optional; default false) when demoting/removing last leader
+ */
+exports.setMinistryLeadership = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const { memberId, ministryId, ministryName: nameArg, makeLeader, allowLastLeader = false } = req.data || {};
+  if (!memberId || typeof makeLeader !== 'boolean') {
+    throw Object.assign(new Error('invalid-argument: memberId/makeLeader'), { code: 'invalid-argument' });
+  }
+
+  const { ministryName } = await resolveMinistryByNameOrId(S(ministryId) || S(nameArg));
+  if (!ministryName) {
+    throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
+  }
+
+  const allowed = await hasMinistryModerationRights(uid, ministryName);
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  if (makeLeader === false) {
+    // Safety: prevent demoting the last leader unless override
+    const currentCount = await countLeadersInMinistry(ministryName);
+    if (currentCount <= 1 && !(await isUserPastorOrAdmin(uid)) && !allowLastLeader) {
+      throw Object.assign(new Error('would-remove-last-leader'), { code: 'failed-precondition' });
+    }
+  }
+
+  await db.runTransaction(async (tx) => {
+    const mRef = db.doc(`members/${memberId}`);
+    const mSnap = await tx.get(mRef);
+    if (!mSnap.exists) throw Object.assign(new Error('member-not-found'), { code: 'not-found' });
+    const m = mSnap.data() || {};
+    const curMins = new Set(Array.isArray(m.ministries) ? m.ministries : []);
+    const curLeads = new Set(Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : []);
+    let roles = Array.isArray(m.roles) ? m.roles : [];
+
+    if (makeLeader) {
+      curMins.add(ministryName);
+      curLeads.add(ministryName);
+      roles = mergeRoles(roles, ['leader'], []);
+    } else {
+      curLeads.delete(ministryName);
+      // If user is being demoted AND not a leader anywhere else, drop leader role
+      if (curLeads.size === 0) {
+        roles = mergeRoles(roles, [], ['leader']);
+      }
+    }
+
+    tx.update(mRef, {
+      ministries: Array.from(curMins),
+      leadershipMinistries: Array.from(curLeads),
+      roles,
+      updatedAt: ts(),
+    });
+
+    // Mirror to linked user (roles & leadershipMinistries)
+    const linked = await findUserByMemberId(memberId);
+    if (linked?.id) {
+      const uRef = db.doc(`users/${linked.id}`);
+      const uSnap = await tx.get(uRef);
+      const u = uSnap.exists ? uSnap.data() || {} : {};
+      const uRoles = Array.isArray(u.roles) ? u.roles : [];
+      const uLeadMins = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+      let nextUserRoles = uRoles.slice();
+
+      if (makeLeader) {
+        uLeadMins.add(ministryName);
+        nextUserRoles = mergeRoles(nextUserRoles, ['leader'], []);
+      } else {
+        uLeadMins.delete(ministryName);
+        if (uLeadMins.size === 0) {
+          nextUserRoles = mergeRoles(nextUserRoles, [], ['leader']);
+        }
+      }
+
+      txSyncUserRoles(tx, linked.id, nextUserRoles);
+      tx.set(uRef, {
+        leadershipMinistries: Array.from(uLeadMins),
+        updatedAt: ts(),
+      }, { merge: true });
+    }
+  });
+
+  // Sync claims
+  const linked = await findUserByMemberId(memberId);
+  if (linked?.id) await syncClaimsForUid(linked.id);
+
+  return { ok: true };
+});
+
+/**
+ * Remove a member from a ministry (and leadership if present) by ministryName/docId.
+ * Parity: Pastor/Admin OR leaders of that ministry may remove.
+ * Body:
+ *   - memberId (required)
+ *   - ministryId OR ministryName (required)
+ *   - allowLastLeaderRemoval: boolean (default false) — prevents removing the last leader unless true or caller is pastor/admin
+ */
+exports.removeMemberFromMinistry = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const { memberId, ministryId, ministryName: nameArg, allowLastLeaderRemoval = false } = req.data || {};
+  if (!memberId) throw Object.assign(new Error('invalid-argument: memberId'), { code: 'invalid-argument' });
+
+  const { ministryName } = await resolveMinistryByNameOrId(S(ministryId) || S(nameArg));
+  if (!ministryName) throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
+
+  const allowed = await hasMinistryModerationRights(uid, ministryName);
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  // If the target member is currently a (the last) leader in that ministry, guard removal unless allowed
+  const m = await getMemberById(memberId);
+  const isLeaderThere = Array.isArray(m?.leadershipMinistries) && m.leadershipMinistries.includes(ministryName);
+
+  if (isLeaderThere) {
+    const totalLeaders = await countLeadersInMinistry(ministryName);
+    if (totalLeaders <= 1 && !(await isUserPastorOrAdmin(uid)) && !allowLastLeaderRemoval) {
+      throw Object.assign(new Error('would-remove-last-leader'), { code: 'failed-precondition' });
+    }
+  }
+
+  await db.runTransaction(async (tx) => {
+    const mRef = db.doc(`members/${memberId}`);
+    const mSnap = await tx.get(mRef);
+    if (!mSnap.exists) throw Object.assign(new Error('member-not-found'), { code: 'not-found' });
+
+    const data = mSnap.data() || {};
+    const curMins = new Set(Array.isArray(data.ministries) ? data.ministries : []);
+    const curLeads = new Set(Array.isArray(data.leadershipMinistries) ? data.leadershipMinistries : []);
+    let roles = Array.isArray(data.roles) ? data.roles.slice() : [];
+
+    curMins.delete(ministryName);
+    if (curLeads.has(ministryName)) {
+      curLeads.delete(ministryName);
+      if (curLeads.size === 0) {
+        roles = mergeRoles(roles, [], ['leader']);
+      }
+    }
+
+    tx.update(mRef, {
+      ministries: Array.from(curMins),
+      leadershipMinistries: Array.from(curLeads),
+      roles,
+      updatedAt: ts(),
+    });
+
+    // Mirror to linked user
+    const linked = await findUserByMemberId(memberId);
+    if (linked?.id) {
+      const uRef = db.doc(`users/${linked.id}`);
+      const uSnap = await tx.get(uRef);
+      const u = uSnap.exists ? uSnap.data() || {} : {};
+      let uRoles = Array.isArray(u.roles) ? u.roles.slice() : [];
+      const uLead = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+
+      uLead.delete(ministryName);
+      if (uLead.size === 0) {
+        uRoles = mergeRoles(uRoles, [], ['leader']);
+      }
+
+      txSyncUserRoles(tx, linked.id, uRoles);
+      tx.set(uRef, {
+        leadershipMinistries: Array.from(uLead),
+        updatedAt: ts(),
+      }, { merge: true });
+    }
+  });
+
+  const linked = await findUserByMemberId(memberId);
+  if (linked?.id) await syncClaimsForUid(linked.id);
+
+  return { ok: true };
+});
+
+/**
+ * Member cancels their own pending join request.
+ * Looks up by (memberId + ministryId/docId or ministryName).
+ * (Retained)
+ */
+exports.memberCancelJoinRequest = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const { memberId: memberIdArg, ministryId, ministryName: nameArg } = req.data || {};
+  // Allow either explicit memberId or infer from uid
+  const memberId = S(memberIdArg) || (await findMemberIdByUid(uid));
+  if (!memberId) throw Object.assign(new Error('member-not-linked'), { code: 'failed-precondition' });
+
+  const nameOrId = S(ministryId) || S(nameArg);
+  if (!nameOrId) throw Object.assign(new Error('invalid-argument: need ministryId or ministryName'), { code: 'invalid-argument' });
+
+  // Resolve to a clean name/id pair to query
+  let resolvedName = null;
+  let resolvedDocId = null;
+
+  // If caller passed a doc id
+  try {
+    const d = await db.doc(`ministries/${nameOrId}`).get();
+    if (d.exists) {
+      resolvedDocId = d.id;
+      const dd = d.data() || {};
+      resolvedName = S(dd.name);
+    }
+  } catch (_) {}
+
+  if (!resolvedName) {
+    // Treat as name
+    resolvedName = nameOrId;
+    const mins = await db.collection('ministries').where('name', '==', resolvedName).limit(1).get();
+    if (!mins.empty) resolvedDocId = mins.docs[0].id;
+  }
+
+  // Find the user's pending join request
+  let q = await db.collection('join_requests')
+    .where('memberId', '==', memberId)
+    .where('status', '==', 'pending')
+    .where('ministryId', '==', resolvedName)   // legacy stored as name
+    .limit(1).get();
+
+  if (q.empty && resolvedDocId) {
+    q = await db.collection('join_requests')
+      .where('memberId', '==', memberId)
+      .where('status', '==', 'pending')
+      .where('ministryId', '==', resolvedDocId) // new stored as doc id
+      .limit(1).get();
+  }
+
+  if (q.empty && resolvedName) {
+    q = await db.collection('join_requests')
+      .where('memberId', '==', memberId)
+      .where('status', '==', 'pending')
+      .where('ministryName', '==', resolvedName) // explicit name field
+      .limit(1).get();
+  }
+
+  if (q.empty) {
+    throw Object.assign(new Error('no-pending-request-found'), { code: 'not-found' });
+  }
+
+  const ref = q.docs[0].ref;
+  await ref.update({
+    status: 'cancelled',
+    cancelledAt: ts(),
+    cancelledByUid: uid,
+    updatedAt: ts(),
+  });
+
+  // Fire-and-forget: notify leaders of cancellation
+  try {
+    const jrSnap = await ref.get();
+    const jr = jrSnap.data() || {};
+    const { ministryName, ministryDocId } = await resolveMinistryFromJoin(jr);
+    await writeLeaderBroadcast({
+      ministryName,
+      ministryDocId,
+      joinRequestId: ref.id,
+      requestedByUid: S(jr.requestedByUid) || uid,
+      requesterMemberId: memberId,
+      type: 'join_request_cancelled',
+    });
+    await writeDirectToLeaders({
+      ministryName,
+      ministryDocId,
+      joinRequestId: ref.id,
+      requestedByUid: S(jr.requestedByUid) || uid,
+      requesterMemberId: memberId,
+      type: 'join_request_cancelled',
+    });
+  } catch (e) {
+    logger.warn('memberCancelJoinRequest notify failed', { error: e });
+  }
+
+  return { ok: true };
+});
+
+/**
+ * Callable for pastors/admins to promote or demote a member to leader for a ministry.
+ * Used when Flutter calls 'pastorSetMemberLeaderStatus'.
+ */
+exports.pastorSetMemberLeaderStatus = onCall(async (req) => {
+  const { memberId, ministryName, makeLeader } = req.data || {};
+  const uid = req.auth?.uid;
+  if (!uid) throw new Error('unauthenticated');
+
+  if (!memberId || !ministryName || typeof makeLeader !== 'boolean') {
+    throw new Error('invalid-argument');
+  }
+
+  // Verify caller has rights
+  const allowed = await isUserPastorOrAdmin(uid);
+  if (!allowed) throw new Error('permission-denied');
+
+  const mRef = db.collection('members').doc(memberId);
+  const mSnap = await mRef.get();
+  if (!mSnap.exists) throw new Error('member-not-found');
+  const m = mSnap.data() || {};
+
+  const leadershipMinistries = new Set(m.leadershipMinistries || []);
+  const ministries = new Set(m.ministries || []);
+  ministries.add(ministryName);
+
+  if (makeLeader) {
+    leadershipMinistries.add(ministryName);
+  } else {
+    leadershipMinistries.delete(ministryName);
+  }
+
+  // Update member
+  await mRef.update({
+    ministries: Array.from(ministries),
+    leadershipMinistries: Array.from(leadershipMinistries),
+    roles: makeLeader
+      ? mergeRoles(m.roles || [], ['leader'], [])
+      : mergeRoles(m.roles || [], [], ['leader']),
+    updatedAt: ts(),
+  });
+
+  // Mirror to linked user
+  const linked = await findUserByMemberId(memberId);
+  if (linked?.id) {
+    const uRef = db.collection('users').doc(linked.id);
+    const uSnap = await uRef.get();
+    const u = uSnap.exists ? uSnap.data() || {} : {};
+    const userLeadMins = new Set(u.leadershipMinistries || []);
+    if (makeLeader) userLeadMins.add(ministryName);
+    else userLeadMins.delete(ministryName);
+
+    await uRef.set(
+      {
+        leadershipMinistries: Array.from(userLeadMins),
+        roles: makeLeader
+          ? mergeRoles(u.roles || [], ['leader'], [])
+          : mergeRoles(u.roles || [], [], ['leader']),
+        updatedAt: ts(),
+      },
+      { merge: true }
+    );
+
+    await syncClaimsForUid(linked.id);
+  }
+
+  logger.info('pastorSetMemberLeaderStatus', { memberId, ministryName, makeLeader, by: uid });
+  return { ok: true, makeLeader, memberId, ministryName };
+});
+
+/* ===== end of file ===== */

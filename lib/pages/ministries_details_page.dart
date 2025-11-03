@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:async/async.dart' show StreamZip;
 import 'package:http/http.dart' as http;
 import 'package:html/parser.dart' as htmlp;
 import 'package:url_launcher/url_launcher.dart';
@@ -40,9 +41,9 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
   String? _memberId;
   Set<String> _roles = {};
   Set<String> _memberMinistriesByName = {};
-  bool _canAccess = false;
 
   final _db = FirebaseFirestore.instance;
+  final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
 
   @override
   void initState() {
@@ -64,88 +65,54 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
       final user = FirebaseAuth.instance.currentUser;
       _uid = user?.uid;
       if (_uid == null) {
-        setState(() { _loading = false; _canAccess = false; });
+        setState(() { _loading = false; });
         return;
       }
 
       final userSnap = await _db.collection('users').doc(_uid).get();
       final u = userSnap.data() ?? {};
       _memberId = (u['memberId'] ?? '').toString().isNotEmpty ? (u['memberId'] as String) : null;
+
+      // Support both single and legacy array roles
+      final single = (u['role'] ?? '').toString().toLowerCase().trim();
       final roles = (u['roles'] is List) ? List<String>.from(u['roles']) : const <String>[];
-      _roles = roles.map((e) => e.toString().toLowerCase()).toSet();
+      _roles = {
+        if (single.isNotEmpty) single,
+        ...roles.map((e) => e.toString().toLowerCase()),
+        if (u['isAdmin'] == true) 'admin',
+        if (u['isPastor'] == true) 'pastor',
+        if (u['isLeader'] == true) 'leader',
+      };
 
       if (_memberId != null) {
         final memSnap = await _db.collection('members').doc(_memberId).get();
         final m = memSnap.data() ?? {};
         _memberMinistriesByName =
         (m['ministries'] is List) ? Set<String>.from(m['ministries']) : <String>{};
+        if (m['isPastor'] == true) _roles.add('pastor');
       }
-
-      final isAdmin = _roles.contains('admin');
-      final isInThisMinistry = _memberMinistriesByName.contains(widget.ministryName);
-      _canAccess = isAdmin || isInThisMinistry;
 
       setState(() => _loading = false);
     } catch (_) {
-      setState(() { _loading = false; _canAccess = false; });
+      setState(() { _loading = false; });
     }
   }
 
-  Future<void> _notifyRequester(
-      String requesterMemberId,
-      String joinRequestId,
-      String result,
-      ) async {
-    String? requesterUid;
-    final qs = await _db
-        .collection('users')
-        .where('memberId', isEqualTo: requesterMemberId)
-        .limit(1)
-        .get();
-    if (qs.docs.isNotEmpty) requesterUid = qs.docs.first.id;
-    if (requesterUid == null) return;
-
-    await _db.collection('notifications').add({
-      'uid': requesterUid,
-      'type': 'join_request.$result',
-      'joinRequestId': joinRequestId,
-      'ministryName': widget.ministryName,
-      'createdAt': FieldValue.serverTimestamp(),
-      'read': false,
+  // ========== Callables (secure; server sends notifications) ==========
+  Future<void> _callModerateJoinRequest({
+    required String requestId,
+    required String action, // 'approve' or 'reject'
+  }) async {
+    final callable = _functions.httpsCallable('leaderModerateJoinRequest');
+    await callable.call(<String, dynamic>{
+      'requestId': requestId,
+      'action': action,
     });
   }
 
   Future<void> approveJoin(String requestId, String memberId) async {
     try {
-      final jrRef = _db.collection('join_requests').doc(requestId);
-      final memberRef = _db.collection('members').doc(memberId);
-
-      final snap = await jrRef.get();
-      if (snap.exists) {
-        final status = (snap.data()?['status'] ?? '').toString().toLowerCase();
-        if (status != 'pending') throw Exception('Request already processed');
-      }
-
-      await _db.runTransaction((t) async {
-        final md = (await t.get(memberRef)).data();
-        if (md == null) throw Exception('Member not found');
-
-        final current = List<String>.from(md['ministries'] ?? const <String>[]);
-        if (!current.contains(widget.ministryName)) current.add(widget.ministryName);
-
-        t.update(memberRef, {
-          'ministries': current,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-
-        t.update(jrRef, {
-          'status': 'approved',
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      });
-
-      try { await _notifyRequester(memberId, requestId, 'approved'); } catch (_) {}
-
+      await _callModerateJoinRequest(requestId: requestId, action: 'approve');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Request approved')),
@@ -160,21 +127,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
 
   Future<void> rejectJoin(String requestId, String memberId) async {
     try {
-      final jrRef = _db.collection('join_requests').doc(requestId);
-
-      final snap = await jrRef.get();
-      if (snap.exists) {
-        final status = (snap.data()?['status'] ?? '').toString().toLowerCase();
-        if (status != 'pending') throw Exception('Request already processed');
-      }
-
-      await jrRef.update({
-        'status': 'rejected',
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
-
-      try { await _notifyRequester(memberId, requestId, 'rejected'); } catch (_) {}
-
+      await _callModerateJoinRequest(requestId: requestId, action: 'reject');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Request rejected')),
@@ -218,7 +171,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
   }
 }
 
-/* ===================== MEMBERS TAB (as you had it, minor tidy) ===================== */
+/* ===================== MEMBERS TAB ===================== */
 
 class _MembersTab extends StatefulWidget {
   final String ministryId;
@@ -241,7 +194,7 @@ class _MembersTabState extends State<_MembersTab> {
   final _db = FirebaseFirestore.instance;
   final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
 
-  bool _isLeaderOrAdmin = false;
+  bool _canModerate = false; // leader of this ministry OR pastor/admin
   String? _myMemberId;
 
   final Set<String> _busy = <String>{};
@@ -266,19 +219,48 @@ class _MembersTabState extends State<_MembersTab> {
   Future<void> _resolveCanModerate() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
-    final u = await _db.collection('users').doc(uid).get();
-    final data = u.data() ?? {};
-    _myMemberId = (data['memberId'] ?? '').toString().isNotEmpty ? (data['memberId'] as String) : null;
-    final roles = (data['roles'] is List) ? List<String>.from(data['roles']) : <String>[];
-    final leaderMins = (data['leadershipMinistries'] is List)
-        ? List<String>.from(data['leadershipMinistries'])
-        : <String>[];
-    final rolesLower = roles.map((e) => e.toLowerCase()).toList();
+
+    final uDoc = await _db.collection('users').doc(uid).get();
+    final u = uDoc.data() ?? {};
+
+    _myMemberId = (u['memberId'] ?? '').toString().isNotEmpty ? (u['memberId'] as String) : null;
+
+    final single = (u['role'] ?? '').toString().toLowerCase().trim();
+    final rolesArr = (u['roles'] is List) ? List<String>.from(u['roles']) : <String>[];
+    final rolesLower = {
+      if (single.isNotEmpty) single,
+      ...rolesArr.map((e) => e.toLowerCase()),
+      if (u['isAdmin'] == true) 'admin',
+      if (u['isPastor'] == true) 'pastor',
+      if (u['isLeader'] == true) 'leader',
+    };
+
+    final userLead = (u['leadershipMinistries'] is List)
+        ? List<String>.from(u['leadershipMinistries']).map((e) => e.toString()).toList()
+        : const <String>[];
+
+    List<String> memberLead = const <String>[];
+    if (_myMemberId != null) {
+      final mDoc = await _db.collection('members').doc(_myMemberId!).get();
+      final m = mDoc.data() ?? {};
+      memberLead = (m['leadershipMinistries'] is List)
+          ? List<String>.from(m['leadershipMinistries']).map((e) => e.toString()).toList()
+          : const <String>[];
+      if (m['isPastor'] == true) rolesLower.add('pastor');
+    }
+
+    bool leadsHere(List<String> arr) {
+      return arr.contains(widget.ministryName) || arr.contains(widget.ministryId);
+    }
+
     final can = rolesLower.contains('admin') ||
-        (rolesLower.contains('leader') && leaderMins.contains(widget.ministryName));
-    if (mounted) setState(() => _isLeaderOrAdmin = can);
+        rolesLower.contains('pastor') ||
+        (rolesLower.contains('leader') && (leadsHere(userLead) || leadsHere(memberLead)));
+
+    if (mounted) setState(() => _canModerate = can);
   }
 
+  // Members (mark leaders by either name or id)
   Stream<List<Map<String, dynamic>>> _membersStream() {
     return _db
         .collection('members')
@@ -291,18 +273,23 @@ class _MembersTabState extends State<_MembersTab> {
         final last = (data['lastName'] ?? '').toString();
         final name = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
         final email = (data['email'] ?? '').toString();
+
         final leadership = (data['leadershipMinistries'] is List)
-            ? List<String>.from(data['leadershipMinistries'])
+            ? List<String>.from(data['leadershipMinistries']).map((e) => e.toString()).toList()
             : <String>[];
+
         final roles = (data['roles'] is List)
             ? List<String>.from(data['roles']).map((e) => e.toLowerCase()).toSet()
             : <String>{};
-        final isLeaderHere = roles.contains('leader') && leadership.contains(widget.ministryName);
+
+        final isLeaderHere =
+            leadership.contains(widget.ministryName) || leadership.contains(widget.ministryId);
+
         return {
           'memberId': d.id,
           'name': name.isEmpty ? 'Unnamed Member' : name,
           'email': email,
-          'isLeader': isLeaderHere,
+          'isLeader': isLeaderHere && (roles.contains('leader') || true /* tolerate legacy */),
           'leadershipMinistries': leadership,
           'roles': roles.toList(),
         };
@@ -310,31 +297,54 @@ class _MembersTabState extends State<_MembersTab> {
     });
   }
 
+  // Pending join requests by name OR id (merged)
   Stream<List<Map<String, dynamic>>> _pendingRequests() {
-    return _db
+    final qByName = _db
         .collection('join_requests')
         .where('status', isEqualTo: 'pending')
-        .where('ministryId', whereIn: [widget.ministryName, widget.ministryId])
+        .where('ministryName', isEqualTo: widget.ministryName)
         .orderBy('requestedAt', descending: true)
-        .snapshots()
-        .asyncMap((qs) async {
-      final out = <Map<String, dynamic>>[];
-      for (final doc in qs.docs) {
-        if (_hidden.contains(doc.id)) continue;
+        .snapshots();
 
-        final r = doc.data();
+    final qById = _db
+        .collection('join_requests')
+        .where('status', isEqualTo: 'pending')
+        .where('ministryId', isEqualTo: widget.ministryId)
+        .orderBy('requestedAt', descending: true)
+        .snapshots();
+
+    return StreamZip<QuerySnapshot>([qByName, qById]).asyncMap((snaps) async {
+      final seen = <String>{};
+      final mergedDocs = <QueryDocumentSnapshot>[];
+
+      for (final s in snaps) {
+        for (final d in s.docs) {
+          if (!seen.contains(d.id)) {
+            seen.add(d.id);
+            mergedDocs.add(d);
+          }
+        }
+      }
+
+      final out = <Map<String, dynamic>>[];
+      for (final doc in mergedDocs) {
+        if (_hidden.contains(doc.id)) continue;
+        final r = doc.data() as Map<String, dynamic>;
         final memberId = (r['memberId'] ?? '').toString();
-        final requestedAt =
-        (r['requestedAt'] is Timestamp) ? (r['requestedAt'] as Timestamp).toDate() : null;
+        final requestedAt = (r['requestedAt'] is Timestamp)
+            ? (r['requestedAt'] as Timestamp).toDate()
+            : null;
 
         String fullName = 'Unknown Member';
         if (memberId.isNotEmpty) {
-          final m = await _db.collection('members').doc(memberId).get();
-          final md = m.data() ?? {};
-          final f = (md['firstName'] ?? '').toString();
-          final l = (md['lastName'] ?? '').toString();
-          final n = [f, l].where((s) => s.isNotEmpty).join(' ').trim();
-          if (n.isNotEmpty) fullName = n;
+          try {
+            final m = await _db.collection('members').doc(memberId).get();
+            final md = m.data() ?? {};
+            final f = (md['firstName'] ?? '').toString();
+            final l = (md['lastName'] ?? '').toString();
+            final n = [f, l].where((s) => s.isNotEmpty).join(' ').trim();
+            if (n.isNotEmpty) fullName = n;
+          } catch (_) {}
         }
 
         out.add({
@@ -348,24 +358,20 @@ class _MembersTabState extends State<_MembersTab> {
     });
   }
 
+  // ===== Promote/Demote (server enforces parity + last-leader guard) =====
   Future<void> _callSetLeader({
     required String memberId,
     required bool makeLeader,
   }) async {
-    final callable = _functions.httpsCallable('leaderSetMemberLeaderRole');
+    // UPDATED: use setMinistryLeadership (matches functions/index.js)
+    final callable = _functions.httpsCallable('setMinistryLeadership');
     await callable.call(<String, dynamic>{
       'memberId': memberId,
       'ministryName': widget.ministryName,
+      'ministryId': widget.ministryId, // pass both for robustness
       'makeLeader': makeLeader,
+      // 'allowLastLeader': false, // optional; server defaults false
     });
-  }
-
-  Future<int> _countLeadersInMinistry() async {
-    final qs = await _db
-        .collection('members')
-        .where('leadershipMinistries', arrayContains: widget.ministryName)
-        .get();
-    return qs.docs.length;
   }
 
   Future<void> _promoteToLeader(String memberId) async {
@@ -373,72 +379,42 @@ class _MembersTabState extends State<_MembersTab> {
       HapticFeedback.selectionClick();
       await _callSetLeader(memberId: memberId, makeLeader: true);
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Promoted to leader')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Promoted to leader')),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error promoting: $e'), backgroundColor: Colors.red),
+        SnackBar(content: Text('Promote failed: $e'), backgroundColor: Colors.red),
       );
     }
   }
 
   Future<void> _demoteFromLeader(String memberId) async {
     try {
-      final leadersCount = await _countLeadersInMinistry();
-      if (leadersCount <= 1) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text('Cannot demote the last leader of this ministry'),
-              backgroundColor: Colors.orange),
-        );
-        return;
-      }
-
       HapticFeedback.selectionClick();
       await _callSetLeader(memberId: memberId, makeLeader: false);
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Demoted from leader')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Demoted from leader')),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error demoting: $e'), backgroundColor: Colors.red),
+        SnackBar(content: Text('Demote failed: $e'), backgroundColor: Colors.red),
       );
     }
   }
 
+  // ===== Removal (server callable; handles last-leader + parity) =====
   Future<void> _removeFromMinistry(String memberId) async {
     try {
-      final mSnap = await _db.collection('members').doc(memberId).get();
-      final m = mSnap.data() ?? {};
-      final mLeader = (m['leadershipMinistries'] is List)
-          ? List<String>.from(m['leadershipMinistries'])
-          : <String>[];
-      final roles = (m['roles'] is List)
-          ? List<String>.from(m['roles']).map((e) => e.toLowerCase()).toSet()
-          : <String>{};
-      final isLeaderHere =
-          roles.contains('leader') && mLeader.contains(widget.ministryName);
-
-      if (isLeaderHere) {
-        final leadersCount = await _countLeadersInMinistry();
-        if (leadersCount <= 1) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text('Cannot remove the last leader of this ministry'),
-                backgroundColor: Colors.orange),
-          );
-          return;
-        }
-        await _callSetLeader(memberId: memberId, makeLeader: false);
-      }
-
-      final memberRef = _db.doc('members/$memberId');
-      await memberRef.set({
-        'ministries': FieldValue.arrayRemove([widget.ministryName]),
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
+      final callable = _functions.httpsCallable('removeMemberFromMinistry');
+      await callable.call({
+        'memberId': memberId,
+        'ministryName': widget.ministryName,
+        'ministryId': widget.ministryId, // let backend resolve
+      });
 
       if (!mounted) return;
       ScaffoldMessenger.of(context)
@@ -455,7 +431,7 @@ class _MembersTabState extends State<_MembersTab> {
   Widget build(BuildContext context) {
     return ListView(
       children: [
-        if (_isLeaderOrAdmin)
+        if (_canModerate)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
             child: Align(
@@ -464,7 +440,7 @@ class _MembersTabState extends State<_MembersTab> {
                   style: Theme.of(context).textTheme.titleMedium),
             ),
           ),
-        if (_isLeaderOrAdmin)
+        if (_canModerate)
           SizedBox(
             height: 156,
             child: StreamBuilder<List<Map<String, dynamic>>>(
@@ -609,6 +585,7 @@ class _MembersTabState extends State<_MembersTab> {
                 itemBuilder: (context, i) {
                   final m = members[i];
                   final memberId = m['memberId'] as String;
+                  final isLeader = (m['isLeader'] ?? false) == true;
                   return Card(
                     child: ListTile(
                       title: Row(
@@ -619,7 +596,7 @@ class _MembersTabState extends State<_MembersTab> {
                               style: const TextStyle(fontWeight: FontWeight.w600),
                             ),
                           ),
-                          if ((m['isLeader'] ?? false) == true)
+                          if (isLeader)
                             const Padding(
                               padding: EdgeInsets.only(left: 6),
                               child: Icon(Icons.star_rounded, size: 20, color: Colors.amberAccent),
@@ -627,7 +604,7 @@ class _MembersTabState extends State<_MembersTab> {
                         ],
                       ),
                       subtitle: Text(m['email'] ?? '', style: const TextStyle(color: Colors.black54)),
-                      trailing: (_isLeaderOrAdmin && (memberId != _myMemberId))
+                      trailing: (_canModerate && (memberId != _myMemberId))
                           ? PopupMenuButton<String>(
                         onSelected: (value) async {
                           if (value == 'promote') {
@@ -639,7 +616,6 @@ class _MembersTabState extends State<_MembersTab> {
                           }
                         },
                         itemBuilder: (context) {
-                          final isLeader = (m['isLeader'] ?? false) == true;
                           return <PopupMenuEntry<String>>[
                             if (!isLeader)
                               const PopupMenuItem<String>(
@@ -672,7 +648,7 @@ class _MembersTabState extends State<_MembersTab> {
   }
 
   String _initials(String name) {
-    final parts = name.trim().split(RegExp(r'\\s+'));
+    final parts = name.trim().split(RegExp(r'\s+'));
     if (parts.isEmpty) return '?';
     if (parts.length == 1) return parts.first.characters.take(2).toString().toUpperCase();
     return (parts.first.characters.take(1).toString() + parts.last.characters.take(1).toString()).toUpperCase();
@@ -721,11 +697,19 @@ class _FeedTabState extends State<_FeedTab> {
     final userDoc = await _db.collection('users').doc(_uid).get();
     final ud = userDoc.data() ?? {};
     _memberId = (ud['memberId'] ?? '').toString().isNotEmpty ? ud['memberId'] as String : null;
-    final roles = (ud['roles'] is List) ? List<String>.from(ud['roles']).map((e) => e.toString().toLowerCase()).toSet() : <String>{};
-    final leaderMins = (ud['leadershipMinistries'] is List) ? List<String>.from(ud['leadershipMinistries']) : const <String>[];
 
-    _isAdmin = roles.contains('admin');
-    _isLeaderHere = roles.contains('leader') && leaderMins.contains(widget.ministryName);
+    final single = (ud['role'] ?? '').toString().toLowerCase().trim();
+    final roles = (ud['roles'] is List)
+        ? List<String>.from(ud['roles']).map((e) => e.toString().toLowerCase()).toSet()
+        : <String>{};
+
+    _isAdmin = single == 'admin' || roles.contains('admin') || ud['isAdmin'] == true;
+
+    final leaderMins = (ud['leadershipMinistries'] is List)
+        ? List<String>.from(ud['leadershipMinistries'])
+        : const <String>[];
+    _isLeaderHere = (single == 'leader' || roles.contains('leader') || ud['isLeader'] == true) &&
+        (leaderMins.contains(widget.ministryName) || leaderMins.contains(widget.ministryId));
 
     String? name = (ud['displayName'] ?? ud['name'])?.toString();
     if (_memberId != null) {
@@ -763,7 +747,7 @@ class _FeedTabState extends State<_FeedTab> {
 
   // --- Link utilities ---
   static final _urlRegex = RegExp(
-    r'((https?:\/\/)?((www\.)?)[^\s]+\.[^\s]{2,}([^\s]*)?)',
+    r'((https?:\/\/)?((www\.)?)[^\\s]+\\.[^\\s]{2,}([^\\s]*)?)',
     caseSensitive: false,
   );
 
@@ -849,9 +833,8 @@ class _FeedTabState extends State<_FeedTab> {
         'authorName': _displayName ?? 'Member',
         'text': hasText ? text : null,
         'links': hasLinks ? links : [],
-        // include media key even if empty (image-only will be updated after upload)
-        'media': hasImage ? [] : (hasText || hasLinks ? [] : []),
-        'imageUrl': null, // legacy convenience for your UI
+        'media': hasImage ? [] : [],
+        'imageUrl': null,
         'createdAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
         'likes': <String>[],
@@ -888,7 +871,6 @@ class _FeedTabState extends State<_FeedTab> {
     final uid = _uid;
     if (uid == null) return;
     final hasLiked = likes.contains(uid);
-    // Only update 'likes' so it passes security rules
     await postRef.update({
       'likes': hasLiked ? FieldValue.arrayRemove([uid]) : FieldValue.arrayUnion([uid]),
       'updatedAt': FieldValue.serverTimestamp(),
@@ -907,7 +889,7 @@ class _FeedTabState extends State<_FeedTab> {
       }
       if (imageUrl != null && imageUrl.isNotEmpty) {
         try {
-          final ref = await _storage.refFromURL(imageUrl);
+          final ref = _storage.refFromURL(imageUrl);
           await ref.delete();
         } catch (_) {}
       }
@@ -1035,7 +1017,6 @@ class _FeedTabState extends State<_FeedTab> {
                   final canDelete = (_uid != null && authorId == _uid) || _isAdmin || _isLeaderHere;
                   final when = createdAt != null ? DateFormat('dd MMM yyyy • HH:mm').format(createdAt) : '';
 
-                  // URLs in text
                   final urls = _extractUrls(text);
 
                   return Card(
@@ -1110,7 +1091,6 @@ class _FeedTabState extends State<_FeedTab> {
                                     ),
                                   );
                                 }
-                                // Generic OpenGraph preview (also covers Instagram/Twitter/links)
                                 return Padding(
                                   padding: const EdgeInsets.only(bottom: 8),
                                   child: LinkPreviewCard(url: u),
@@ -1284,7 +1264,6 @@ class _LinkPreviewCardState extends State<LinkPreviewCard> {
   }
 
   Future<void> _fetch() async {
-    // On web, CORS often blocks direct fetches. Just skip (tile will show URL).
     if (kIsWeb) {
       setState(() => _loading = false);
       return;
@@ -1293,7 +1272,6 @@ class _LinkPreviewCardState extends State<LinkPreviewCard> {
       final resp = await http.get(
         widget.url,
         headers: {
-          // Use a browser-y UA to avoid some sites blocking previews
           'user-agent':
           'Mozilla/5.0 (Linux; Android 13; Pixel) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36',
           'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -1315,7 +1293,6 @@ class _LinkPreviewCardState extends State<LinkPreviewCard> {
         var img = contentOf('meta[property="og:image"]') ??
             contentOf('meta[name="twitter:image"]');
         if (img != null && img.isNotEmpty) {
-          // fix relative URLs
           final uri = Uri.parse(img);
           if (uri.hasScheme) {
             _image = img;
@@ -1327,7 +1304,7 @@ class _LinkPreviewCardState extends State<LinkPreviewCard> {
         _site = contentOf('meta[property="og:site_name"]') ?? widget.url.host;
       }
     } catch (_) {
-      // ignore; fall back to plain link
+      // ignore; fallback to plain link
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -1404,7 +1381,7 @@ class _LinkPreviewCardState extends State<LinkPreviewCard> {
   }
 }
 
-/* ===================== COMMENTS (rules-compatible) ===================== */
+/* ===================== COMMENTS ===================== */
 
 class _CommentsSheet extends StatefulWidget {
   final DocumentReference postRef;
@@ -1440,7 +1417,6 @@ class _CommentsSheetState extends State<_CommentsSheet> {
     setState(() => _sending = true);
     try {
       final ref = widget.postRef.collection('comments').doc();
-      // Write only fields allowed by rules: authorId, text, createdAt (updatedAt optional)
       await ref.set({
         'authorId': uid,
         'text': text,

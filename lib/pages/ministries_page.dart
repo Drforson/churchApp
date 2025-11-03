@@ -2,7 +2,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:cloud_functions/cloud_functions.dart'; // ✅ for optional callable delete
+import 'package:cloud_functions/cloud_functions.dart'; // ✅ for optional callable delete/cancel
 import 'ministries_details_page.dart'; // adjust path as needed
 
 class MinistriesPage extends StatefulWidget {
@@ -14,10 +14,12 @@ class MinistriesPage extends StatefulWidget {
 
 class _MinistriesPageState extends State<MinistriesPage>
     with TickerProviderStateMixin {
+  // ====== Services
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
   final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2'); // ✅
 
+  // ====== Role / Identity
   bool _loading = true;
 
   bool _isLeader = false;
@@ -30,8 +32,13 @@ class _MinistriesPageState extends State<MinistriesPage>
   final Set<String> _memberMinistries = {};
   final Set<String> _leaderMinistries = {};
 
+  // ====== Search
   final _searchCtrl = TextEditingController();
   String _query = '';
+
+  // ====== Pending Join Requests
+  // We store both ministry doc IDs and names here for robust matching.
+  final Set<String> _pendingJoinKeys = {};
 
   // Locally dismissed request ids for tap-to-disintegrate effect
   final Set<String> _dismissedReqIds = {};
@@ -52,19 +59,51 @@ class _MinistriesPageState extends State<MinistriesPage>
     super.dispose();
   }
 
+  // ========== Helpers ==========
+  bool _isPendingFor({required String id, required String name}) {
+    // match if either the doc id or the plain name is present
+    return _pendingJoinKeys.contains(id) || _pendingJoinKeys.contains(name);
+  }
+
+  // Load pending join requests for this member; track by BOTH ministryId and ministryName
+  Future<void> _refreshPendingJoinRequests() async {
+    _pendingJoinKeys.clear();
+    final mid = _memberId;
+    if (mid == null) {
+      if (mounted) setState(() {});
+      return;
+    }
+    try {
+      final q = await _db
+          .collection('join_requests')
+          .where('memberId', isEqualTo: mid)
+          .where('status', isEqualTo: 'pending')
+          .get();
+      for (final d in q.docs) {
+        final data = d.data();
+        final mn = (data['ministryName'] ?? '').toString().trim();
+        final mi = (data['ministryId'] ?? '').toString().trim();
+        if (mn.isNotEmpty) _pendingJoinKeys.add(mn);
+        if (mi.isNotEmpty) _pendingJoinKeys.add(mi);
+      }
+      if (mounted) setState(() {});
+    } catch (_) {
+      // ignore
+    }
+  }
+
   Future<void> _bootstrap() async {
     final user = _auth.currentUser;
     if (user == null) {
-      setState(() {
-        _uid = null;
-        _memberId = null;
-        _isLeader = false;
-        _isAdmin = false;
-        _isPastor = false;
-        _memberMinistries.clear();
-        _leaderMinistries.clear();
-        _loading = false;
-      });
+      _uid = null;
+      _memberId = null;
+      _isLeader = false;
+      _isAdmin = false;
+      _isPastor = false;
+      _memberMinistries.clear();
+      _leaderMinistries.clear();
+      await _refreshPendingJoinRequests();
+      if (mounted) setState(() => _loading = false);
       return;
     }
 
@@ -127,23 +166,24 @@ class _MinistriesPageState extends State<MinistriesPage>
         if (md['isPastor'] == true) _isPastor = true;
       }
 
-      setState(() {
-        _memberId = mid.isNotEmpty ? mid : null;
-        _memberMinistries
-          ..clear()
-          ..addAll(memberMins);
-        _leaderMinistries
-          ..clear()
-          ..addAll(leaderMins);
-        _loading = false;
-      });
+      _memberId = mid.isNotEmpty ? mid : null;
+      _memberMinistries
+        ..clear()
+        ..addAll(memberMins);
+      _leaderMinistries
+        ..clear()
+        ..addAll(leaderMins);
+
+      // ensure pending join requests state is fresh
+      await _refreshPendingJoinRequests();
+
+      if (mounted) setState(() => _loading = false);
     } catch (_) {
-      setState(() {
-        _memberId = null;
-        _memberMinistries.clear();
-        _leaderMinistries.clear();
-        _loading = false;
-      });
+      _memberId = null;
+      _memberMinistries.clear();
+      _leaderMinistries.clear();
+      await _refreshPendingJoinRequests();
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -253,7 +293,7 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   // ======== Join Request ========
-  Future<void> _showJoinPrompt(String name) async {
+  Future<void> _showJoinPrompt({required String id, required String name}) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -267,10 +307,10 @@ class _MinistriesPageState extends State<MinistriesPage>
         ],
       ),
     );
-    if (ok == true) await _sendJoinRequest(name);
+    if (ok == true) await _sendJoinRequest(id: id, name: name);
   }
 
-  Future<void> _sendJoinRequest(String name) async {
+  Future<void> _sendJoinRequest({required String id, required String name}) async {
     if (_uid == null || _memberId == null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -281,15 +321,103 @@ class _MinistriesPageState extends State<MinistriesPage>
 
     await _db.collection('join_requests').add({
       'memberId': _memberId,            // must equal requesterMemberId() for rules
-      'ministryId': name,               // ministry NAME per your rules
+      'ministryId': id,                 // ✅ can be doc id (new) or name (legacy)
+      'ministryName': name,             // keep name for easy lookups
       'requestedByUid': _uid,
       'status': 'pending',
       'requestedAt': FieldValue.serverTimestamp(),
     });
 
+    // Track both name and id for robust "pending" UI
+    _pendingJoinKeys.add(name);
+    _pendingJoinKeys.add(id);
+    await _refreshPendingJoinRequests();
+
     if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text('Join request sent for "$name".')));
+  }
+
+  // ======== Cancel Join Request ========
+  Future<void> _confirmCancelJoin({required String id, required String name}) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel join request?'),
+        content: Text('Withdraw your pending request for "$name"?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('No')),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Yes, cancel')),
+        ],
+      ),
+    );
+
+    if (ok == true) {
+      await _cancelPendingJoin(id: id, name: name);
+    }
+  }
+
+  Future<void> _cancelPendingJoin({required String id, required String name}) async {
+    if (_memberId == null || _uid == null) return;
+
+    try {
+      // Prefer direct Firestore update (fast path)
+      var q = await _db
+          .collection('join_requests')
+          .where('memberId', isEqualTo: _memberId)
+          .where('status', isEqualTo: 'pending')
+          .where('ministryId', isEqualTo: id) // might be doc id (new)
+          .limit(1)
+          .get();
+
+      if (q.docs.isEmpty) {
+        // try by ministryName
+        q = await _db
+            .collection('join_requests')
+            .where('memberId', isEqualTo: _memberId)
+            .where('status', isEqualTo: 'pending')
+            .where('ministryName', isEqualTo: name)
+            .limit(1)
+            .get();
+      }
+
+      if (q.docs.isNotEmpty) {
+        await q.docs.first.reference.update({
+          'status': 'cancelled',
+          'cancelledAt': FieldValue.serverTimestamp(),
+          'cancelledByUid': _uid,
+        });
+      } else {
+        // Fallback via callable (covers legacy name/docId ambiguity + rules)
+        final func = _functions.httpsCallable('memberCancelJoinRequest');
+        await func.call({
+          'memberId': _memberId,
+          'ministryId': id,
+          'ministryName': name,
+        });
+      }
+
+      // Update local UI state
+      _pendingJoinKeys.remove(name);
+      _pendingJoinKeys.remove(id);
+      await _refreshPendingJoinRequests();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Cancelled request for "$name".')),
+        );
+      }
+    } catch (e2) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not cancel: $e2')),
+        );
+      }
+    }
   }
 
   // ======== Delete Ministry (Pastor/Admin only) ========
@@ -451,10 +579,17 @@ class _MinistriesPageState extends State<MinistriesPage>
     // Decide trailing widget:
     Widget? trailing;
     if (!canAccess && signedIn && !_isAdmin && !_isPastor) {
-      trailing = TextButton.icon(
+      final pending = _isPendingFor(id: id, name: name);
+      trailing = pending
+          ? TextButton.icon(
+        icon: const Icon(Icons.cancel),
+        label: const Text('Cancel request'),
+        onPressed: () => _confirmCancelJoin(id: id, name: name),
+      )
+          : TextButton.icon(
         icon: const Icon(Icons.person_add_alt_1),
         label: const Text('Join'),
-        onPressed: () => _showJoinPrompt(name),
+        onPressed: () => _showJoinPrompt(id: id, name: name),
       );
     } else if (canDelete) {
       trailing = PopupMenuButton<String>(
@@ -494,7 +629,7 @@ class _MinistriesPageState extends State<MinistriesPage>
               ),
             );
           } else if (signedIn) {
-            _showJoinPrompt(name);
+            _showJoinPrompt(id: id, name: name);
           } else {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('Sign in to join a ministry.')),
@@ -568,112 +703,115 @@ class _MinistriesPageState extends State<MinistriesPage>
         body: TabBarView(
           children: [
             // ---- TAB 1: Ministries ----
-            StreamBuilder<List<Map<String, dynamic>>>(
-              stream: _ministriesStream(),
-              builder: (context, snap) {
-                if (!snap.hasData) {
-                  return const Center(child: CircularProgressIndicator());
-                }
+            RefreshIndicator(
+              onRefresh: _refreshPendingJoinRequests,
+              child: StreamBuilder<List<Map<String, dynamic>>>(
+                stream: _ministriesStream(),
+                builder: (context, snap) {
+                  if (!snap.hasData) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
 
-                // Filter by search query (case-insensitive)
-                final all = snap.data!
-                    .where((m) => _query.isEmpty
-                    ? true
-                    : m['name']
-                    .toString()
-                    .toLowerCase()
-                    .contains(_query.toLowerCase()))
-                    .toList();
+                  // Filter by search query (case-insensitive)
+                  final all = snap.data!
+                      .where((m) => _query.isEmpty
+                      ? true
+                      : m['name']
+                      .toString()
+                      .toLowerCase()
+                      .contains(_query.toLowerCase()))
+                      .toList();
 
-                final fullAccess = _isAdmin || _isPastor;
+                  final fullAccess = _isAdmin || _isPastor;
 
-                final mySet = fullAccess
-                    ? all.map((m) => m['name'].toString()).toSet()
-                    : {..._memberMinistries, ..._leaderMinistries};
+                  final mySet = fullAccess
+                      ? all.map((m) => m['name'].toString()).toSet()
+                      : {..._memberMinistries, ..._leaderMinistries};
 
-                final myList =
-                all.where((m) => mySet.contains(m['name'])).toList();
-                final otherList =
-                all.where((m) => !mySet.contains(m['name'])).toList();
+                  final myList =
+                  all.where((m) => mySet.contains(m['name'])).toList();
+                  final otherList =
+                  all.where((m) => !mySet.contains(m['name'])).toList();
 
-                return ListView(
-                  children: [
-                    // 🔸 Pending Requests Section (leaders; pending-only; tap to disintegrate)
-                    if (_isLeader)
-                      StreamBuilder<List<Map<String, dynamic>>>(
-                        stream: _myPendingCreationRequestsStream(),
-                        builder: (context, reqSnap) {
-                          if (!reqSnap.hasData || reqSnap.data!.isEmpty) {
-                            return const SizedBox.shrink();
-                          }
+                  return ListView(
+                    children: [
+                      // 🔸 Pending Requests Section (leaders; pending-only; tap to disintegrate)
+                      if (_isLeader)
+                        StreamBuilder<List<Map<String, dynamic>>>(
+                          stream: _myPendingCreationRequestsStream(),
+                          builder: (context, reqSnap) {
+                            if (!reqSnap.hasData || reqSnap.data!.isEmpty) {
+                              return const SizedBox.shrink();
+                            }
 
-                          // Filter out locally dismissed AND ensure status is truly 'pending'
-                          final reqs = reqSnap.data!
-                              .where((r) =>
-                          !_dismissedReqIds.contains(r['id'] as String) &&
-                              (r['status'] as String).trim().toLowerCase() ==
-                                  'pending')
-                              .toList();
+                            // Filter out locally dismissed AND ensure status is truly 'pending'
+                            final reqs = reqSnap.data!
+                                .where((r) =>
+                            !_dismissedReqIds.contains(r['id'] as String) &&
+                                (r['status'] as String).trim().toLowerCase() ==
+                                    'pending')
+                                .toList();
 
-                          if (reqs.isEmpty) return const SizedBox.shrink();
+                            if (reqs.isEmpty) return const SizedBox.shrink();
 
-                          return Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _sectionHeader('Pending Ministry Requests'),
-                              ...reqs.map((r) {
-                                final id = r['id'] as String;
-                                final name = r['name'] as String? ?? '';
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _sectionHeader('Pending Ministry Requests'),
+                                ...reqs.map((r) {
+                                  final id = r['id'] as String;
+                                  final name = r['name'] as String? ?? '';
 
-                                return _disintegrateTile(
-                                  id: id,
-                                  child: Card(
-                                    child: ListTile(
-                                      title: Text(name),
-                                      subtitle:
-                                      const Text('Awaiting pastoral approval'),
-                                      trailing: Chip(
-                                        label: const Text('PENDING'),
-                                        backgroundColor:
-                                        Colors.orange.withOpacity(0.15),
-                                        labelStyle:
-                                        const TextStyle(color: Colors.orange),
+                                  return _disintegrateTile(
+                                    id: id,
+                                    child: Card(
+                                      child: ListTile(
+                                        title: Text(name),
+                                        subtitle:
+                                        const Text('Awaiting pastoral approval'),
+                                        trailing: Chip(
+                                          label: const Text('PENDING'),
+                                          backgroundColor:
+                                          Colors.orange.withOpacity(0.15),
+                                          labelStyle:
+                                          const TextStyle(color: Colors.orange),
+                                        ),
+                                        // 👇 Tap to disintegrate locally (pure UX; no write)
+                                        onTap: () {
+                                          setState(() => _dismissedReqIds.add(id));
+                                        },
                                       ),
-                                      // 👇 Tap to disintegrate locally (pure UX; no write)
-                                      onTap: () {
-                                        setState(() => _dismissedReqIds.add(id));
-                                      },
                                     ),
-                                  ),
-                                );
-                              }),
-                            ],
-                          );
-                        },
-                      ),
+                                  );
+                                }),
+                              ],
+                            );
+                          },
+                        ),
 
-                    _sectionHeader('My Ministries'),
-                    if (myList.isEmpty)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 12),
-                        child: Text('None'),
-                      )
-                    else
-                      ...myList.map(_ministryTile),
-
-                    if (!(_isAdmin || _isPastor)) ...[
-                      _sectionHeader('Other Ministries'),
-                      if (otherList.isEmpty)
+                      _sectionHeader('My Ministries'),
+                      if (myList.isEmpty)
                         const Padding(
                           padding: EdgeInsets.symmetric(horizontal: 12),
                           child: Text('None'),
                         )
                       else
-                        ...otherList.map(_ministryTile),
+                        ...myList.map(_ministryTile),
+
+                      if (!(_isAdmin || _isPastor)) ...[
+                        _sectionHeader('Other Ministries'),
+                        if (otherList.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 12),
+                            child: Text('None'),
+                          )
+                        else
+                          ...otherList.map(_ministryTile),
+                      ],
                     ],
-                  ],
-                );
-              },
+                  );
+                },
+              ),
             ),
 
             // ---- TAB 2: Creation Requests (leaders only; full history) ----
