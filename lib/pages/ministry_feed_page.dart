@@ -1,4 +1,7 @@
 // lib/pages/ministry_feed_page.dart
+// Extended: likes ❤️, reactions (emoji), comments with member display names.
+// Works with Firestore rules you provided (likes array, comments & reactions subcollections).
+
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -8,8 +11,9 @@ import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/post_model.dart';
+import '../models/link_preview.dart' as lp;
 import '../services/post_service.dart';
-import '../services/link_preview_service.dart';
+import '../services/link_preview_service.dart' as lps;
 import '../widgets/link_preview_card.dart';
 
 class MinistryFeedPage extends StatefulWidget {
@@ -37,7 +41,11 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
   // auth/meta
   List<String> _myRoles = const [];
   List<String> _myLeaderMins = const [];
+  String? _singleRole;
   bool _isMemberOfThis = false;
+
+  // cache for uid -> display name
+  final Map<String, String> _uidNameCache = {};
 
   @override
   void initState() {
@@ -60,8 +68,9 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
     final snap = await FirebaseFirestore.instance.collection('users').doc(uid).get();
     final data = snap.data() ?? {};
     setState(() {
-      _myRoles = List<String>.from(data['roles'] ?? []);
-      _myLeaderMins = List<String>.from(data['leadershipMinistries'] ?? []);
+      _myRoles = List<String>.from((data['roles'] ?? const []) as List);
+      _myLeaderMins = List<String>.from((data['leadershipMinistries'] ?? const []) as List);
+      _singleRole = (data['role'] ?? '').toString().toLowerCase().trim();
     });
   }
 
@@ -81,9 +90,11 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
 
   Future<void> _pickImage() async {
     if (!_svc.hasStorage) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Images disabled: Storage not configured')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Images disabled: Storage not configured')),
+        );
+      }
       return;
     }
     final picker = ImagePicker();
@@ -103,15 +114,17 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
     final hasLink = _linkCtrl.text.trim().isNotEmpty;
     final hasImage = _imageFile != null;
     if (!hasText && !hasLink && !hasImage) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Write something, add a link, or pick an image')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Write something, add a link, or pick an image')),
+        );
+      }
       return;
     }
 
     setState(() => _posting = true);
     try {
-      // 🔎 get linked member -> build full name
+      // 🔎 build author display name/photo from linked member if present
       String? authorName;
       String? authorPhotoUrl;
 
@@ -132,16 +145,13 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
         final full  = ('$first $last').trim();
         authorName = full.isEmpty ? null : full;
 
-        // optional: if you store a photo field on members
-        if ((m['photoUrl'] ?? '').toString().isNotEmpty) {
-          authorPhotoUrl = (m['photoUrl'] as String).trim();
-        }
+        final photo = (m['photoUrl'] ?? '').toString().trim();
+        if (photo.isNotEmpty) authorPhotoUrl = photo;
       }
 
-      // fallbacks if no member record
       authorName ??= user.displayName?.trim();
       authorName ??= (user.email ?? '').trim();
-      if (authorName.isEmpty) authorName = 'Member';
+      if (authorName == null || authorName.isEmpty) authorName = 'Member';
 
       await _svc.createPost(
         ministryId: widget.ministryId,
@@ -168,11 +178,28 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
     }
   }
 
+  Future<String> _nameForUid(String uid) async {
+    if (_uidNameCache.containsKey(uid)) return _uidNameCache[uid]!;
+    try {
+      final u = await FirebaseFirestore.instance.collection('users').doc(uid).get();
+      final mid = (u.data() ?? const {})['memberId'] as String?;
+      if (mid != null && mid.isNotEmpty) {
+        final m = await FirebaseFirestore.instance.collection('members').doc(mid).get();
+        final md = m.data() ?? {};
+        final full = (md['fullName'] ?? '${(md['firstName'] ?? '').toString().trim()} ${(md['lastName'] ?? '').toString().trim()}').toString().trim();
+        if (full.isNotEmpty) {
+          _uidNameCache[uid] = full;
+          return full;
+        }
+      }
+    } catch (_) {}
+    _uidNameCache[uid] = 'Member';
+    return 'Member';
+  }
+
   @override
   Widget build(BuildContext context) {
-    final isAdmin = _myRoles.contains('admin,leader');
-    final isLeaderHere = _myLeaderMins.contains(widget.ministryName);
-
+    final bool isAdmin = _myRoles.contains('admin') || _singleRole == 'admin';
     return Scaffold(
       appBar: AppBar(title: Text('${widget.ministryName} Feed')),
       body: Column(
@@ -222,7 +249,45 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
                     ministryId: widget.ministryId,
                     ministryName: widget.ministryName,
                     isAdmin: isAdmin,
-                    leaderMinistries: _myLeaderMins,
+                    isMemberOfThis: _isMemberOfThis,
+                    onToggleLike: (p) async {
+                      final uid = FirebaseAuth.instance.currentUser?.uid;
+                      if (uid == null) return;
+                      final ref = FirebaseFirestore.instance
+                          .collection('ministries').doc(widget.ministryId)
+                          .collection('posts').doc(p.id);
+                      final liked = (p.likes ?? const <String>[]).contains(uid);
+                      await ref.update({
+                        'likes': liked
+                            ? FieldValue.arrayRemove([uid])
+                            : FieldValue.arrayUnion([uid]),
+                        'updatedAt': FieldValue.serverTimestamp(),
+                      });
+                    },
+                    onReact: (p, emoji) async {
+                      final uid = FirebaseAuth.instance.currentUser?.uid;
+                      if (uid == null) return;
+                      final reacts = FirebaseFirestore.instance
+                          .collection('ministries').doc(widget.ministryId)
+                          .collection('posts').doc(p.id)
+                          .collection('reactions');
+
+                      // toggle same emoji by same user: delete if exists else create
+                      final qs = await reacts
+                          .where('authorUid', isEqualTo: uid)
+                          .where('emoji', isEqualTo: emoji)
+                          .limit(1).get();
+                      if (qs.docs.isNotEmpty) {
+                        await qs.docs.first.reference.delete();
+                      } else {
+                        await reacts.add({
+                          'authorUid': uid,
+                          'emoji': emoji,
+                          'createdAt': FieldValue.serverTimestamp(),
+                          'updatedAt': FieldValue.serverTimestamp(),
+                        });
+                      }
+                    },
                     onDelete: (p) async {
                       try {
                         await _svc.deletePost(
@@ -243,6 +308,12 @@ class _MinistryFeedPageState extends State<MinistryFeedPage> {
                         }
                       }
                     },
+                    commentBuilder: (postId) => _CommentsBlock(
+                      ministryId: widget.ministryId,
+                      postId: postId,
+                      canComment: _isMemberOfThis,
+                      nameForUid: _nameForUid,
+                    ),
                   ),
                   separatorBuilder: (_, __) => const SizedBox(height: 12),
                   itemCount: posts.length,
@@ -338,29 +409,44 @@ class _Composer extends StatelessWidget {
 
 // ================= Post Card =================
 
+typedef ReactFn = Future<void> Function(PostModel post, String emoji);
+typedef ToggleLikeFn = Future<void> Function(PostModel post);
+typedef DeletePostFn = Future<void> Function(PostModel post);
+typedef CommentBuilder = Widget Function(String postId);
+
 class _PostCard extends StatelessWidget {
   final PostModel post;
   final String ministryId;
   final String ministryName;
   final bool isAdmin;
-  final List<String> leaderMinistries;
-  final Future<void> Function(PostModel) onDelete;
+  final bool isMemberOfThis;
+  final ToggleLikeFn onToggleLike;
+  final ReactFn onReact;
+  final DeletePostFn onDelete;
+  final CommentBuilder commentBuilder;
 
   const _PostCard({
     required this.post,
     required this.ministryId,
     required this.ministryName,
     required this.isAdmin,
-    required this.leaderMinistries,
+    required this.isMemberOfThis,
+    required this.onToggleLike,
+    required this.onReact,
     required this.onDelete,
+    required this.commentBuilder,
   });
 
   @override
   Widget build(BuildContext context) {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     final isAuthor = uid != null && uid == post.authorId;
-    final isLeaderHere = leaderMinistries.contains(ministryName);
-    final canDelete = isAuthor || isAdmin || isLeaderHere;
+
+    final canDelete = isAuthor || isAdmin;
+
+    final likes = post.likes ?? const <String>[];
+    final iLiked = uid != null && likes.contains(uid);
+    final likeCount = likes.length;
 
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -407,9 +493,7 @@ class _PostCard extends StatelessWidget {
                         ],
                       ),
                     );
-                    if (ok == true) {
-                      await onDelete(post);
-                    }
+                    if (ok == true) await onDelete(post);
                   }
                 },
                 itemBuilder: (_) => const [
@@ -439,8 +523,8 @@ class _PostCard extends StatelessWidget {
             if ((post.linkUrl ?? '').isNotEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12.0),
-                child: FutureBuilder(
-                  future: LinkPreviewService.instance.fetch(post.linkUrl!.trim()),
+                child: FutureBuilder<lps.LinkPreview>(
+                  future: lps.LinkPreviewService.instance.fetch(post.linkUrl!.trim()),
                   builder: (context, snap) {
                     if (snap.connectionState == ConnectionState.waiting) {
                       return Padding(
@@ -458,22 +542,29 @@ class _PostCard extends StatelessWidget {
                         ),
                       );
                     }
-                    final preview = snap.data;
-                    if (preview == null) {
-                      // Fallback: simple clickable host chip
+                    final servicePreview = snap.data;
+                    if (servicePreview == null) {
+                      Uri? uri;
+                      try { uri = Uri.parse(post.linkUrl!.trim()); } catch (_) {}
+                      final host = uri?.host.isNotEmpty == true ? uri!.host : post.linkUrl!.trim();
                       return Align(
                         alignment: Alignment.centerLeft,
                         child: ActionChip(
                           avatar: const Icon(Icons.link),
-                          label: Text(Uri.parse(post.linkUrl!).host),
+                          label: Text(host),
                           onPressed: () => launchUrl(
-                            Uri.parse(post.linkUrl!),
+                            Uri.parse(post.linkUrl!.trim()),
                             mode: LaunchMode.externalApplication,
                           ),
                         ),
                       );
                     }
-                    return LinkPreviewCard(preview: preview);
+                    final cardPreview = lp.LinkPreview(
+                      title: servicePreview.title,
+                      description: servicePreview.description,
+                      imageUrl: servicePreview.imageUrl, url: '',
+                    );
+                    return LinkPreviewCard(preview: cardPreview);
                   },
                 ),
               ),
@@ -490,9 +581,167 @@ class _PostCard extends StatelessWidget {
                 ),
               ),
             ],
+
+            // Reactions row
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8.0),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: iLiked ? 'Unlike' : 'Like',
+                    icon: Icon(iLiked ? Icons.favorite : Icons.favorite_border),
+                    onPressed: isMemberOfThis ? () => onToggleLike(post) : null,
+                  ),
+                  Text(likeCount.toString()),
+                  const Spacer(),
+                  // Simple set of emojis to toggle
+                  for (final e in const ['👍','❤️','😂','🙏','🔥'])
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 2.0),
+                      child: TextButton(
+                        onPressed: isMemberOfThis ? () => onReact(post, e) : null,
+                        child: Text(e, style: const TextStyle(fontSize: 18)),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+            const Divider(height: 12),
+            // Comments
+            commentBuilder(post.id),
           ],
         ),
       ),
+    );
+  }
+}
+
+// ================ Comments Block =================
+
+class _CommentsBlock extends StatefulWidget {
+  final String ministryId;
+  final String postId;
+  final bool canComment;
+  final Future<String> Function(String uid) nameForUid;
+
+  const _CommentsBlock({
+    required this.ministryId,
+    required this.postId,
+    required this.canComment,
+    required this.nameForUid,
+  });
+
+  @override
+  State<_CommentsBlock> createState() => _CommentsBlockState();
+}
+
+class _CommentsBlockState extends State<_CommentsBlock> {
+  final _ctrl = TextEditingController();
+  bool _sending = false;
+
+  CollectionReference<Map<String, dynamic>> get _col =>
+      FirebaseFirestore.instance
+          .collection('ministries').doc(widget.ministryId)
+          .collection('posts').doc(widget.postId)
+          .collection('comments');
+
+  Future<void> _send() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    final text = _ctrl.text.trim();
+    if (uid == null || text.isEmpty) return;
+    setState(() => _sending = true);
+    try {
+      await _col.add({
+        'authorId': uid,
+        'text': text,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      _ctrl.clear();
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: _col.orderBy('createdAt', descending: false).snapshots(),
+          builder: (context, snap) {
+            if (!snap.hasData) return const SizedBox.shrink();
+            final docs = snap.data!.docs;
+            if (docs.isEmpty) {
+              return const SizedBox.shrink();
+            }
+            return Column(
+              children: [
+                for (final c in docs)
+                  FutureBuilder<String>(
+                    future: widget.nameForUid((c.data()['authorId'] ?? '').toString()),
+                    builder: (context, nameSnap) {
+                      final name = nameSnap.data ?? 'Member';
+                      final text = (c.data()['text'] ?? '').toString();
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 4.0),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            CircleAvatar(radius: 12, child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: RichText(
+                                text: TextSpan(
+                                  style: DefaultTextStyle.of(context).style,
+                                  children: [
+                                    TextSpan(text: '$name ', style: const TextStyle(fontWeight: FontWeight.w600)),
+                                    TextSpan(text: text),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            );
+          },
+        ),
+        if (widget.canComment)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 6),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _ctrl,
+                    minLines: 1,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                      hintText: 'Write a comment...',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: _sending ? null : _send,
+                )
+              ],
+            ),
+          ),
+      ],
     );
   }
 }

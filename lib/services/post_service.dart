@@ -1,3 +1,4 @@
+// lib/services/post_service.dart
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -44,6 +45,7 @@ class PostService {
   }
 
   /// Creates a post. Provide at least one of [text], [linkUrl], or [imageFile].
+  /// Uses server timestamps and initializes likes to [] to satisfy security rules.
   Future<void> createPost({
     required String ministryId,
     required String authorId,
@@ -73,19 +75,17 @@ class PostService {
       imageUrl = await _uploadImage(ministryId, postRef.id, imageFile);
     }
 
-    final post = PostModel(
-      id: postRef.id,
-      ministryId: ministryId,
-      authorId: authorId,
-      authorName: authorName,
-      authorPhotoUrl: authorPhotoUrl,
-      text: sanitizedText,
-      linkUrl: sanitizedLink,
-      imageUrl: imageUrl,
-      createdAt: DateTime.now(),
-    );
-
-    await postRef.set(post.toMap());
+    // Write minimal schema aligned with rules (createdAt required; likes exists as list)
+    await postRef.set({
+      'authorId': authorId,
+      if (authorName != null) 'authorName': authorName,
+      if (authorPhotoUrl != null) 'authorPhotoUrl': authorPhotoUrl,
+      if (sanitizedText != null && sanitizedText.isNotEmpty) 'text': sanitizedText,
+      if (sanitizedLink != null && sanitizedLink.isNotEmpty) 'linkUrl': sanitizedLink,
+      if (imageUrl != null && imageUrl.isNotEmpty) 'imageUrl': imageUrl,
+      'likes': <String>[],
+      'createdAt': FieldValue.serverTimestamp(),
+    });
   }
 
   Future<void> deletePost({
@@ -103,6 +103,80 @@ class PostService {
       }
     }
     await _db.doc(_postDoc(ministryId, postId)).delete();
+  }
+
+  /// Optional helpers used by some UIs (not strictly required by your current page):
+
+  Future<void> toggleLike({
+    required String ministryId,
+    required String postId,
+    required String uid,
+    required bool currentlyLiked,
+  }) async {
+    final ref = _db.doc(_postDoc(ministryId, postId));
+    await ref.update({
+      'likes': currentlyLiked
+          ? FieldValue.arrayRemove([uid])
+          : FieldValue.arrayUnion([uid]),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> addReaction({
+    required String ministryId,
+    required String postId,
+    required String uid,
+    required String emoji,
+  }) async {
+    final reacts = _db.collection(_postDoc(ministryId, postId)).doc().parent.parent!
+        .collection('posts').doc(postId).collection('reactions');
+    // toggle this exact emoji for this user
+    final qs = await reacts
+        .where('authorUid', isEqualTo: uid)
+        .where('emoji', isEqualTo: emoji)
+        .limit(1)
+        .get();
+    if (qs.docs.isNotEmpty) {
+      await qs.docs.first.reference.delete();
+    } else {
+      await reacts.add({
+        'authorUid': uid,
+        'emoji': emoji,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    }
+  }
+
+  Future<void> addComment({
+    required String ministryId,
+    required String postId,
+    required String uid,
+    required String text,
+  }) async {
+    final comments = _db
+        .collection(_postsCol(ministryId))
+        .doc(postId)
+        .collection('comments');
+    await comments.add({
+      'authorId': uid,
+      'text': text.trim(),
+      'createdAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+  }
+
+  Future<void> deleteComment({
+    required String ministryId,
+    required String postId,
+    required String commentId,
+  }) async {
+    final doc = _db
+        .collection(_postsCol(ministryId))
+        .doc(postId)
+        .collection('comments')
+        .doc(commentId);
+    await doc.delete();
   }
 
   /// -------- Internals --------
