@@ -1,5 +1,5 @@
 
-// lib/pages/ministries_details_page.dart (MERGED)
+// lib/pages/ministries_details_page.dart (MERGED + Likes/Comments + Rich Previews + Leader star)
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -14,12 +14,6 @@ import '../services/post_service.dart';
 import '../services/link_preview_service.dart';
 import '../widgets/link_preview_card.dart';
 
-/// Ministries Details Page
-///
-/// Tabs:
-/// - Members: searchable roster; leaders get moderation tools (promote/demote/remove)
-/// - Feed: your full feed (merged)
-/// - Overview: placeholder (swap with your own details if desired)
 class MinistryDetailsPage extends StatefulWidget {
   final String ministryId;   // "ministries/{docId}"
   final String ministryName; // e.g., "Ushering" (must match members.ministries[] value)
@@ -107,7 +101,6 @@ class _MembersTabState extends State<_MembersTab> {
     final uid = _auth.currentUser?.uid;
     if (uid == null) return;
     _myUid = uid;
-    // read users/{uid} to detect leadershipMinistries + memberId
     final userSnap = await _db.collection('users').doc(uid).get();
     final data = userSnap.data() ?? {};
     _myMemberId = data['memberId'] as String?;
@@ -125,7 +118,6 @@ class _MembersTabState extends State<_MembersTab> {
         .snapshots();
   }
 
-  // Pending join requests for leaders
   Stream<QuerySnapshot<Map<String, dynamic>>> _joinRequestsStream() {
     if (!_isLeaderHere) {
       return const Stream<QuerySnapshot<Map<String, dynamic>>>.empty();
@@ -272,7 +264,17 @@ class _MembersTabState extends State<_MembersTab> {
 
                     return ListTile(
                       contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      leading: _Avatar(initials: m.initials, photoUrl: m.photoUrl),
+                      leading: Stack(
+                        children: [
+                          _Avatar(initials: m.initials, photoUrl: m.photoUrl),
+                          if (isLeaderHere)
+                            const Positioned(
+                              right: -2,
+                              bottom: -2,
+                              child: Icon(Icons.star, size: 16, color: Colors.amber),
+                            ),
+                        ],
+                      ),
                       title: Text(m.fullName ?? 'Unknown',
                           style: const TextStyle(fontWeight: FontWeight.w600)),
                       subtitle: Column(
@@ -401,7 +403,7 @@ class _JoinRequestsCard extends StatelessWidget {
 }
 
 // ===================================================================
-// Feed Tab (your provided feed page merged in as a tab)
+// Feed Tab (with Likes + Comments + Rich link fallback for YouTube)
 // ===================================================================
 class _FeedTab extends StatefulWidget {
   final String ministryId;   // ministries/{id}
@@ -561,7 +563,7 @@ class _FeedTabState extends State<_FeedTab> {
   @override
   Widget build(BuildContext context) {
     final lowerRoles = _myRoles.map((e) => e.toLowerCase()).toList();
-    final isAdmin = lowerRoles.contains('admin'); // fix from 'admin,leader'
+    final isAdmin = lowerRoles.contains('admin');
     final isLeaderHere = _myLeaderMins.contains(widget.ministryName);
 
     return Column(
@@ -644,7 +646,7 @@ class _FeedTabState extends State<_FeedTab> {
   }
 }
 
-// Composer (from your feed page)
+// Composer
 class _Composer extends StatelessWidget {
   final TextEditingController textCtrl;
   final TextEditingController linkCtrl;
@@ -723,7 +725,7 @@ class _Composer extends StatelessWidget {
   }
 }
 
-// Post Card (from your feed page)
+// ======================= Post Card =======================
 class _PostCard extends StatelessWidget {
   final PostModel post;
   final String ministryId;
@@ -821,7 +823,7 @@ class _PostCard extends StatelessWidget {
                 child: Text(post.text!.trim()),
               ),
 
-            // Link preview
+            // Link preview with YouTube fallback
             if ((post.linkUrl ?? '').isNotEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12.0),
@@ -846,14 +848,20 @@ class _PostCard extends StatelessWidget {
                     }
                     final preview = snap.data;
                     if (preview == null) {
-                      // Fallback: simple clickable host chip
+                      final url = post.linkUrl!.trim();
+                      final ytId = _youtubeId(url);
+                      if (ytId != null) {
+                        // Fallback: show YouTube thumbnail with play icon
+                        return _YouTubeThumb(url: url, videoId: ytId);
+                      }
+                      // Fallback: clickable host chip
                       return Align(
                         alignment: Alignment.centerLeft,
                         child: ActionChip(
                           avatar: const Icon(Icons.link),
-                          label: Text(Uri.parse(post.linkUrl!).host),
+                          label: Text(Uri.parse(url).host),
                           onPressed: () => launchUrl(
-                            Uri.parse(post.linkUrl!),
+                            Uri.parse(url),
                             mode: LaunchMode.externalApplication,
                           ),
                         ),
@@ -876,10 +884,288 @@ class _PostCard extends StatelessWidget {
                 ),
               ),
             ],
+
+            // Actions: Like / Comment
+            _PostActions(
+              ministryId: ministryId,
+              postId: post.id,
+            ),
           ],
         ),
       ),
     );
+  }
+}
+
+// ========= Actions Row (likes & comments) =========
+class _PostActions extends StatelessWidget {
+  final String ministryId;
+  final String postId;
+  const _PostActions({required this.ministryId, required this.postId});
+
+  @override
+  Widget build(BuildContext context) {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    final postRef = FirebaseFirestore.instance
+        .collection('ministries')
+        .doc(ministryId)
+        .collection('posts')
+        .doc(postId);
+
+    final commentsQuery = postRef.collection('comments').orderBy('createdAt', descending: true);
+
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: postRef.snapshots(),
+      builder: (context, docSnap) {
+        final data = docSnap.data()?.data() ?? {};
+        final likes = (data['likes'] is List) ? List<String>.from(data['likes']) : <String>[];
+        final myLiked = uid != null && likes.contains(uid);
+        final likeCount = likes.length;
+
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8.0),
+          child: Row(
+            children: [
+              IconButton(
+                icon: Icon(myLiked ? Icons.favorite : Icons.favorite_border),
+                color: myLiked ? Colors.red : null,
+                onPressed: uid == null
+                    ? null
+                    : () async {
+                  try {
+                    if (myLiked) {
+                      await postRef.update({
+                        'likes': FieldValue.arrayRemove([uid])
+                      });
+                    } else {
+                      await postRef.update({
+                        'likes': FieldValue.arrayUnion([uid])
+                      });
+                    }
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Failed to update like: $e')),
+                    );
+                  }
+                },
+              ),
+              Text('$likeCount'),
+              const SizedBox(width: 16),
+              IconButton(
+                icon: const Icon(Icons.mode_comment_outlined),
+                onPressed: () {
+                  showModalBottomSheet(
+                    context: context,
+                    isScrollControlled: true,
+                    useSafeArea: true,
+                    builder: (_) => _CommentsSheet(ministryId: ministryId, postId: postId),
+                  );
+                },
+              ),
+              // live comment count (lightweight aggregate using withConverter to not load bodies)
+              StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                stream: commentsQuery.limit(1).snapshots(),
+                builder: (context, snap) {
+                  // We don't have count without aggregate; show placeholder icon text
+                  // You can store commentCount on post via CF for accuracy.
+                  // Here we just show a dash to keep the UI consistent.
+                  return const Text('');
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ========= Comments Bottom Sheet =========
+class _CommentsSheet extends StatefulWidget {
+  final String ministryId;
+  final String postId;
+  const _CommentsSheet({required this.ministryId, required this.postId});
+
+  @override
+  State<_CommentsSheet> createState() => _CommentsSheetState();
+}
+
+class _CommentsSheetState extends State<_CommentsSheet> {
+  final _db = FirebaseFirestore.instance;
+  final _auth = FirebaseAuth.instance;
+  final _textCtrl = TextEditingController();
+  bool _sending = false;
+
+  Future<void> _send() async {
+    final text = _textCtrl.text.trim();
+    final uid = _auth.currentUser?.uid;
+    if (text.isEmpty || uid == null) return;
+    setState(() => _sending = true);
+    try {
+      await _db
+          .collection('ministries')
+          .doc(widget.ministryId)
+          .collection('posts')
+          .doc(widget.postId)
+          .collection('comments')
+          .add({
+        'authorId': uid,
+        'text': text,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+      _textCtrl.clear();
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _textCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final commentsRef = _db
+        .collection('ministries')
+        .doc(widget.ministryId)
+        .collection('posts')
+        .doc(widget.postId)
+        .collection('comments')
+        .orderBy('createdAt', descending: true);
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 8.0),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 8),
+            Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey.shade400, borderRadius: BorderRadius.circular(4))),
+            const SizedBox(height: 8),
+            Text('Comments', style: Theme.of(context).textTheme.titleMedium),
+            const Divider(height: 16),
+            Flexible(
+              child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                stream: commentsRef.snapshots(),
+                builder: (context, snap) {
+                  if (!snap.hasData) {
+                    return const Center(child: CircularProgressIndicator());
+                  }
+                  final docs = snap.data!.docs;
+                  if (docs.isEmpty) {
+                    return const Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: Text('No comments yet. Start the conversation!'),
+                    );
+                  }
+                  return ListView.separated(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    reverse: true,
+                    itemBuilder: (_, i) {
+                      final c = docs[i].data();
+                      final text = (c['text'] ?? '').toString();
+                      final ts = c['createdAt'];
+                      return ListTile(
+                        dense: false,
+                        leading: const CircleAvatar(child: Icon(Icons.person_outline)),
+                        title: Text(text),
+                        subtitle: Text(ts is Timestamp ? ts.toDate().toLocal().toString() : ''),
+                      );
+                    },
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemCount: docs.length,
+                  );
+                },
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _textCtrl,
+                      decoration: const InputDecoration(
+                        hintText: 'Write a comment...',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.icon(
+                    onPressed: _sending ? null : _send,
+                    icon: const Icon(Icons.send),
+                    label: Text(_sending ? 'Sending...' : 'Send'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ========= YouTube thumbnail fallback widget =========
+class _YouTubeThumb extends StatelessWidget {
+  final String url;
+  final String videoId;
+  const _YouTubeThumb({required this.url, required this.videoId});
+
+  @override
+  Widget build(BuildContext context) {
+    final thumb = 'https://img.youtube.com/vi/$videoId/hqdefault.jpg';
+    return InkWell(
+      onTap: () => launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          AspectRatio(
+            aspectRatio: 16/9,
+            child: Image.network(
+              thumb,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => const Icon(Icons.ondemand_video_outlined),
+            ),
+          ),
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.black54,
+              shape: BoxShape.circle,
+            ),
+            padding: const EdgeInsets.all(12),
+            child: const Icon(Icons.play_arrow, color: Colors.white, size: 36),
+          )
+        ],
+      ),
+    );
+  }
+}
+
+// ========= Helpers =========
+String? _youtubeId(String url) {
+  try {
+    final uri = Uri.parse(url);
+    if (uri.host.contains('youtu.be')) {
+      return uri.pathSegments.isNotEmpty ? uri.pathSegments.first : null;
+    }
+    if (uri.host.contains('youtube.com')) {
+      if (uri.pathSegments.contains('watch')) {
+        return uri.queryParameters['v'];
+      }
+      if (uri.pathSegments.isNotEmpty && uri.pathSegments.first == 'shorts') {
+        return uri.pathSegments.length > 1 ? uri.pathSegments[1] : null;
+      }
+    }
+    return null;
+  } catch (_) {
+    return null;
   }
 }
 
