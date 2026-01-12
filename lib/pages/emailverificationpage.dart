@@ -1,13 +1,17 @@
 import 'dart:async';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:church_management_app/pages/signup2.dart'; // ✅ Adjust import if needed
+import 'package:church_management_app/pages/signup2.dart';
 
 class EmailVerificationPage extends StatefulWidget {
   final String uid;
   final String email;
 
-  const EmailVerificationPage({super.key, required this.uid, required this.email});
+  const EmailVerificationPage({
+    super.key,
+    required this.uid,
+    required this.email,
+  });
 
   @override
   State<EmailVerificationPage> createState() => _EmailVerificationPageState();
@@ -17,8 +21,12 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
   bool _sending = false;
   bool _checking = false;
   int _cooldown = 0;
+
   Timer? _cooldownTimer;
   Timer? _autoCheckTimer;
+  bool _navigated = false;
+
+  FirebaseAuth get _auth => FirebaseAuth.instance;
 
   @override
   void initState() {
@@ -36,65 +44,98 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
 
   void _startCooldown() {
     setState(() => _cooldown = 30); // 30 seconds
-    _cooldownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_cooldown <= 1) {
-        timer.cancel();
-        if (mounted) setState(() => _cooldown = 0);
-      } else {
-        if (mounted) setState(() => _cooldown--);
-      }
-    });
+    _cooldownTimer?.cancel();
+    _cooldownTimer =
+        Timer.periodic(const Duration(seconds: 1), (Timer timer) {
+          if (!mounted) {
+            timer.cancel();
+            return;
+          }
+
+          if (_cooldown <= 1) {
+            timer.cancel();
+            setState(() => _cooldown = 0);
+          } else {
+            setState(() => _cooldown--);
+          }
+        });
   }
 
   void _startAutoCheckLoop() {
-    _autoCheckTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null) {
-        await user.reload();
-        if (!mounted) return;
+    _autoCheckTimer?.cancel();
+    _autoCheckTimer =
+        Timer.periodic(const Duration(seconds: 5), (Timer timer) async {
+          if (!mounted || _navigated) {
+            timer.cancel();
+            return;
+          }
 
-        final refreshedUser = FirebaseAuth.instance.currentUser;
-        if (refreshedUser != null && refreshedUser.emailVerified) {
-          timer.cancel();
-          if (!mounted) return;
+          final user = _auth.currentUser;
+          if (user == null || user.uid != widget.uid) {
+            // User changed or signed out — bail out
+            timer.cancel();
+            if (!mounted) return;
+            Navigator.of(context).pop();
+            return;
+          }
 
-          _navigateToNextStep(); // ✅ auto-route
-        }
-      }
-    });
+          await user.reload();
+          if (!mounted || _navigated) return;
+
+          final refreshedUser = _auth.currentUser;
+          if (refreshedUser != null && refreshedUser.emailVerified) {
+            timer.cancel();
+            _navigateToNextStep();
+          }
+        });
   }
 
   Future<void> _sendVerificationEmail() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user != null && !user.emailVerified) {
-      try {
-        setState(() => _sending = true);
-        await user.sendEmailVerification();
-        _startCooldown();
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Verification email sent!')),
-        );
-      } catch (e) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to send email: $e')),
-        );
-      } finally {
-        if (mounted) setState(() => _sending = false);
-      }
+    final user = _auth.currentUser;
+    if (user == null || user.uid != widget.uid) return;
+
+    if (user.emailVerified) {
+      // Already verified → go next
+      _navigateToNextStep();
+      return;
+    }
+
+    try {
+      setState(() => _sending = true);
+      await user.sendEmailVerification();
+      _startCooldown();
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Verification email sent!')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to send email: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _sending = false);
     }
   }
 
   Future<void> _checkEmailVerified() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
+    final user = _auth.currentUser;
+    if (user == null || user.uid != widget.uid) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('You are not signed in. Please log in again.'),
+        ),
+      );
+      return;
+    }
 
     setState(() => _checking = true);
 
     try {
       await user.reload();
-      final refreshedUser = FirebaseAuth.instance.currentUser;
+      final refreshedUser = _auth.currentUser;
 
       if (!mounted) return;
 
@@ -109,6 +150,7 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
         );
       }
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error checking verification: $e')),
       );
@@ -118,6 +160,12 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
   }
 
   void _navigateToNextStep() {
+    if (!mounted || _navigated) return;
+    _navigated = true;
+
+    _autoCheckTimer?.cancel();
+    _cooldownTimer?.cancel();
+
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (_) => SignupStep2Page(
@@ -130,6 +178,8 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
 
   @override
   Widget build(BuildContext context) {
+    final emailDisplay = widget.email.trim();
+
     return Scaffold(
       appBar: AppBar(title: const Text('Verify Your Email')),
       body: Center(
@@ -138,23 +188,30 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Text(
-                'Please verify your email address.\nCheck your inbox and click the verification link.',
+              Text(
+                'We’ve sent a verification link to:\n$emailDisplay\n\n'
+                    'Please check your inbox and tap the link to continue.',
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 24),
               ElevatedButton.icon(
-                onPressed: (_cooldown > 0 || _sending) ? null : _sendVerificationEmail,
+                onPressed:
+                (_cooldown > 0 || _sending) ? null : _sendVerificationEmail,
                 icon: _sending
                     ? const SizedBox(
                   height: 16,
                   width: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
                 )
                     : const Icon(Icons.email),
-                label: Text(_cooldown > 0
-                    ? 'Resend Email ($_cooldown s)'
-                    : 'Resend Verification Email'),
+                label: Text(
+                  _cooldown > 0
+                      ? 'Resend Email ($_cooldown s)'
+                      : 'Resend Verification Email',
+                ),
               ),
               const SizedBox(height: 12),
               ElevatedButton.icon(
@@ -163,10 +220,13 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
                     ? const SizedBox(
                   height: 16,
                   width: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
                 )
                     : const Icon(Icons.check),
-                label: const Text('Check Verification'),
+                label: const Text('I\'ve Verified – Continue'),
               ),
             ],
           ),

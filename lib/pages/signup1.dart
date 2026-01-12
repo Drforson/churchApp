@@ -12,7 +12,8 @@ class SignupStep1Page extends StatefulWidget {
 
 class _SignupStep1PageState extends State<SignupStep1Page> {
   final _formKey = GlobalKey<FormState>();
-  final _authService = AuthService();
+  final _authService = AuthService.instance;
+  final FirebaseAuth _firebaseAuth = FirebaseAuth.instance;
 
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -20,6 +21,7 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
   bool _loading = false;
   bool _emailExists = false;
   bool _obscure = true;
+  String _lastCheckedEmail = '';
 
   @override
   void dispose() {
@@ -33,18 +35,29 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
   }
 
   Future<void> _checkEmailExists(String email) async {
+    final v = email.trim().toLowerCase();
+
+    // Avoid repeat calls for the same value
+    if (v.isEmpty || v == _lastCheckedEmail) return;
+
+    _lastCheckedEmail = v;
+
     try {
-      final methods = await FirebaseAuth.instance.fetchSignInMethodsForEmail(email);
+      final methods = await _firebaseAuth.fetchSignInMethodsForEmail(v);
+      if (!mounted) return;
       setState(() {
         _emailExists = methods.isNotEmpty;
       });
-    } catch (_) {
-      // On error, don’t block signup UI — just clear the warning.
+    } catch (e) {
+      // Non-fatal: do not block signup on this
+      if (!mounted) return;
       setState(() => _emailExists = false);
+      debugPrint('fetchSignInMethodsForEmail failed (non-fatal): $e');
     }
   }
 
   Future<void> _handleSignup() async {
+    // Trigger validators
     if (!_isFormValid) return;
 
     setState(() => _loading = true);
@@ -56,16 +69,18 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
       final userCred = await _authService.signUp(email, password);
       final user = userCred.user;
       if (user == null) {
-        throw FirebaseAuthException(code: 'unknown', message: 'Signup failed. No user returned.');
+        throw FirebaseAuthException(
+          code: 'unknown',
+          message: 'Signup failed. No user returned.',
+        );
       }
 
-      // Send Email Verification (AuthService does not send it automatically)
+      // Send Email Verification (AuthService only handles doc/roles/claims)
       if (!user.emailVerified) {
         await user.sendEmailVerification();
       }
       await user.reload();
 
-      // Go to Email Verification Page
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
@@ -79,12 +94,18 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_friendlyAuthError(e)), backgroundColor: Colors.red),
+        SnackBar(
+          content: Text(_friendlyAuthError(e)),
+          backgroundColor: Colors.red,
+        ),
       );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+        SnackBar(
+          content: Text('Error: $e'),
+          backgroundColor: Colors.red,
+        ),
       );
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -118,7 +139,7 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
             children: [
               const SizedBox(height: 20),
               const Text(
-                "Step 1: Account Setup",
+                'Step 1: Account Setup',
                 style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
                 textAlign: TextAlign.center,
               ),
@@ -140,7 +161,12 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
                 textInputAction: TextInputAction.next,
                 onChanged: (value) {
                   final v = value.trim();
-                  if (v.contains('@')) _checkEmailExists(v);
+                  // Only check once it looks like an email
+                  if (RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(v)) {
+                    _checkEmailExists(v);
+                  } else {
+                    setState(() => _emailExists = false);
+                  }
                 },
                 validator: (val) {
                   final v = (val ?? '').trim();
@@ -166,8 +192,12 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
                   ),
                 ),
                 validator: (val) {
-                  if (val == null || val.isEmpty) return 'Password is required';
-                  if (val.length < 6) return 'Password must be at least 6 characters';
+                  if (val == null || val.isEmpty) {
+                    return 'Password is required';
+                  }
+                  if (val.length < 6) {
+                    return 'Password must be at least 6 characters';
+                  }
                   return null;
                 },
               ),
@@ -180,13 +210,23 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
                 style: ElevatedButton.styleFrom(
                   minimumSize: const Size(double.infinity, 50),
                   backgroundColor: Colors.indigo,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
                 child: _loading
                     ? const SizedBox(
-                  width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
                 )
-                    : const Text('Continue', style: TextStyle(color: Colors.white)),
+                    : const Text(
+                  'Continue',
+                  style: TextStyle(color: Colors.white),
+                ),
               ),
             ],
           ),

@@ -1,9 +1,9 @@
 // lib/pages/login_page.dart
 import 'package:church_management_app/pages/signup1.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
+
 import '../services/auth_service.dart';
 
 class LoginPage extends StatefulWidget {
@@ -14,20 +14,12 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final _authService = AuthService();
+  final _authService = AuthService.instance;
   final _formKey = GlobalKey<FormState>();
   final _email = TextEditingController();
   final _password = TextEditingController();
+
   bool _loading = false;
-
-  late final FirebaseFunctions _functions;
-
-  @override
-  void initState() {
-    super.initState();
-    // Match your deployed region for Functions
-    _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
-  }
 
   @override
   void dispose() {
@@ -36,25 +28,22 @@ class _LoginPageState extends State<LoginPage> {
     super.dispose();
   }
 
-  /// Subscribes this device to broadcast pings and syncs backend user doc & claims.
+  /// Post-login tasks that should NOT block the login flow:
+  /// - Ask for notification permissions
+  /// - Subscribe device to 'all_members' topic for attendance pings, etc.
   Future<void> _postLoginBootstrap() async {
-    // 1) Notifications: ask permission + best-effort topic subscribe
     try {
       await FirebaseMessaging.instance.requestPermission();
-    } catch (_) {/* ignore */}
+    } catch (e) {
+      debugPrint('FCM permission request failed (non-fatal): $e');
+    }
+
     try {
       await FirebaseMessaging.instance.subscribeToTopic('all_members');
-    } catch (_) {/* ignore */}
-
-    // 2) Best-effort claim sync (callable). DO NOT block login on error.
-    try {
-      await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call(<String, dynamic>{});
     } catch (e) {
-      // Log locally; do not show a red error that implies login failed.
-      debugPrint('syncUserRoleFromMemberOnLogin failed (non-fatal): $e');
+      debugPrint('Subscribe to all_members failed (non-fatal): $e');
     }
   }
-
 
   Future<void> _handleLogin() async {
     if (!_formKey.currentState!.validate()) return;
@@ -66,10 +55,11 @@ class _LoginPageState extends State<LoginPage> {
         _password.text.trim(),
       );
 
-      // Force fresh ID token before calling any callable
-      await userCred.user!.getIdToken(true);
-
-      // Post-login tasks should never block login
+      // signIn already:
+      //  - ensureUserDoc (callable)
+      //  - syncUserRoleFromMemberOnLogin (callable)
+      //  - refreshes ID token
+      // So here we just do UI-level bootstrap.
       await _postLoginBootstrap();
 
       if (!mounted) return;
@@ -77,26 +67,32 @@ class _LoginPageState extends State<LoginPage> {
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message ?? 'Login failed'), backgroundColor: Colors.red),
+        SnackBar(
+          content: Text(e.message ?? 'Login failed'),
+          backgroundColor: Colors.red,
+        ),
       );
     } catch (e) {
       if (!mounted) return;
-      // This catch now *only* covers unexpected errors before navigation.
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Login failed. Please try again.'), backgroundColor: Colors.red),
+        const SnackBar(
+          content: Text('Login failed. Please try again.'),
+          backgroundColor: Colors.red,
+        ),
       );
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-
   void _showForgotPasswordDialog() {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Forgot Password'),
-        content: const Text('Password reset is not implemented yet.'),
+        content: const Text(
+          'Password reset is not implemented yet.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -134,7 +130,7 @@ class _LoginPageState extends State<LoginPage> {
                       color: Colors.black26,
                       blurRadius: 10,
                       offset: Offset(0, 4),
-                    )
+                    ),
                   ],
                 ),
                 child: Form(
@@ -142,7 +138,11 @@ class _LoginPageState extends State<LoginPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      const Icon(Icons.church, size: 80, color: Colors.deepPurple),
+                      const Icon(
+                        Icons.church,
+                        size: 80,
+                        color: Colors.deepPurple,
+                      ),
                       const SizedBox(height: 16),
                       const Text(
                         'Welcome to Resurrection Church',
@@ -157,37 +157,55 @@ class _LoginPageState extends State<LoginPage> {
                       const Text(
                         'Join us in worship and community',
                         textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 16, color: Colors.black87),
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: Colors.black87,
+                        ),
                       ),
                       const SizedBox(height: 30),
-                      const SizedBox(height: 12),
                       TextFormField(
                         controller: _email,
+                        keyboardType: TextInputType.emailAddress,
+                        autofillHints: const [AutofillHints.username],
                         decoration: const InputDecoration(
                           labelText: 'Email',
                           prefixIcon: Icon(Icons.email),
                         ),
-                        validator: (value) =>
-                        value != null && value.contains('@') ? null : 'Enter a valid email',
+                        validator: (value) {
+                          final v = value?.trim() ?? '';
+                          if (v.isEmpty) return 'Email is required';
+                          if (!v.contains('@')) return 'Enter a valid email';
+                          return null;
+                        },
                       ),
                       const SizedBox(height: 12),
                       TextFormField(
                         controller: _password,
+                        obscureText: true,
+                        autofillHints: const [AutofillHints.password],
                         decoration: const InputDecoration(
                           labelText: 'Password',
                           prefixIcon: Icon(Icons.lock),
                         ),
-                        obscureText: true,
-                        validator: (value) =>
-                        value != null && value.length >= 6 ? null : 'Min 6 characters',
+                        validator: (value) {
+                          final v = value ?? '';
+                          if (v.isEmpty) return 'Password is required';
+                          if (v.length < 6) return 'Min 6 characters';
+                          return null;
+                        },
                       ),
                       const SizedBox(height: 20),
                       ElevatedButton(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.deepPurple,
+                        ),
                         onPressed: _loading ? null : _handleLogin,
                         child: _loading
                             ? const SizedBox(
-                            width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
                             : const Text(
                           'Login',
                           style: TextStyle(
@@ -198,17 +216,23 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                       TextButton(
-                        style: TextButton.styleFrom(foregroundColor: Colors.deepPurple),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.deepPurple,
+                        ),
                         onPressed: _showForgotPasswordDialog,
                         child: const Text('Forgot Password?'),
                       ),
                       const SizedBox(height: 10),
                       TextButton(
-                        style: TextButton.styleFrom(foregroundColor: Colors.deepPurple),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.deepPurple,
+                        ),
                         onPressed: () {
                           Navigator.push(
                             context,
-                            MaterialPageRoute(builder: (_) => const SignupStep1Page()),
+                            MaterialPageRoute(
+                              builder: (_) => const SignupStep1Page(),
+                            ),
                           );
                         },
                         child: const Text("Don't have an account? Sign Up"),
