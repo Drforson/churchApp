@@ -346,15 +346,19 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
     final fullName =
     "${memberData['firstName'] ?? ''} ${memberData['lastName'] ?? ''}".trim();
 
-    // Link allowed keys only
-    await FirebaseFirestore.instance.collection('users').doc(user.uid).set(
-      {
-        'memberId': memberId,
-        'linkedAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
-    );
+    // Client guard: do not write restricted fields to users/{uid} directly.
+    // Ask backend to link by email/userUid and sync roles/claims.
+    try {
+      await FirebaseFunctions.instanceFor(region: 'europe-west2')
+          .httpsCallable('syncUserRoleFromMemberOnLogin')
+          .call();
+      await user.getIdToken(true);
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("❌ Link failed: $e")),
+      );
+      return;
+    }
 
     if (!mounted) return;
     setState(() {

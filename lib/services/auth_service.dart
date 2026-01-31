@@ -12,6 +12,13 @@ class AuthService {
   final FirebaseFunctions _functions =
   FirebaseFunctions.instanceFor(region: 'europe-west2');
 
+  static const Set<String> _userClientAllowedKeys = {
+    'email',
+    'linkedAt',
+    'createdAt',
+    'updatedAt',
+  };
+
   User? get currentUser => _auth.currentUser;
 
   /// --------- PRIVATE HELPERS ---------
@@ -47,6 +54,17 @@ class AuthService {
     await _callEnsureUserDoc();
     await _syncRoleFromMemberOnLogin();
     await user.getIdToken(true);
+  }
+
+  void _guardUserWriteKeys(Map<String, dynamic> data) {
+    for (final key in data.keys) {
+      if (!_userClientAllowedKeys.contains(key)) {
+        throw FirebaseAuthException(
+          code: 'unsafe-user-write',
+          message: 'Client write blocked for restricted field: $key',
+        );
+      }
+    }
   }
 
   /// --------- PUBLIC AUTH METHODS ---------
@@ -121,13 +139,12 @@ class AuthService {
     final emailLc = email.trim().toLowerCase();
 
     // Keep user email in sync; link is resolved server-side (unique email or userUid)
-    await _firestore.collection('users').doc(uid).set(
-      {
-        'email': emailLc,
-        'updatedAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
-    );
+    final payload = <String, dynamic>{
+      'email': emailLc,
+      'updatedAt': FieldValue.serverTimestamp(),
+    };
+    _guardUserWriteKeys(payload);
+    await _firestore.collection('users').doc(uid).set(payload, SetOptions(merge: true));
 
     await _syncRoleFromMemberOnLogin();
     await _auth.currentUser?.getIdToken(true);
@@ -192,12 +209,15 @@ class AuthService {
   }
 
   /// Utility: check if a phone number is already used by a member.
-  Future<bool> checkPhoneNumberExists(String phoneNumber) async {
-    final result = await _firestore
-        .collection('members')
-        .where('phoneNumber', isEqualTo: phoneNumber)
-        .limit(1)
-        .get();
-    return result.docs.isNotEmpty;
+  Future<bool> checkPhoneNumberExists(String phoneNumber, {String? excludeMemberId}) async {
+    final callable = _functions.httpsCallable('checkPhoneNumberExists');
+    final res = await callable.call(<String, dynamic>{
+      'phoneNumber': phoneNumber,
+      if (excludeMemberId != null && excludeMemberId.trim().isNotEmpty)
+        'excludeMemberId': excludeMemberId.trim(),
+    });
+    final data = res.data;
+    if (data is Map && data['exists'] == true) return true;
+    return false;
   }
 }

@@ -7,8 +7,11 @@ class MemberModel {
   final String email;
   final String? phoneNumber;
   final String? address;
+  final String? preferredContactMethod;
   final DateTime? dob;
   final bool isVisitor;
+  final String? emergencyContactRelationship;
+  final bool? consentToDataUse;
   final List<String> ministries; // Membership
   final List<String> leadershipMinistries; // Ministries where the user is leader
   final List<String> roles; // 🆕 Roles like ['member', 'leader']
@@ -22,8 +25,11 @@ class MemberModel {
     required this.email,
     this.phoneNumber,
     this.address,
+    this.preferredContactMethod,
     this.dob,
     required this.isVisitor,
+    this.emergencyContactRelationship,
+    this.consentToDataUse,
     required this.ministries,
     required this.leadershipMinistries,
     required this.roles, // 🆕
@@ -40,10 +46,13 @@ class MemberModel {
       email: data['email'] ?? '',
       phoneNumber: data['phoneNumber'],
       address: data['address'],
+      preferredContactMethod: data['preferredContactMethod'],
       dob: data['dateOfBirth'] is Timestamp
           ? (data['dateOfBirth'] as Timestamp).toDate()
           : (data['dob'] is Timestamp ? (data['dob'] as Timestamp).toDate() : null),
       isVisitor: data['isVisitor'] ?? false,
+      emergencyContactRelationship: data['emergencyContactRelationship'],
+      consentToDataUse: data['consentToDataUse'],
       ministries: List<String>.from(data['ministries'] ?? []),
       leadershipMinistries: List<String>.from(data['leadershipMinistries'] ?? []),
       roles: List<String>.from(data['roles'] ?? ['member']), // 🆕
@@ -59,8 +68,11 @@ class MemberModel {
       'email': email,
       'phoneNumber': phoneNumber,
       'address': address,
+      'preferredContactMethod': preferredContactMethod,
       'dateOfBirth': dob != null ? Timestamp.fromDate(dob!) : null,
       'isVisitor': isVisitor,
+      'emergencyContactRelationship': emergencyContactRelationship,
+      'consentToDataUse': consentToDataUse,
       'ministries': ministries,
       'leadershipMinistries': leadershipMinistries,
       'roles': roles, // 🆕

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:church_management_app/services/auth_service.dart';
 
 class EditProfilePage extends StatefulWidget {
   final String memberId;
@@ -116,14 +117,9 @@ class _EditProfilePageState extends State<EditProfilePage> {
     }
 
     try {
-      final phoneQuery = await FirebaseFirestore.instance
-          .collection('members')
-          .where('phoneNumber', isEqualTo: trimmed)
-          .limit(10)
-          .get();
-
-      final conflict =
-      phoneQuery.docs.any((doc) => doc.id != widget.memberId);
+      final exists = await AuthService.instance
+          .checkPhoneNumberExists(trimmed, excludeMemberId: widget.memberId);
+      final conflict = exists;
 
       if (!mounted) return;
       setState(() {

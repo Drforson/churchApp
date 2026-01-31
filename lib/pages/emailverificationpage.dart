@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:church_management_app/pages/signup2.dart';
+import 'package:church_management_app/pages/membership_form_page.dart';
 
 class EmailVerificationPage extends StatefulWidget {
   final String uid;
@@ -168,9 +168,9 @@ class _EmailVerificationPageState extends State<EmailVerificationPage> {
 
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
-        builder: (_) => SignupStep2Page(
-          uid: widget.uid,
-          email: widget.email.trim().toLowerCase(),
+        builder: (_) => MembershipFormPage(
+          selfSignup: true,
+          prefillEmail: widget.email.trim().toLowerCase(),
         ),
       ),
     );

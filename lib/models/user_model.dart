@@ -175,8 +175,11 @@ class MemberModel {
   final String email; // stored lowercase for searches
   final String? phoneNumber;
   final String? address;
+  final String? preferredContactMethod;
   final DateTime? dob;
   final bool isVisitor;
+  final String? emergencyContactRelationship;
+  final bool? consentToDataUse;
 
   /// Membership by NAME
   final List<String> ministries;
@@ -205,8 +208,11 @@ class MemberModel {
     required this.email,
     this.phoneNumber,
     this.address,
+    this.preferredContactMethod,
     this.dob,
     required this.isVisitor,
+    this.emergencyContactRelationship,
+    this.consentToDataUse,
     required this.ministries,
     required this.leadershipMinistries,
     required this.roles,
@@ -234,10 +240,13 @@ class MemberModel {
       email: _safeLower(data['email'] as String?),
       phoneNumber: (data['phoneNumber'] as String?)?.trim(),
       address: (data['address'] as String?)?.trim(),
+      preferredContactMethod: (data['preferredContactMethod'] as String?)?.trim(),
       dob: data['dateOfBirth'] is Timestamp
           ? (data['dateOfBirth'] as Timestamp).toDate()
           : (data['dob'] is Timestamp ? (data['dob'] as Timestamp).toDate() : null),
       isVisitor: (data['isVisitor'] as bool?) ?? false,
+      emergencyContactRelationship: (data['emergencyContactRelationship'] as String?)?.trim(),
+      consentToDataUse: (data['consentToDataUse'] as bool?),
       ministries: (data['ministries'] is List)
           ? List<String>.from((data['ministries'] as List).map((e) => (e ?? '').toString()))
           : <String>[],
@@ -264,8 +273,11 @@ class MemberModel {
       'email': email.trim().toLowerCase(),
       'phoneNumber': phoneNumber,
       'address': address,
+      'preferredContactMethod': preferredContactMethod,
       'dateOfBirth': dob != null ? Timestamp.fromDate(dob!) : null,
       'isVisitor': isVisitor,
+      'emergencyContactRelationship': emergencyContactRelationship,
+      'consentToDataUse': consentToDataUse,
       'ministries': ministries,
       'leadershipMinistries': leadershipMinistries,
       'roles': roles.map((e) => e.toLowerCase()).toList(),
@@ -286,8 +298,11 @@ class MemberModel {
     String? email,
     String? phoneNumber,
     String? address,
+    String? preferredContactMethod,
     DateTime? dob,
     bool? isVisitor,
+    String? emergencyContactRelationship,
+    bool? consentToDataUse,
     List<String>? ministries,
     List<String>? leadershipMinistries,
     List<String>? roles,
@@ -305,8 +320,11 @@ class MemberModel {
       email: email ?? this.email,
       phoneNumber: phoneNumber ?? this.phoneNumber,
       address: address ?? this.address,
+      preferredContactMethod: preferredContactMethod ?? this.preferredContactMethod,
       dob: dob ?? this.dob,
       isVisitor: isVisitor ?? this.isVisitor,
+      emergencyContactRelationship: emergencyContactRelationship ?? this.emergencyContactRelationship,
+      consentToDataUse: consentToDataUse ?? this.consentToDataUse,
       ministries: ministries ?? this.ministries,
       leadershipMinistries: leadershipMinistries ?? this.leadershipMinistries,
       roles: roles != null ? normalizeRoleList(roles) : this.roles,

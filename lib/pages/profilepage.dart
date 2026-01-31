@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import 'package:church_management_app/services/auth_service.dart';
@@ -26,6 +29,9 @@ class _HomePageState extends State<HomePage> {
   String? _memberId;
   bool _loading = true;
   bool _saving = false;
+  bool _linking = false;
+  bool _showDebug = true;
+  String _debugInfo = '';
 
   bool _bypassMode = false;
   int _cooldownSecs = 0;
@@ -39,6 +45,8 @@ class _HomePageState extends State<HomePage> {
   final _addressCtrl = TextEditingController();
   final _emergencyNameCtrl = TextEditingController();
   final _emergencyPhoneCtrl = TextEditingController();
+  final _preferredContactCtrl = TextEditingController();
+  final _emergencyRelationCtrl = TextEditingController();
 
   final List<String> _maritalOptions = const ['single', 'married', 'divorced', 'widowed'];
   String? _maritalStatus;
@@ -47,6 +55,8 @@ class _HomePageState extends State<HomePage> {
   String? _genderStatus;
 
   DateTime? _dob;
+  bool _isVisitor = false;
+  bool _consentToDataUse = false;
 
   @override
   void initState() {
@@ -64,6 +74,8 @@ class _HomePageState extends State<HomePage> {
     _addressCtrl.dispose();
     _emergencyNameCtrl.dispose();
     _emergencyPhoneCtrl.dispose();
+    _preferredContactCtrl.dispose();
+    _emergencyRelationCtrl.dispose();
     _cooldownTimer?.cancel();
     super.dispose();
   }
@@ -76,6 +88,15 @@ class _HomePageState extends State<HomePage> {
     }
 
     try {
+      final debugLines = <String>[];
+      debugLines.add('uid: ${user.uid}');
+      debugLines.add('email: ${user.email ?? ''}');
+
+      await user.reload();
+      final refreshed = _auth.currentUser;
+      final isVerified = refreshed?.emailVerified ?? false;
+      debugLines.add('emailVerified: $isVerified');
+
       final emailLc = (user.email ?? '').trim().toLowerCase();
       final now = FieldValue.serverTimestamp();
 
@@ -84,22 +105,42 @@ class _HomePageState extends State<HomePage> {
       final userSnap = await userRef.get();
 
       if (!userSnap.exists) {
-        await userRef.set(
-          {
-            'email': emailLc,
-            'createdAt': now,
-            'updatedAt': now,
-          },
-          SetOptions(merge: true),
-        );
+        try {
+          await userRef.set(
+            {
+              'email': emailLc,
+              'createdAt': now,
+              'updatedAt': now,
+            },
+            SetOptions(merge: true),
+          );
+        } on FirebaseException catch (e) {
+          if (mounted) {
+            setState(() {
+              _loading = false;
+              _debugInfo = '${debugLines.join('\n')}\nusers.set error: ${e.code}';
+            });
+          }
+          return;
+        }
       } else {
-        await userRef.set(
-          {
-            if (emailLc.isNotEmpty) 'email': emailLc,
-            'updatedAt': now,
-          },
-          SetOptions(merge: true),
-        );
+        try {
+          await userRef.set(
+            {
+              if (emailLc.isNotEmpty) 'email': emailLc,
+              'updatedAt': now,
+            },
+            SetOptions(merge: true),
+          );
+        } on FirebaseException catch (e) {
+          if (mounted) {
+            setState(() {
+              _loading = false;
+              _debugInfo = '${debugLines.join('\n')}\nusers.update error: ${e.code}';
+            });
+          }
+          return;
+        }
       }
 
       if (_emailCtrl.text.trim().isEmpty && user.email != null) {
@@ -109,6 +150,7 @@ class _HomePageState extends State<HomePage> {
       // Check link
       final uSnap = await userRef.get();
       String? memberId = (uSnap.data()?['memberId'] as String?)?.trim();
+      debugLines.add('users.memberId: ${memberId ?? ''}');
 
       // Try server-side auto-link (unique email or userUid) if not linked
       if (memberId == null || memberId.isEmpty) {
@@ -123,17 +165,50 @@ class _HomePageState extends State<HomePage> {
 
         final uSnap2 = await userRef.get();
         memberId = (uSnap2.data()?['memberId'] as String?)?.trim();
+        debugLines.add('linked memberId: ${memberId ?? ''}');
+      }
+
+      // Fallback: if still not linked, try unique email match for UI access
+      if ((memberId == null || memberId.isEmpty) && emailLc.isNotEmpty) {
+        try {
+          final q = await _db
+              .collection('members')
+              .where('email', isEqualTo: emailLc)
+              .limit(2)
+              .get();
+          if (q.size == 1) {
+            memberId = q.docs.first.id;
+            debugLines.add('email match memberId: $memberId');
+          } else {
+            debugLines.add('email match count: ${q.size}');
+          }
+        } on FirebaseException catch (e) {
+          debugLines.add('email query error: ${e.code}');
+        }
       }
 
       if (memberId == null || memberId.isEmpty) {
         setState(() {
           _memberId = null;
           _loading = false;
+          _debugInfo = debugLines.join('\n');
         });
         return;
       }
 
-      final mSnap = await _db.collection('members').doc(memberId).get();
+      DocumentSnapshot<Map<String, dynamic>> mSnap;
+      try {
+        mSnap = await _db.collection('members').doc(memberId).get();
+      } on FirebaseException catch (e) {
+        if (mounted) {
+          setState(() {
+            _memberId = null;
+            _loading = false;
+            _debugInfo = '${debugLines.join('\n')}\nmembers.get error: ${e.code}';
+          });
+        }
+        return;
+      }
       final md = mSnap.data() ?? {};
 
       _memberId = memberId;
@@ -144,6 +219,10 @@ class _HomePageState extends State<HomePage> {
       _addressCtrl.text = (md['address'] ?? '').toString();
       _emergencyNameCtrl.text = (md['emergencyContactName'] ?? '').toString();
       _emergencyPhoneCtrl.text = (md['emergencyContactNumber'] ?? '').toString();
+      _preferredContactCtrl.text = (md['preferredContactMethod'] ?? '').toString();
+      _emergencyRelationCtrl.text = (md['emergencyContactRelationship'] ?? '').toString();
+      _isVisitor = (md['isVisitor'] == true);
+      _consentToDataUse = (md['consentToDataUse'] == true);
 
       final g = (md['gender'] ?? '').toString().toLowerCase().trim();
       _genderStatus = _genderOptions.contains(g) ? g : null;
@@ -153,6 +232,11 @@ class _HomePageState extends State<HomePage> {
 
       final ts = md['dateOfBirth'];
       _dob = ts is Timestamp ? ts.toDate() : null;
+
+      debugLines.add('resolved memberId: $memberId');
+      debugLines.add('member.email: ${(md['email'] ?? '').toString()}');
+      debugLines.add('member.userUid: ${(md['userUid'] ?? '').toString()}');
+      _debugInfo = debugLines.join('\n');
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -281,9 +365,13 @@ class _HomePageState extends State<HomePage> {
       'phoneNumber': _phoneCtrl.text.trim(),
       'gender': (_genderStatus ?? '').trim(),
       'address': _addressCtrl.text.trim(),
+      'preferredContactMethod': _preferredContactCtrl.text.trim(),
       'emergencyContactName': _emergencyNameCtrl.text.trim(),
       'emergencyContactNumber': _emergencyPhoneCtrl.text.trim(),
+      'emergencyContactRelationship': _emergencyRelationCtrl.text.trim(),
       'maritalStatus': (_maritalStatus ?? '').trim(),
+      'consentToDataUse': _consentToDataUse,
+      'isVisitor': _isVisitor,
       'updatedAt': FieldValue.serverTimestamp(),
       if (_dob != null) 'dateOfBirth': Timestamp.fromDate(_dob!),
       if (_dob == null) 'dateOfBirth': FieldValue.delete(),
@@ -314,6 +402,10 @@ class _HomePageState extends State<HomePage> {
         // Fetch the linked memberId for local state
         final uSnap = await _db.collection('users').doc(user.uid).get();
         _memberId = uSnap.data()?['memberId'] as String?;
+
+        if (_memberId != null) {
+          await _db.collection('members').doc(_memberId!).update(profilePayload);
+        }
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -357,6 +449,115 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  dynamic _jsonSafe(dynamic value) {
+    if (value is Timestamp) return value.toDate().toIso8601String();
+    if (value is DateTime) return value.toIso8601String();
+    if (value is Map) {
+      return value.map((k, v) => MapEntry(k.toString(), _jsonSafe(v)));
+    }
+    if (value is Iterable) return value.map(_jsonSafe).toList();
+    return value;
+  }
+
+  Future<void> _dumpUserDoc() async {
+    final user = _auth.currentUser;
+    if (user == null) return;
+    try {
+      final uSnap = await _db.collection('users').doc(user.uid).get();
+      final uData = uSnap.data() ?? const <String, dynamic>{};
+      debugPrint('--- USERS/${user.uid} ---');
+      debugPrint(const JsonEncoder.withIndent('  ').convert(_jsonSafe(uData)));
+
+      final memberId = (uData['memberId'] as String?)?.trim();
+      if (memberId != null && memberId.isNotEmpty) {
+        final mSnap = await _db.collection('members').doc(memberId).get();
+        final mData = mSnap.data() ?? const <String, dynamic>{};
+        debugPrint('--- MEMBERS/$memberId ---');
+        debugPrint(const JsonEncoder.withIndent('  ').convert(_jsonSafe(mData)));
+      }
+    } catch (e) {
+      debugPrint('Dump user/member doc failed: $e');
+    }
+  }
+
+  Future<void> _showAppCheckToken() async {
+    String? token;
+    String? error;
+    try {
+      token = await FirebaseAppCheck.instance.getToken(true);
+    } catch (e) {
+      error = e.toString();
+    }
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('App Check token'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SelectableText(
+            token ?? 'Failed to fetch token.\n${error ?? ''}',
+            style: const TextStyle(fontSize: 12),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+          if (token != null)
+            TextButton(
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: token!));
+                Navigator.pop(ctx);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Token copied')),
+                );
+              },
+              child: const Text('Copy'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _linkSelfAfterVerification() async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Not signed in.')),
+      );
+      return;
+    }
+
+    if (_linking) return;
+    setState(() => _linking = true);
+    try {
+      await _functions.httpsCallable('linkSelfAfterVerification').call();
+      await user.getIdToken(true);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Link completed. Refreshing...')),
+        );
+      }
+      await _loadProfile();
+    } on FirebaseFunctionsException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Link failed: ${e.code}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Link failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _linking = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final percent = _computeCompletionPercent();
@@ -373,16 +574,27 @@ class _HomePageState extends State<HomePage> {
         onRefresh: _loadProfile,
         onResend: _resendVerificationEmail,
         onBypass: _enableBypassAndShowForm,
+        onLinkSelf: _linkSelfAfterVerification,
+        onDump: _dumpUserDoc,
+        onAppCheckToken: _showAppCheckToken,
+        linking: _linking,
         email: _auth.currentUser?.email,
         cooldownSecs: _cooldownSecs,
+        debugText: _showDebug ? _debugInfo : null,
       )
           : SafeArea(
-        child: Form(
+      child: Form(
           key: _formKey,
           child: ListView(
             padding:
             const EdgeInsets.fromLTRB(16, 12, 16, 24),
             children: [
+              if (_showDebug)
+                _DebugCard(
+                  text: _debugInfo,
+                  onDump: _dumpUserDoc,
+                  onAppCheckToken: _showAppCheckToken,
+                ),
               _Header(percent: percent),
               const SizedBox(height: 16),
 
@@ -485,6 +697,15 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
               const SizedBox(height: 12),
+              TextFormField(
+                controller: _preferredContactCtrl,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(
+                  labelText: 'Preferred contact method',
+                  prefixIcon: Icon(Icons.forum_outlined),
+                ),
+              ),
+              const SizedBox(height: 12),
 
               InkWell(
                 borderRadius: BorderRadius.circular(12),
@@ -526,6 +747,15 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 12),
               TextFormField(
+                controller: _emergencyRelationCtrl,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(
+                  labelText: 'Emergency contact relationship',
+                  prefixIcon: Icon(Icons.group_outlined),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
                 controller: _emergencyPhoneCtrl,
                 keyboardType: TextInputType.phone,
                 decoration: const InputDecoration(
@@ -533,6 +763,20 @@ class _HomePageState extends State<HomePage> {
                   prefixIcon:
                   Icon(Icons.local_phone_outlined),
                 ),
+              ),
+              const SizedBox(height: 12),
+
+              SwitchListTile.adaptive(
+                value: _isVisitor,
+                title: const Text('Visitor'),
+                subtitle: const Text('Mark as visitor (no ministry membership required)'),
+                onChanged: (v) => setState(() => _isVisitor = v),
+              ),
+              SwitchListTile.adaptive(
+                value: _consentToDataUse,
+                title: const Text('Consent to data use'),
+                subtitle: const Text('I consent to the use of my data for church administration'),
+                onChanged: (v) => setState(() => _consentToDataUse = v),
               ),
 
               const SizedBox(height: 24),
@@ -559,7 +803,7 @@ class _HomePageState extends State<HomePage> {
 
   double _computeCompletionPercent() {
     int filled = 0;
-    const total = 8;
+    const total = 11;
     if (_firstNameCtrl.text.trim().isNotEmpty ||
         _lastNameCtrl.text.trim().isNotEmpty) filled++;
     if (_emailCtrl.text.trim().isNotEmpty) filled++;
@@ -567,11 +811,16 @@ class _HomePageState extends State<HomePage> {
     if (_genderStatus != null && _genderStatus!.isNotEmpty) filled++;
     if (_maritalStatus != null && _maritalStatus!.isNotEmpty) filled++;
     if (_addressCtrl.text.trim().isNotEmpty) filled++;
+    if (_preferredContactCtrl.text.trim().isNotEmpty) filled++;
     if (_emergencyNameCtrl.text.trim().isNotEmpty ||
         _emergencyPhoneCtrl.text.trim().isNotEmpty) filled++;
+    if (_emergencyRelationCtrl.text.trim().isNotEmpty) filled++;
+    if (_consentToDataUse) filled++;
+    if (_isVisitor) filled++;
     if (_dob != null) filled++;
     return (filled / total).clamp(0.0, 1.0);
   }
+
 }
 
 /* ---------- small helper widgets ---------- */
@@ -624,15 +873,25 @@ class _NoMemberSection extends StatelessWidget {
   final Future<void> Function() onRefresh;
   final VoidCallback onResend;
   final VoidCallback onBypass;
+  final VoidCallback onLinkSelf;
+  final VoidCallback onDump;
+  final VoidCallback onAppCheckToken;
+  final bool linking;
   final String? email;
   final int cooldownSecs;
+  final String? debugText;
 
   const _NoMemberSection({
     required this.onRefresh,
     required this.onResend,
     required this.onBypass,
+    required this.onLinkSelf,
+    required this.onDump,
+    required this.onAppCheckToken,
+    required this.linking,
     required this.email,
     required this.cooldownSecs,
+    required this.debugText,
   });
 
   @override
@@ -642,6 +901,12 @@ class _NoMemberSection extends StatelessWidget {
       child: ListView(
         padding: const EdgeInsets.all(24),
         children: [
+          if (debugText != null)
+            _DebugCard(
+              text: debugText!,
+              onDump: onDump,
+              onAppCheckToken: onAppCheckToken,
+            ),
           const SizedBox(height: 40),
           Icon(Icons.person_search_outlined,
               size: 62, color: Colors.grey.shade700),
@@ -684,12 +949,82 @@ class _NoMemberSection extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: linking ? null : onLinkSelf,
+              icon: const Icon(Icons.link),
+              label: Text(linking ? 'Linking...' : 'Link my account'),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: onDump,
+              icon: const Icon(Icons.copy_all_outlined),
+              label: const Text('Print user doc to console'),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: onAppCheckToken,
+              icon: const Icon(Icons.security_outlined),
+              label: const Text('Show App Check token'),
+            ),
+          ),
+          const SizedBox(height: 12),
           Text(
             'Bypass lets you fill out your profile now. We’ll create a member record and link it to your account (email must still be verified).',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade600),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _DebugCard extends StatelessWidget {
+  final String text;
+  final VoidCallback? onDump;
+  final VoidCallback? onAppCheckToken;
+  const _DebugCard({required this.text, this.onDump, this.onAppCheckToken});
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: Colors.yellow.shade50,
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              text.isEmpty ? 'Debug info unavailable' : text,
+              style: const TextStyle(fontSize: 12),
+            ),
+            if (onDump != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: onDump,
+                icon: const Icon(Icons.copy_all_outlined),
+                label: const Text('Print user doc to console'),
+              ),
+            ],
+            if (onAppCheckToken != null) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: onAppCheckToken,
+                icon: const Icon(Icons.security_outlined),
+                label: const Text('Show App Check token'),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

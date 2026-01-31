@@ -16,7 +16,6 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'pages/attendance_setup_page.dart';
 import 'pages/login_page.dart';
 import 'pages/signup1.dart';
-import 'pages/signup2.dart';
 
 import 'pages/prayer_request_manage_page.dart';
 import 'pages/baptism_manage_page.dart';
@@ -83,7 +82,7 @@ Future<void> _initLocalNotifications() async {
       requestSoundPermission: false,
     ),
   );
-  await _fln.initialize(initSettings);
+  await _fln.initialize(settings: initSettings);
 }
 
 Future<void> _initMessaging() async {
@@ -105,10 +104,10 @@ Future<void> _initMessaging() async {
   FirebaseMessaging.onMessage.listen((RemoteMessage m) {
     final n = m.notification;
     _fln.show(
-      n.hashCode,
-      n?.title ?? 'New message',
-      n?.body ?? '',
-      const NotificationDetails(
+      id: n.hashCode,
+      title: n?.title ?? 'New message',
+      body: n?.body ?? '',
+      notificationDetails: const NotificationDetails(
         android: AndroidNotificationDetails(
           _androidChannelId,
           _androidChannelName,
@@ -138,8 +137,15 @@ Future<void> _activateAppCheck() async {
   try {
     final t = await FirebaseAppCheck.instance.getToken(true);
     debugPrint('[AppCheck] token len=${t?.length ?? 0}');
+    if (!kReleaseMode) {
+      debugPrint('[AppCheck] If Firestore is denied in debug, add the "App Check debug token" from logcat to Firebase Console.');
+      debugPrint('[AppCheck] current token (debug only): ${t ?? 'null'}');
+    }
   } catch (e) {
     debugPrint('[AppCheck] getToken warn: $e');
+    if (!kReleaseMode) {
+      debugPrint('[AppCheck] If you see "App Check debug token" in logcat, add it in Firebase Console → App Check → Debug tokens.');
+    }
   }
 
   await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
@@ -188,6 +194,11 @@ Future<void> main() async {
 
 /// Order of precedence: admin > pastor > leader > usher > member
 String _resolveRoleFromUserData(Map<String, dynamic> data) {
+  // First: explicit boolean flags (new/legacy)
+  if (data['admin'] == true || data['isAdmin'] == true) return 'admin';
+  if (data['pastor'] == true || data['isPastor'] == true) return 'pastor';
+  if (data['leader'] == true || data['isLeader'] == true) return 'leader';
+
   // Prefer canonical single field from backend
   final single = (data['role'] is String)
       ? (data['role'] as String).toLowerCase().trim()
@@ -209,6 +220,14 @@ String _resolveRoleFromUserData(Map<String, dynamic> data) {
   if (legacy.contains('pastor')) return 'pastor';
   if (legacy.contains('leader')) return 'leader';
   if (legacy.contains('usher')) return 'usher';
+  return 'member';
+}
+
+/// Order of precedence: admin > pastor > leader > member
+String _resolveRoleFromClaims(Map<String, dynamic> claims) {
+  if (claims['admin'] == true || claims['isAdmin'] == true) return 'admin';
+  if (claims['pastor'] == true || claims['isPastor'] == true) return 'pastor';
+  if (claims['leader'] == true || claims['isLeader'] == true) return 'leader';
   return 'member';
 }
 
@@ -324,30 +343,78 @@ class _RoleGateState extends State<RoleGate> {
               );
             }
 
-            final exists = userSnap.data?.exists ?? false;
-            if (!exists) {
-              // If user doc not ready yet, just show member home
-              return const HomeDashboardPage();
-            }
+        final exists = userSnap.data?.exists ?? false;
+        if (!exists) {
+          return FutureBuilder<IdTokenResult>(
+            future: _auth.currentUser?.getIdTokenResult(),
+            builder: (context, claimSnap) {
+              if (claimSnap.connectionState == ConnectionState.waiting) {
+                if (_timeout()) return const HomeDashboardPage();
+                return const Scaffold(
+                  body: Center(child: CircularProgressIndicator()),
+                );
+              }
+              final claims = claimSnap.data?.claims ?? const <String, dynamic>{};
+              final claimRole = _resolveRoleFromClaims(claims);
+              switch (claimRole) {
+                case 'admin':
+                  return const AdminDashboardPage();
+                case 'pastor':
+                  return const PastorHomeDashboardPage();
+                case 'leader':
+                  return const AdminDashboardPage();
+                default:
+                  return const HomeDashboardPage();
+              }
+            },
+          );
+        }
 
             final data =
                 userSnap.data?.data() ?? const <String, dynamic>{};
             final effectiveRole = _resolveRoleFromUserData(data);
 
             // Route by canonical role
-            switch (effectiveRole) {
-              case 'admin':
-                return const AdminDashboardPage();
-              case 'pastor':
-                return const PastorHomeDashboardPage();
-              case 'leader':
-              // Leaders share admin dashboard UI in your app
-                return const AdminDashboardPage();
-              case 'usher':
-                return const UsherHomeDashboardPage();
-              default:
-                return const HomeDashboardPage();
+            if (effectiveRole != 'member') {
+              switch (effectiveRole) {
+                case 'admin':
+                  return const AdminDashboardPage();
+                case 'pastor':
+                  return const PastorHomeDashboardPage();
+                case 'leader':
+                  // Leaders share admin dashboard UI in your app
+                  return const AdminDashboardPage();
+                case 'usher':
+                  return const UsherHomeDashboardPage();
+                default:
+                  return const HomeDashboardPage();
+              }
             }
+
+            return FutureBuilder<IdTokenResult>(
+              future: _auth.currentUser?.getIdTokenResult(),
+              builder: (context, claimSnap) {
+                if (claimSnap.connectionState == ConnectionState.waiting) {
+                  if (_timeout()) return const HomeDashboardPage();
+                  return const Scaffold(
+                    body: Center(child: CircularProgressIndicator()),
+                  );
+                }
+                final claims =
+                    claimSnap.data?.claims ?? const <String, dynamic>{};
+                final claimRole = _resolveRoleFromClaims(claims);
+                switch (claimRole) {
+                  case 'admin':
+                    return const AdminDashboardPage();
+                  case 'pastor':
+                    return const PastorHomeDashboardPage();
+                  case 'leader':
+                    return const AdminDashboardPage();
+                  default:
+                    return const HomeDashboardPage();
+                }
+              },
+            );
           },
         );
       },
@@ -370,8 +437,10 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
     case '/signupStep2':
       final args = settings.arguments as Map<String, dynamic>;
       return MaterialPageRoute(
-        builder: (_) =>
-            SignupStep2Page(uid: args['uid'], email: args['email']),
+        builder: (_) => MembershipFormPage(
+          selfSignup: true,
+          prefillEmail: (args['email'] as String?)?.trim().toLowerCase(),
+        ),
       );
 
     case '/admin-dashboard':

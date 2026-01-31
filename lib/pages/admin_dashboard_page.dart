@@ -68,16 +68,25 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     String? name = (u['displayName'] ?? u['name'])?.toString();
     final memberId = u['memberId'] as String?;
 
-    // 3) Derive admin/leader/pastor from users doc (single + array + claims)
-    bool isAdmin  = claimAdmin  || singleRole == 'admin'  || rolesArr.contains('admin');
-    bool isLeader = claimLeader || singleRole == 'leader' || rolesArr.contains('leader') || userLeadMins.isNotEmpty;
-    bool isPastor = claimPastor || singleRole == 'pastor' || rolesArr.contains('pastor');
+    // 3) Derive admin/leader/pastor from users doc (single + array + flags + claims)
+    final userIsAdmin = (u['admin'] == true) || (u['isAdmin'] == true);
+    final userIsPastor = (u['pastor'] == true) || (u['isPastor'] == true);
+    final userIsLeader = (u['leader'] == true) || (u['isLeader'] == true);
+
+    bool isAdmin = claimAdmin || userIsAdmin || singleRole == 'admin' || rolesArr.contains('admin');
+    bool isLeader = claimLeader || userIsLeader || singleRole == 'leader' || rolesArr.contains('leader') || userLeadMins.isNotEmpty;
+    bool isPastor = claimPastor || userIsPastor || singleRole == 'pastor' || rolesArr.contains('pastor');
 
     // 4) Merge with members/{memberId} (roles, flags, name, leadership)
     final mins = <String>{...userLeadMins};
     if (memberId != null && memberId.isNotEmpty) {
-      final mSnap = await _db.collection('members').doc(memberId).get();
-      final md = mSnap.data() ?? {};
+      Map<String, dynamic> md = const <String, dynamic>{};
+      try {
+        final mSnap = await _db.collection('members').doc(memberId).get();
+        md = mSnap.data() ?? {};
+      } on FirebaseException catch (e) {
+        debugPrint('[AdminDashboard] members/$memberId read failed: ${e.code}');
+      }
 
       // Leadership from member doc
       final memberLeadMins = (md['leadershipMinistries'] is List)

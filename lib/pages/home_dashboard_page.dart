@@ -76,8 +76,8 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
         ],
       ),
       body: SafeArea(
-        child: FutureBuilder<DocumentSnapshot>(
-          future: _db.collection('users').doc(uid).get(),
+        child: StreamBuilder<DocumentSnapshot>(
+          stream: _db.collection('users').doc(uid).snapshots(),
           builder: (context, userSnap) {
             if (userSnap.connectionState == ConnectionState.waiting) {
               return const Center(child: CircularProgressIndicator());
@@ -93,15 +93,26 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
             final effectiveRoleFromUser = _resolveRoleFromUser(user);
             final userFullName = (user['fullName'] ?? '').toString().trim();
 
-            // No linked member yet → just show user-based dashboard
+            // No linked member yet → try to resolve by userUid/email for name display
             if (memberId == null || memberId.isEmpty) {
-              final fallbackProgress = _fallbackProfileProgress(user, null);
-              final name = userFullName.isNotEmpty ? userFullName : 'Member';
+              return FutureBuilder<Map<String, dynamic>?>(
+                future: _resolveMemberForUser(uid),
+                builder: (context, mSnap) {
+                  final member = mSnap.data;
+                  final fallbackProgress = _fallbackProfileProgress(user, member);
 
-              return _ScaffoldBody(
-                name: name,
-                role: effectiveRoleFromUser,
-                profileProgress: fallbackProgress,
+                  String name = userFullName.isNotEmpty ? userFullName : 'Member';
+                  final fn = (member?['firstName'] ?? '').toString().trim();
+                  final ln = (member?['lastName'] ?? '').toString().trim();
+                  final memberName = '$fn $ln'.trim();
+                  if (memberName.isNotEmpty) name = memberName;
+
+                  return _ScaffoldBody(
+                    name: name,
+                    role: effectiveRoleFromUser,
+                    profileProgress: fallbackProgress,
+                  );
+                },
               );
             }
 
@@ -164,9 +175,40 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
     );
   }
 
+  Future<Map<String, dynamic>?> _resolveMemberForUser(String uid) async {
+    try {
+      final byUid = await _db
+          .collection('members')
+          .where('userUid', isEqualTo: uid)
+          .limit(1)
+          .get();
+      if (byUid.docs.isNotEmpty) {
+        return byUid.docs.first.data() as Map<String, dynamic>;
+      }
+
+      final email = _auth.currentUser?.email?.trim().toLowerCase() ?? '';
+      if (email.isEmpty) return null;
+
+      final byEmail = await _db
+          .collection('members')
+          .where('email', isEqualTo: email)
+          .orderBy('updatedAt', descending: true)
+          .limit(1)
+          .get();
+      if (byEmail.docs.isNotEmpty) {
+        return byEmail.docs.first.data() as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   /// Canonical role resolution: prefer `role`, then fall back to legacy `roles[]`.
   /// Order: admin > pastor > leader > usher > member.
   String _resolveRoleFromUser(Map<String, dynamic> user) {
+    if (user['admin'] == true || user['isAdmin'] == true) return 'admin';
+    if (user['pastor'] == true || user['isPastor'] == true) return 'pastor';
+    if (user['leader'] == true || user['isLeader'] == true) return 'leader';
+
     final single = (user['role'] is String)
         ? (user['role'] as String).toLowerCase().trim()
         : '';
@@ -237,7 +279,9 @@ class _ScaffoldBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return RefreshIndicator(
-      onRefresh: () async {},
+      onRefresh: () async {
+        await FirebaseAuth.instance.currentUser?.reload();
+      },
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
         children: [

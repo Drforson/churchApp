@@ -109,18 +109,11 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
     }
 
     try {
-      final snapshot = await _db
-          .collection('members')
-          .where('phoneNumber', isEqualTo: v)
-          .get();
-
-      bool conflict = false;
-      for (final doc in snapshot.docs) {
-        if (doc.id != _existingMemberId) {
-          conflict = true;
-          break;
-        }
-      }
+      final exists = await _authService.checkPhoneNumberExists(
+        v,
+        excludeMemberId: _existingMemberId,
+      );
+      final conflict = exists;
 
       if (!mounted) return;
       setState(() => _phoneNumberConflict = conflict);

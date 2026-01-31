@@ -17,7 +17,7 @@
  */
 
 const { onDocumentCreated, onDocumentUpdated, onDocumentDeleted } = require('firebase-functions/v2/firestore');
-const { onCall } = require('firebase-functions/v2/https');
+const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { setGlobalOptions, logger } = require('firebase-functions/v2');
 const admin = require('firebase-admin');
@@ -911,6 +911,274 @@ exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
   await syncClaimsForUid(uid, cache);
 
   return { ok: true, role: highest, linkedMemberId: write.memberId || user?.memberId || null };
+});
+
+/**
+ * Self-link after verification (no admin required).
+ * - Requires auth + verified email
+ * - Links by members.userUid OR unique email match
+ * - Stamps users.memberId + members.userUid
+ */
+exports.linkSelfAfterVerification = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+
+  const authUser = await admin.auth().getUser(uid);
+  if (!authUser.emailVerified) {
+    throw new HttpsError('failed-precondition', 'Email not verified.');
+  }
+
+  const emailLc = toLc(authUser.email || '');
+  if (!emailLc) {
+    throw new HttpsError('failed-precondition', 'Email missing.');
+  }
+
+  let memberSnap = null;
+
+  const byUid = await db.collection('members').where('userUid', '==', uid).limit(1).get();
+  if (!byUid.empty) memberSnap = byUid.docs[0];
+
+  if (!memberSnap) {
+    const byEmail = await db
+      .collection('members')
+      .where('email', '==', emailLc)
+      .orderBy('updatedAt', 'desc')
+      .limit(2)
+      .get();
+    if (byEmail.size >= 1) {
+      memberSnap = byEmail.docs[0];
+    }
+  }
+
+  if (!memberSnap) {
+    throw new HttpsError('not-found', 'No matching member record found.');
+  }
+
+  const memberId = memberSnap.id;
+  const mData = memberSnap.data() || {};
+  const firstName = S(mData.firstName);
+  const lastName = S(mData.lastName);
+  const fullName = S(mData.fullName) || [firstName, lastName].filter(Boolean).join(' ').trim();
+  const userUpdate = { memberId, updatedAt: ts() };
+  if (fullName) {
+    userUpdate.fullName = fullName;
+    userUpdate.fullNameLower = fullName.toLowerCase();
+  }
+  await db.doc(`users/${uid}`).set(userUpdate, { merge: true });
+
+  const memberUpdate = { userUid: uid, updatedAt: ts() };
+  const memberEmail = toLc(memberSnap.get('email') || '');
+  if (memberEmail !== emailLc) {
+    memberUpdate.email = emailLc;
+  }
+  await memberSnap.ref.set(memberUpdate, { merge: true });
+
+  await recomputeAndWriteUserRole(uid);
+  return { ok: true, linkedMemberId: memberId };
+});
+
+/**
+ * Check if a phone number is already used by a member.
+ * Returns { exists: boolean, memberId?: string }
+ */
+exports.checkPhoneNumberExists = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+
+  const phone = S(req.data?.phoneNumber);
+  const excludeMemberId = S(req.data?.excludeMemberId);
+  if (!phone) throw new HttpsError('invalid-argument', 'phoneNumber required.');
+
+  const qs = await db.collection('members').where('phoneNumber', '==', phone).limit(2).get();
+  if (qs.empty) return { exists: false };
+
+  const match = qs.docs.find((d) => d.id !== excludeMemberId) || null;
+  return match ? { exists: true, memberId: match.id } : { exists: false };
+});
+
+/**
+ * One-time admin utility: normalize user<->member links and roles.
+ * - links users to members by existing memberId, members.userUid, or unique email
+ * - syncs user roles/role/leadershipMinistries from member data
+ * - optionally syncs member roles from merged roles
+ */
+exports.normalizeUserLinksAndRoles = onCall(async (req) => {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) throw new Error('unauthenticated');
+
+  const allowed = await isUserPastorOrAdmin(callerUid);
+  if (!allowed) throw new Error('permission-denied');
+
+  const {
+    limit = 200,
+    startAfterUid = null,
+    dryRun = true,
+    mode = 'all',
+    syncClaims = false,
+  } = req.data || {};
+
+  const lim = Math.max(1, Math.min(Number(limit) || 200, 500));
+  let q = db.collection('users').orderBy(admin.firestore.FieldPath.documentId()).limit(lim);
+  if (mode === 'unlinked') q = q.where('memberId', '==', null);
+  if (startAfterUid) q = q.startAfter(String(startAfterUid));
+
+  const snap = await q.get();
+  let processed = 0;
+  let linked = 0;
+  let updated = 0;
+  let conflicts = 0;
+  let ambiguous = 0;
+  const updatedUids = [];
+
+  const sameSet = (a, b) => {
+    const sa = new Set(asArray(a).map((v) => String(v ?? '').trim()).filter(Boolean));
+    const sb = new Set(asArray(b).map((v) => String(v ?? '').trim()).filter(Boolean));
+    if (sa.size !== sb.size) return false;
+    for (const v of sa) if (!sb.has(v)) return false;
+    return true;
+  };
+
+  let batch = db.batch();
+  let batchOps = 0;
+  const commitBatch = async () => {
+    if (dryRun || batchOps === 0) return;
+    await batch.commit();
+    batch = db.batch();
+    batchOps = 0;
+  };
+
+  for (const doc of snap.docs) {
+    processed += 1;
+    const uid = doc.id;
+    const user = doc.data() || {};
+    const emailLc = (user.email || '').toString().trim().toLowerCase();
+
+    let memberSnap = null;
+    let linkedBy = null;
+
+    if (user.memberId) {
+      const m = await db.doc(`members/${user.memberId}`).get();
+      if (m.exists) {
+        memberSnap = m;
+        linkedBy = 'memberId';
+      }
+    }
+
+    if (!memberSnap) {
+      const q1 = await db.collection('members').where('userUid', '==', uid).limit(1).get();
+      if (!q1.empty) {
+        memberSnap = q1.docs[0];
+        linkedBy = 'userUid';
+      }
+    }
+
+    if (!memberSnap) {
+      const qLegacy = await db.collection('members').where('userId', '==', uid).limit(1).get();
+      if (!qLegacy.empty) {
+        memberSnap = qLegacy.docs[0];
+        linkedBy = 'legacy_userId';
+      }
+    }
+
+    if (!memberSnap && emailLc) {
+      const q2 = await db.collection('members').where('email', '==', emailLc).limit(2).get();
+      if (q2.size === 1) {
+        memberSnap = q2.docs[0];
+        linkedBy = 'unique_email';
+      } else if (q2.size > 1) {
+        ambiguous += 1;
+      }
+    }
+
+    const memberData = memberSnap ? (memberSnap.data() || {}) : null;
+    const memberUid = memberData?.userUid || null;
+    const legacyUid = memberData?.userId || null;
+    if (memberSnap && memberUid && memberUid !== uid) {
+      conflicts += 1;
+      continue;
+    }
+    if (memberSnap && !memberUid && legacyUid && legacyUid !== uid) {
+      conflicts += 1;
+      continue;
+    }
+
+    const mergedRoles = normalizeRoles([
+      ...(user.roles || []),
+      ...(memberData?.roles || []),
+      ...(memberData?.isPastor ? ['pastor'] : []),
+    ]);
+    const single = highestRole(mergedRoles);
+
+    const nextLead = uniq([
+      ...asArray(user.leadershipMinistries),
+      ...asArray(memberData?.leadershipMinistries),
+    ].map((v) => String(v ?? '').trim()).filter(Boolean));
+
+    const userUpdates = {};
+    if (!sameSet(user.roles || [], mergedRoles)) userUpdates.roles = mergedRoles;
+    if (toLc(user.role) !== single) userUpdates.role = single;
+    if (memberSnap && user.memberId !== memberSnap.id) userUpdates.memberId = memberSnap.id;
+    if (!sameSet(user.leadershipMinistries || [], nextLead)) userUpdates.leadershipMinistries = nextLead;
+
+    if (Object.keys(userUpdates).length) {
+      userUpdates.updatedAt = ts();
+    }
+
+    const memberUpdates = {};
+    if (memberSnap && !memberUid) {
+      memberUpdates.userUid = uid;
+    }
+    if (memberSnap && !sameSet(memberData?.roles || [], mergedRoles)) {
+      memberUpdates.roles = mergedRoles;
+    }
+    if (memberSnap && Object.keys(memberUpdates).length) {
+      memberUpdates.updatedAt = ts();
+    }
+
+    if (memberSnap) linked += 1;
+
+    if (!dryRun) {
+      if (Object.keys(userUpdates).length) {
+        batch.set(doc.ref, userUpdates, { merge: true });
+        batchOps += 1;
+      }
+      if (memberSnap && Object.keys(memberUpdates).length) {
+        batch.set(memberSnap.ref, memberUpdates, { merge: true });
+        batchOps += 1;
+      }
+      if (batchOps >= 400) await commitBatch();
+    }
+
+    if (Object.keys(userUpdates).length || Object.keys(memberUpdates).length) {
+      updated += 1;
+      updatedUids.push(uid);
+    }
+
+    if (linkedBy === 'unique_email' && memberSnap && !memberData?.userUid && !dryRun) {
+      // already handled by memberUpdates.userUid
+    }
+  }
+
+  await commitBatch();
+
+  if (!dryRun && syncClaims && updatedUids.length) {
+    for (const uid of updatedUids) {
+      await syncClaimsForUid(uid);
+    }
+  }
+
+  const nextPageToken = snap.docs.length === lim ? snap.docs[snap.docs.length - 1].id : null;
+
+  return {
+    ok: true,
+    processed,
+    linked,
+    updated,
+    conflicts,
+    ambiguous,
+    nextPageToken,
+    dryRun: !!dryRun,
+  };
 });
 
 exports.setMemberPastorRole = onCall(async (req) => {
