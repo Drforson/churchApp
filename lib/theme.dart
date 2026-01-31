@@ -1,145 +1,181 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 class AppThemes {
   static final ThemeData _base = ThemeData.light(useMaterial3: true);
 
   // Shared neutrals
-  static const Color _bgNeutral = Color(0xFFF7F8FA);
-  static const Color _cardNeutral = Colors.white;
-  static const Color _textStrong = Color(0xFF1F2937); // slate-800
-  static const Color _textMedium = Color(0xFF4B5563); // slate-600
+  static const Color _bgNeutral = Color(0xFFF5F7F6);
+  static const Color _cardNeutral = Color(0xFFFFFFFF);
+  static const Color _surfaceTint = Color(0xFFE9ECEF);
+  static const Color _textStrong = Color(0xFF111827); // slate-900
+  static const Color _textMedium = Color(0xFF475569); // slate-600
+  static const Color _outline = Color(0xFFE2E8F0);
+
+  static TextTheme _baseText(ThemeData base) {
+    final body = GoogleFonts.manropeTextTheme(base.textTheme);
+    final display = GoogleFonts.spaceGroteskTextTheme(base.textTheme);
+    return body.copyWith(
+      displayLarge: display.displayLarge?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      displayMedium: display.displayMedium?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      displaySmall: display.displaySmall?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      headlineLarge: display.headlineLarge?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      headlineMedium: display.headlineMedium?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      headlineSmall: display.headlineSmall?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      titleLarge: display.titleLarge?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      titleMedium: display.titleMedium?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      titleSmall: display.titleSmall?.copyWith(fontWeight: FontWeight.w700, color: _textStrong),
+      bodyLarge: body.bodyLarge?.copyWith(fontWeight: FontWeight.w500, color: _textMedium),
+      bodyMedium: body.bodyMedium?.copyWith(fontWeight: FontWeight.w500, color: _textMedium),
+      labelLarge: body.labelLarge?.copyWith(fontWeight: FontWeight.w700),
+    );
+  }
+
+  static ThemeData _themeFor({
+    required Color primary,
+    required Color secondary,
+    required Color appBarBg,
+    required Color chipBg,
+  }) {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: primary,
+      brightness: Brightness.light,
+      primary: primary,
+      secondary: secondary,
+      surface: _cardNeutral,
+      surfaceVariant: _surfaceTint,
+      outline: _outline,
+      onSurface: _textStrong,
+      onPrimary: Colors.white,
+      onSecondary: Colors.white,
+    );
+
+    final textTheme = _baseText(_base);
+
+    return _base.copyWith(
+      colorScheme: scheme,
+      scaffoldBackgroundColor: _bgNeutral,
+      textTheme: textTheme,
+      appBarTheme: AppBarTheme(
+        backgroundColor: appBarBg,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        centerTitle: true,
+        surfaceTintColor: Colors.transparent,
+        titleTextStyle: textTheme.titleLarge?.copyWith(color: Colors.white),
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      cardTheme: CardThemeData(
+        color: _cardNeutral,
+        elevation: 1,
+        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        shadowColor: Colors.black12,
+      ),
+      listTileTheme: ListTileThemeData(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        iconColor: scheme.primary,
+        textColor: _textStrong,
+      ),
+      chipTheme: ChipThemeData(
+        backgroundColor: chipBg,
+        selectedColor: scheme.primary.withOpacity(0.12),
+        labelStyle: textTheme.labelMedium?.copyWith(color: _textStrong),
+        secondaryLabelStyle: textTheme.labelMedium?.copyWith(color: _textStrong),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+      ),
+      dividerTheme: const DividerThemeData(color: _outline, thickness: 1, space: 1),
+      dialogTheme: DialogThemeData(
+        backgroundColor: _cardNeutral,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      ),
+      bottomSheetTheme: const BottomSheetThemeData(
+        backgroundColor: _cardNeutral,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+      ),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          foregroundColor: Colors.white,
+          backgroundColor: primary,
+          elevation: 0,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          textStyle: textTheme.labelLarge?.copyWith(color: Colors.white),
+        ),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          foregroundColor: Colors.white,
+          backgroundColor: primary,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          textStyle: textTheme.labelLarge?.copyWith(color: Colors.white),
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: primary,
+          side: BorderSide(color: scheme.outline),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          textStyle: textTheme.labelLarge?.copyWith(color: primary),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: TextButton.styleFrom(
+          foregroundColor: primary,
+          textStyle: textTheme.labelLarge?.copyWith(color: primary),
+        ),
+      ),
+      iconButtonTheme: IconButtonThemeData(
+        style: IconButton.styleFrom(
+          foregroundColor: primary,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: _cardNeutral,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: _outline),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: _outline),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide(color: scheme.primary, width: 1.5),
+        ),
+        labelStyle: textTheme.bodyMedium?.copyWith(color: _textMedium),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        backgroundColor: _textStrong,
+        contentTextStyle: textTheme.bodyMedium?.copyWith(color: Colors.white),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ),
+    );
+  }
 
   /// Admin Theme – warm neutral with golden accent
-  static final ThemeData adminTheme = _base.copyWith(
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: const Color(0xFFDAA520), // goldenrod
-      brightness: Brightness.light,
-      primary: const Color(0xFFDAA520),
-      secondary: const Color(0xFF6D4C41), // earthy brown
-      surface: _cardNeutral,
-      onSurface: _textStrong,
-    ),
-    scaffoldBackgroundColor: _bgNeutral,
-    appBarTheme: const AppBarTheme(
-      backgroundColor: Color(0xFFDAA520),
-      foregroundColor: Colors.white,
-      elevation: 1,
-      centerTitle: true,
-      titleTextStyle: TextStyle(
-        fontSize: 20,
-        fontWeight: FontWeight.w700,
-        color: Colors.white,
-      ),
-    ),
-    textTheme: _base.textTheme.copyWith(
-      headlineSmall: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: _textStrong),
-      titleMedium: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: _textStrong),
-      titleSmall: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: _textStrong),
-      bodyLarge: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500, color: _textMedium),
-      bodyMedium: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: _textMedium),
-      labelLarge: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white),
-    ),
-    cardTheme: CardThemeData(
-      color: _cardNeutral,
-      elevation: 4,
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      shadowColor: Colors.black12,
-    ),
-    elevatedButtonTheme: ElevatedButtonThemeData(
-      style: ElevatedButton.styleFrom(
-        foregroundColor: Colors.white,
-        backgroundColor: const Color(0xFFDAA520),
-        elevation: 3,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-      ),
-    ),
-    inputDecorationTheme: InputDecorationTheme(
-      filled: true,
-      fillColor: _cardNeutral,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFFE5E7EB)),
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFFE5E7EB)),
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFF60A5FA)), // solid Color, not swatch
-      ),
-      labelStyle: const TextStyle(color: _textStrong),
-    ),
+  static final ThemeData adminTheme = _themeFor(
+    primary: const Color(0xFF14532D), // deep forest
+    secondary: const Color(0xFFB45309), // brass
+    appBarBg: const Color(0xFF14532D),
+    chipBg: const Color(0xFFF3E8D2),
   );
 
   /// Member Theme – cool neutral with soft accent
-  static final ThemeData memberTheme = _base.copyWith(
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: const Color(0xFF607D8B), // BlueGrey seed
-      brightness: Brightness.light,
-      primary: const Color(0xFF607D8B),
-      secondary: const Color(0xFFFFB74D), // warm peach
-      surface: _cardNeutral,
-      onSurface: _textStrong,
-    ),
-    scaffoldBackgroundColor: const Color(0xFFEEF1F5), // neutral cool gray
-    appBarTheme: const AppBarTheme(
-      backgroundColor: Color(0xFF607D8B),
-      foregroundColor: Colors.white,
-      elevation: 1,
-      centerTitle: true,
-      titleTextStyle: TextStyle(
-        fontSize: 20,
-        fontWeight: FontWeight.w700,
-        color: Colors.white,
-      ),
-    ),
-    textTheme: _base.textTheme.copyWith(
-      headlineSmall: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: _textStrong),
-      titleMedium: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: _textStrong),
-      titleSmall: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: _textStrong),
-      bodyLarge: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500, color: _textMedium),
-      bodyMedium: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: _textMedium),
-      labelLarge: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white),
-    ),
-    cardTheme: CardThemeData(
-      color: _cardNeutral,
-      elevation: 4,
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      shadowColor: Colors.black12,
-    ),
-    elevatedButtonTheme: ElevatedButtonThemeData(
-      style: ElevatedButton.styleFrom(
-        foregroundColor: Colors.white,
-        backgroundColor: const Color(0xFF607D8B),
-        elevation: 3,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-      ),
-    ),
-    inputDecorationTheme: InputDecorationTheme(
-      filled: true,
-      fillColor: _cardNeutral,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFFE5E7EB)),
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFFE5E7EB)),
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(12),
-        borderSide: const BorderSide(color: Color(0xFF6366F1)), // indigo focus
-      ),
-      labelStyle: const TextStyle(color: _textStrong),
-    ),
+  static final ThemeData memberTheme = _themeFor(
+    primary: const Color(0xFF0F766E), // deep teal
+    secondary: const Color(0xFF0284C7), // ocean blue
+    appBarBg: const Color(0xFF0F766E),
+    chipBg: const Color(0xFFE0F2F1),
   );
 }

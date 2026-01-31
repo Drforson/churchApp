@@ -328,7 +328,7 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                               _StatData('Absent Members', filteredMembers.length, Icons.group_off, Colors.red),
                               _StatData('Absent Visitors', filteredVisitors.length, Icons.person_off, Colors.orange),
                               _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
-                              _StatData('Birthdays', birthdayCount, Icons.cake, Colors.purple),
+                              _StatData('Birthdays', birthdayCount, Icons.cake, Theme.of(context).colorScheme.secondary),
                               _StatData('Member Rate', memberAttendanceRate, Icons.insights, Colors.green, isPercent: true),
                               _StatData('Visitor Rate', visitorAttendanceRate, Icons.pie_chart_outline, Colors.teal, isPercent: true),
                             ],

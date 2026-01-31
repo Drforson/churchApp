@@ -119,47 +119,15 @@ class AuthService {
     }
 
     final emailLc = email.trim().toLowerCase();
-    final now = FieldValue.serverTimestamp();
 
-    final memberSnapshot = await _firestore
-        .collection('members')
-        .where('email', isEqualTo: emailLc)
-        .limit(1)
-        .get();
-
-    if (memberSnapshot.docs.isNotEmpty) {
-      final memberDoc = memberSnapshot.docs.first;
-      final memberId = memberDoc.id;
-
-      // Link user → member
-      await _firestore.collection('users').doc(uid).set(
-        {
-          'email': emailLc,
-          'memberId': memberId,
-          'linkedAt': now,
-          'updatedAt': now,
-        },
-        SetOptions(merge: true),
-      );
-
-      // Stamp ownership on member → user
-      await _firestore.collection('members').doc(memberId).set(
-        {
-          'userUid': uid,
-          'updatedAt': now,
-        },
-        SetOptions(merge: true),
-      );
-    } else {
-      // Keep user email in sync even if no member found (UI can handle "no match")
-      await _firestore.collection('users').doc(uid).set(
-        {
-          'email': emailLc,
-          'updatedAt': now,
-        },
-        SetOptions(merge: true),
-      );
-    }
+    // Keep user email in sync; link is resolved server-side (unique email or userUid)
+    await _firestore.collection('users').doc(uid).set(
+      {
+        'email': emailLc,
+        'updatedAt': FieldValue.serverTimestamp(),
+      },
+      SetOptions(merge: true),
+    );
 
     await _syncRoleFromMemberOnLogin();
     await _auth.currentUser?.getIdToken(true);
@@ -218,17 +186,6 @@ class AuthService {
       'createdAt': now,
       'updatedAt': now,
     });
-
-    // Link user → member
-    await _firestore.collection('users').doc(uid).set(
-      {
-        'email': emailLc,
-        'memberId': memberRef.id,
-        'linkedAt': now,
-        'updatedAt': now,
-      },
-      SetOptions(merge: true),
-    );
 
     await _syncRoleFromMemberOnLogin();
     await _auth.currentUser?.getIdToken(true);

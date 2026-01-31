@@ -841,7 +841,7 @@ class _DebugAdminSetterPageState extends State<DebugAdminSetterPage>
           Colors.teal.shade200,
           Colors.orange.shade200,
           Colors.indigo.shade200,
-          Colors.purple.shade200,
+          Colors.brown.shade200,
           Colors.green.shade200,
           Colors.blueGrey.shade200,
           Colors.pink.shade200,

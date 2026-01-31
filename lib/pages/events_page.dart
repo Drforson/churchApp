@@ -155,7 +155,16 @@ class _EventsPageState extends State<EventsPage> {
     final id = '$eventId-$uid';
     final ref = _db.collection('event_rsvps').doc(id);
     if (on) {
-      await ref.set({'eventId': eventId, 'userId': uid, 'timestamp': Timestamp.now()}, SetOptions(merge: true));
+      await ref.set(
+        {
+          'eventId': eventId,
+          'userId': uid,
+          'status': 'going',
+          'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
     } else {
       await ref.delete();
     }

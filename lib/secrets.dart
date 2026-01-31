@@ -1,2 +1,6 @@
 // lib/secrets.dart (gitignore this file!)
-const kGooglePlacesApiKey = String.fromEnvironment('kaaxfDsdhsvGvmN4YCyq5wDdHcc=');
+// Provide via --dart-define=GOOGLE_PLACES_API_KEY=...
+const kGooglePlacesApiKey = String.fromEnvironment('GOOGLE_PLACES_API_KEY');
+
+// Provide via --dart-define=STRIPE_PUBLISHABLE_KEY=...
+const kStripePublishableKey = String.fromEnvironment('STRIPE_PUBLISHABLE_KEY');

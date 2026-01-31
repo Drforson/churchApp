@@ -8,7 +8,6 @@ class FormsPage extends StatelessWidget {
     final items = <_ActionItem>[
       _ActionItem('Prayer Request', Icons.volunteer_activism_rounded, '/form-prayer-request'),
       _ActionItem('Baptism Request', Icons.water_drop_rounded, '/form-baptism-interest'),
-      _ActionItem('Volunteer Signup', Icons.handshake_rounded, '/form-volunteer-signup'),
     ];
 
     return Scaffold(

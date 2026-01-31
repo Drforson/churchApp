@@ -110,7 +110,7 @@ class _LoginPageState extends State<LoginPage> {
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            colors: [Color(0xFF6A11CB), Color(0xFF2575FC)],
+            colors: [Color(0xFF0F172A), Color(0xFF0F766E)],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
@@ -138,19 +138,19 @@ class _LoginPageState extends State<LoginPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      const Icon(
+                      Icon(
                         Icons.church,
                         size: 80,
-                        color: Colors.deepPurple,
+                        color: Theme.of(context).colorScheme.primary,
                       ),
                       const SizedBox(height: 16),
-                      const Text(
+                      Text(
                         'Welcome to Resurrection Church',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 22,
                           fontWeight: FontWeight.w700,
-                          color: Colors.deepPurple,
+                          color: Theme.of(context).colorScheme.primary,
                         ),
                       ),
                       const SizedBox(height: 8),
@@ -196,9 +196,6 @@ class _LoginPageState extends State<LoginPage> {
                       ),
                       const SizedBox(height: 20),
                       ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.deepPurple,
-                        ),
                         onPressed: _loading ? null : _handleLogin,
                         child: _loading
                             ? const SizedBox(
@@ -216,17 +213,11 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                       TextButton(
-                        style: TextButton.styleFrom(
-                          foregroundColor: Colors.deepPurple,
-                        ),
                         onPressed: _showForgotPasswordDialog,
                         child: const Text('Forgot Password?'),
                       ),
                       const SizedBox(height: 10),
                       TextButton(
-                        style: TextButton.styleFrom(
-                          foregroundColor: Colors.deepPurple,
-                        ),
                         onPressed: () {
                           Navigator.push(
                             context,

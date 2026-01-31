@@ -46,6 +46,7 @@ import 'pages/baptism_interest_form_page.dart';
 
 import 'services/theme_provider.dart';
 import 'firebase_options.dart';
+import 'secrets.dart';
 
 // ---------------------------------------------------------------------------
 // Notifications wiring
@@ -160,8 +161,12 @@ Future<void> main() async {
     await FirebaseAuth.instance.setLanguageCode('en-GB');
   } catch (_) {}
 
-  // Stripe (TODO: move to secure config)
-  Stripe.publishableKey = 'pk_test_your_publishable_key';
+  // Stripe (via --dart-define)
+  if (kStripePublishableKey.isNotEmpty) {
+    Stripe.publishableKey = kStripePublishableKey;
+  } else {
+    debugPrint('[Stripe] publishable key missing; payments will fail.');
+  }
 
   // Notifications
   await _initLocalNotifications();
@@ -435,12 +440,26 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
           builder: (_) => const BaptismInterestFormPage());
 
     case '/uploadExcel':
-      return MaterialPageRoute(
-          builder: (_) => const ExcelDatabaseUploader());
+      if (kReleaseMode) {
+        return MaterialPageRoute(
+          builder: (_) => const Scaffold(
+            body: Center(
+              child: Text('Excel import is disabled in release builds.'),
+            ),
+          ),
+        );
+      }
+      return MaterialPageRoute(builder: (_) => const ExcelDatabaseUploader());
 
     case '/testadmin':
-      return MaterialPageRoute(
-          builder: (_) => const DebugAdminSetterPage());
+      if (kReleaseMode) {
+        return MaterialPageRoute(
+          builder: (_) => const Scaffold(
+            body: Center(child: Text('Page not available in release builds.')),
+          ),
+        );
+      }
+      return MaterialPageRoute(builder: (_) => const DebugAdminSetterPage());
 
     case '/attendance-setup':
       return MaterialPageRoute(

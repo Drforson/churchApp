@@ -234,7 +234,9 @@ class MemberModel {
       email: _safeLower(data['email'] as String?),
       phoneNumber: (data['phoneNumber'] as String?)?.trim(),
       address: (data['address'] as String?)?.trim(),
-      dob: data['dob'] is Timestamp ? (data['dob'] as Timestamp).toDate() : null,
+      dob: data['dateOfBirth'] is Timestamp
+          ? (data['dateOfBirth'] as Timestamp).toDate()
+          : (data['dob'] is Timestamp ? (data['dob'] as Timestamp).toDate() : null),
       isVisitor: (data['isVisitor'] as bool?) ?? false,
       ministries: (data['ministries'] is List)
           ? List<String>.from((data['ministries'] as List).map((e) => (e ?? '').toString()))
@@ -243,7 +245,7 @@ class MemberModel {
           ? List<String>.from((data['leadershipMinistries'] as List).map((e) => (e ?? '').toString()))
           : <String>[],
       roles: normalizeRoleList(data['roles'] as List? ?? const []),
-      userId: (data['userId'] as String?)?.trim(),
+      userId: (data['userUid'] as String?)?.trim() ?? (data['userId'] as String?)?.trim(),
       fullName: finalFull,
       fullNameLower: (data['fullNameLower'] as String? ?? finalFullLower),
       createdAt: data['createdAt'] is Timestamp ? data['createdAt'] as Timestamp : null,
@@ -262,12 +264,12 @@ class MemberModel {
       'email': email.trim().toLowerCase(),
       'phoneNumber': phoneNumber,
       'address': address,
-      'dob': dob != null ? Timestamp.fromDate(dob!) : null,
+      'dateOfBirth': dob != null ? Timestamp.fromDate(dob!) : null,
       'isVisitor': isVisitor,
       'ministries': ministries,
       'leadershipMinistries': leadershipMinistries,
       'roles': roles.map((e) => e.toLowerCase()).toList(),
-      'userId': userId,
+      'userUid': userId,
     };
     if (includeTimestamps) {
       if (createdAt != null) map['createdAt'] = createdAt;

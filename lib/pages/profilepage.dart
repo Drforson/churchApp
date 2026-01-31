@@ -110,35 +110,19 @@ class _HomePageState extends State<HomePage> {
       final uSnap = await userRef.get();
       String? memberId = (uSnap.data()?['memberId'] as String?)?.trim();
 
-      // Try auto-link by email if not linked
-      if ((memberId == null || memberId.isEmpty) && emailLc.isNotEmpty) {
-        final existing = await _db
-            .collection('members')
-            .where('email', isEqualTo: emailLc)
-            .limit(1)
-            .get();
-        if (existing.docs.isNotEmpty) {
-          final foundId = existing.docs.first.id;
-          await userRef.set(
-            {
-              'memberId': foundId,
-              'linkedAt': now,
-              'updatedAt': now,
-            },
-            SetOptions(merge: true),
-          );
-          memberId = foundId;
-
-          // Keep role & claims in sync immediately (linking can change role)
-          try {
-            await _functions
-                .httpsCallable('syncUserRoleFromMemberOnLogin')
-                .call();
-            await user.getIdToken(true);
-          } catch (e) {
-            debugPrint('syncUserRoleFromMemberOnLogin (auto-link) failed: $e');
-          }
+      // Try server-side auto-link (unique email or userUid) if not linked
+      if (memberId == null || memberId.isEmpty) {
+        try {
+          await _functions
+              .httpsCallable('syncUserRoleFromMemberOnLogin')
+              .call();
+          await user.getIdToken(true);
+        } catch (e) {
+          debugPrint('syncUserRoleFromMemberOnLogin (auto-link) failed: $e');
         }
+
+        final uSnap2 = await userRef.get();
+        memberId = (uSnap2.data()?['memberId'] as String?)?.trim();
       }
 
       if (memberId == null || memberId.isEmpty) {

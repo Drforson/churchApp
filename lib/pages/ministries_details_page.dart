@@ -318,9 +318,10 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
   Future<void> _moderateJoinRequest(String requestId, String decision) async {
     // decision: 'approved' | 'rejected'
     try {
+      final action = decision == 'approved' ? 'approve' : 'reject';
       await _functions.httpsCallable('leaderModerateJoinRequest').call({
         'requestId': requestId,
-        'decision': decision,
+        'action': action,
       });
     } catch (_) {
       // Fallback to direct write (should be allowed by your rules for leaders)

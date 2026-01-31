@@ -217,7 +217,7 @@ class _AddEventPageState extends State<AddEventPage> {
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
                       IconButton(
-                        icon: const Icon(Icons.edit, color: Colors.deepPurple),
+                        icon: Icon(Icons.edit, color: Theme.of(context).colorScheme.primary),
                         onPressed: () => _editEvent(event),
                       ),
                       IconButton(

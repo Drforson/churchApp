@@ -164,6 +164,7 @@ class _GivingPageState extends State<GivingPage> {
         required String buttonText,
         required VoidCallback? onPressed,
       }) {
+    final primary = Theme.of(context).colorScheme.primary;
     return Card(
       elevation: 6,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -174,7 +175,7 @@ class _GivingPageState extends State<GivingPage> {
           children: [
             Row(
               children: [
-                Icon(icon, size: 30, color: Colors.deepPurple),
+                Icon(icon, size: 30, color: primary),
                 const SizedBox(width: 10),
                 Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
               ],

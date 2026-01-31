@@ -59,8 +59,8 @@ class _HomeDashboardPageState extends State<HomeDashboardPage> {
       appBar: AppBar(
         title: const Text('Home'),
         centerTitle: true,
-        backgroundColor: Colors.blueGrey,
-        foregroundColor: const Color(0xFF111827),
+        backgroundColor: Theme.of(context).colorScheme.primary,
+        foregroundColor: Colors.white,
         elevation: 0,
         actions: [
           IconButton(

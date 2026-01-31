@@ -9,7 +9,7 @@ class MinistryService {
     if (!snapshot.exists) return false;
 
     final data = snapshot.data();
-    final List<dynamic> leaderships = data?['ministryLeaderships'] ?? [];
+    final List<dynamic> leaderships = data?['leadershipMinistries'] ?? [];
     return leaderships.contains(ministryId);
   }
 
@@ -62,7 +62,12 @@ class MinistryService {
     final snapshot = await _db.collection('users').doc(userId).get();
     if (!snapshot.exists) return false;
 
-    final role = snapshot.data()?['userRole'] ?? 'member';
-    return role == 'admin';
+    final data = snapshot.data() ?? {};
+    final single = (data['role'] ?? '').toString().toLowerCase().trim();
+    if (single == 'admin') return true;
+    final roles = (data['roles'] is List)
+        ? List<String>.from((data['roles'] as List).map((e) => e.toString().toLowerCase()))
+        : const <String>[];
+    return roles.contains('admin');
   }
 }

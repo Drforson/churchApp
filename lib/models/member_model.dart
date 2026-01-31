@@ -40,12 +40,14 @@ class MemberModel {
       email: data['email'] ?? '',
       phoneNumber: data['phoneNumber'],
       address: data['address'],
-      dob: data['dob'] != null ? (data['dob'] as Timestamp).toDate() : null,
+      dob: data['dateOfBirth'] is Timestamp
+          ? (data['dateOfBirth'] as Timestamp).toDate()
+          : (data['dob'] is Timestamp ? (data['dob'] as Timestamp).toDate() : null),
       isVisitor: data['isVisitor'] ?? false,
       ministries: List<String>.from(data['ministries'] ?? []),
       leadershipMinistries: List<String>.from(data['leadershipMinistries'] ?? []),
       roles: List<String>.from(data['roles'] ?? ['member']), // 🆕
-      userId: data['userId'], // 🆕
+      userId: data['userUid'] ?? data['userId'], // 🆕
       createdAt: data['createdAt'] ?? Timestamp.now(),
     );
   }
@@ -57,12 +59,12 @@ class MemberModel {
       'email': email,
       'phoneNumber': phoneNumber,
       'address': address,
-      'dob': dob != null ? Timestamp.fromDate(dob!) : null,
+      'dateOfBirth': dob != null ? Timestamp.fromDate(dob!) : null,
       'isVisitor': isVisitor,
       'ministries': ministries,
       'leadershipMinistries': leadershipMinistries,
       'roles': roles, // 🆕
-      'userId': userId, // 🆕
+      'userUid': userId, // 🆕
       'createdAt': createdAt,
     };
   }

@@ -87,7 +87,7 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Attendance Check-In'),
-        backgroundColor: Colors.teal.shade600,
+        backgroundColor: Theme.of(context).colorScheme.primary,
         foregroundColor: Colors.white,
         centerTitle: true,
       ),
@@ -150,7 +150,7 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
                         trailing: Switch(
                           value: isPresent,
                           onChanged: (val) => _toggleStatus(id, val),
-                          activeColor: Colors.teal,
+                          activeColor: Theme.of(context).colorScheme.primary,
                         ),
                       ),
                     );

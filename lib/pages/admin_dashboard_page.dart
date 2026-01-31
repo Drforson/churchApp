@@ -136,8 +136,8 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       extendBodyBehindAppBar: true,
       appBar: AppBar(
         title: Text(_isAdmin ? 'Admin Dashboard' : _isLeader ? 'Leader Dashboard' : 'Dashboard'),
-        backgroundColor: Colors.teal.shade600,
-        foregroundColor: const Color(0xFF111827),
+        backgroundColor: Theme.of(context).colorScheme.primary,
+        foregroundColor: Colors.white,
         elevation: 0,
         centerTitle: true,
         scrolledUnderElevation: 0,

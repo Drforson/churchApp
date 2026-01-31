@@ -6,8 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:intl/intl.dart';
 
-/// TODO: move this to a safer place (env/remote config/secret manager).
-const String kGooglePlacesApiKey = 'AIzaSyD5fz8C7ktANql7kBzZDucqj15Mf-D3awE';
+import '../secrets.dart';
 
 class AttendanceSetupPage extends StatefulWidget {
   const AttendanceSetupPage({super.key});
@@ -83,14 +82,13 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       }
       final token = await u.getIdTokenResult(true);
       final c = token.claims ?? {};
-      // Allow admin, pastor, leader, or usher
+      // Allow admin, pastor, or leader
       final allowed = (c['admin'] == true ||
           c['isAdmin'] == true ||
           c['pastor'] == true ||
           c['isPastor'] == true ||
           c['leader'] == true ||
-          c['isLeader'] == true ||
-          c['usher'] == true);
+          c['isLeader'] == true);
       setState(() {
         _authorized = allowed;
         _checkingAuth = false;
@@ -311,6 +309,20 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       );
     }
 
+    if (kGooglePlacesApiKey.isEmpty) {
+      return const Scaffold(
+        body: Center(
+          child: Padding(
+            padding: EdgeInsets.all(16),
+            child: Text(
+              'Google Places API key is missing.\nSet GOOGLE_PLACES_API_KEY via --dart-define.',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
+
     if (!_authorized) {
       return Scaffold(
         appBar: AppBar(title: const Text('Attendance Setup')),
@@ -318,7 +330,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
           child: Padding(
             padding: EdgeInsets.all(16),
             child: Text(
-              'You do not have permission to access this page.\n(Admin/Pastor/Leader/Usher only)',
+              'You do not have permission to access this page.\n(Admin/Pastor/Leader only)',
               textAlign: TextAlign.center,
             ),
           ),

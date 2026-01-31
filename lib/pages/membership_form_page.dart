@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -72,6 +73,14 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
   }
 
   Future<void> _submit() async {
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please sign in to register a member.')),
+      );
+      return;
+    }
+
     if (!_formKey.currentState!.validate() || _dob == null || _gender == null || !_consent) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please fill all required fields and give consent.')),
@@ -91,7 +100,7 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
       'lastName': _lastNameCtrl.text.trim(),
       'phoneNumber': _phoneCtrl.text.trim(),
       'email': _emailCtrl.text.trim(),
-      'homeAddress': _addressCtrl.text.trim(),
+      'address': _addressCtrl.text.trim(),
       'preferredContactMethod': _preferredContactCtrl.text.trim(),
       'ministries': _selectedMinistries,
       'emergencyContactName': _ecNameCtrl.text.trim(),
@@ -101,7 +110,9 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
       'gender': _gender,
       'consentToDataUse': _consent,
       'isVisitor': _isVisitor,
-      'createdAt': Timestamp.now(),
+      'createdByUid': currentUser.uid,
+      'createdAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
     });
 
     ScaffoldMessenger.of(context).showSnackBar(

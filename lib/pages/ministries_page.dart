@@ -326,6 +326,7 @@ class _MinistriesPageState extends State<MinistriesPage>
       'requestedByUid': _uid,
       'status': 'pending',
       'requestedAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
     });
 
     // Track both name and id for robust "pending" UI
@@ -390,6 +391,7 @@ class _MinistriesPageState extends State<MinistriesPage>
           'status': 'cancelled',
           'cancelledAt': FieldValue.serverTimestamp(),
           'cancelledByUid': _uid,
+          'updatedAt': FieldValue.serverTimestamp(),
         });
       } else {
         // Fallback via callable (covers legacy name/docId ambiguity + rules)
