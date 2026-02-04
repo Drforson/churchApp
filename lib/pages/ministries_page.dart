@@ -68,23 +68,50 @@ class _MinistriesPageState extends State<MinistriesPage>
   // Load pending join requests for this member; track by BOTH ministryId and ministryName
   Future<void> _refreshPendingJoinRequests() async {
     _pendingJoinKeys.clear();
-    final mid = _memberId;
-    if (mid == null) {
-      if (mounted) setState(() {});
-      return;
-    }
     try {
-      final q = await _db
-          .collection('join_requests')
-          .where('memberId', isEqualTo: mid)
-          .where('status', isEqualTo: 'pending')
-          .get();
-      for (final d in q.docs) {
-        final data = d.data();
-        final mn = (data['ministryName'] ?? '').toString().trim();
-        final mi = (data['ministryId'] ?? '').toString().trim();
+      final callable = _functions.httpsCallable('memberListPendingJoinRequests');
+      final res = await callable.call();
+      final data = (res.data is Map)
+          ? Map<String, dynamic>.from(res.data as Map)
+          : <String, dynamic>{};
+
+      final fixedMemberId = (data['memberId'] ?? '').toString().trim();
+      if (fixedMemberId.isNotEmpty) {
+        _memberId = fixedMemberId;
+      }
+
+      final items = (data['items'] is List)
+          ? List<Map<String, dynamic>>.from(
+              (data['items'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
+            )
+          : const <Map<String, dynamic>>[];
+
+      for (final item in items) {
+        final mn = (item['ministryName'] ?? '').toString().trim();
+        final mi = (item['ministryId'] ?? '').toString().trim();
+        final md = (item['ministryDocId'] ?? '').toString().trim();
         if (mn.isNotEmpty) _pendingJoinKeys.add(mn);
         if (mi.isNotEmpty) _pendingJoinKeys.add(mi);
+        if (md.isNotEmpty) _pendingJoinKeys.add(md);
+      }
+      if (mounted) setState(() {});
+    } on FirebaseFunctionsException catch (e) {
+      // Fallback for environments where the callable is not deployed yet.
+      if (e.code == 'not-found' && _memberId != null) {
+        final q = await _db
+            .collection('join_requests')
+            .where('memberId', isEqualTo: _memberId)
+            .where('status', isEqualTo: 'pending')
+            .get();
+        for (final d in q.docs) {
+          final data = d.data();
+          final mn = (data['ministryName'] ?? '').toString().trim();
+          final mi = (data['ministryId'] ?? '').toString().trim();
+          final md = (data['ministryDocId'] ?? '').toString().trim();
+          if (mn.isNotEmpty) _pendingJoinKeys.add(mn);
+          if (mi.isNotEmpty) _pendingJoinKeys.add(mi);
+          if (md.isNotEmpty) _pendingJoinKeys.add(md);
+        }
       }
       if (mounted) setState(() {});
     } catch (_) {
@@ -194,6 +221,11 @@ class _MinistriesPageState extends State<MinistriesPage>
 
   // ======== New Ministry Request ========
   Future<void> _openNewMinistryDialog() async {
+    if (_isPastor || _isAdmin) {
+      await _openDirectCreateMinistryDialog();
+      return;
+    }
+
     final nameCtrl = TextEditingController();
     final descCtrl = TextEditingController();
 
@@ -234,6 +266,207 @@ class _MinistriesPageState extends State<MinistriesPage>
       final name = nameCtrl.text.trim();
       final desc = descCtrl.text.trim();
       await _submitNewMinistryRequest(name, desc);
+    }
+  }
+
+  Future<void> _openDirectCreateMinistryDialog() async {
+    final nameCtrl = TextEditingController();
+    final descCtrl = TextEditingController();
+    final searchCtrl = TextEditingController();
+    final selectedLeaderIds = <String>{};
+    final membersFuture = _db.collection('members').get();
+
+    String query = '';
+
+    final ok = await showDialog<bool>(
+      context: context,
+      useSafeArea: true,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setLocalState) {
+          final mq = MediaQuery.of(dialogContext);
+          final contentHeight = (((mq.size.height - mq.viewInsets.bottom) * 0.72) - 2)
+              .clamp(278.0, 618.0)
+              .toDouble();
+
+          return AlertDialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            title: const Text('Create Ministry'),
+            content: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOut,
+              width: 460,
+              height: contentHeight,
+            child: FutureBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              future: membersFuture,
+              builder: (context, snap) {
+                Widget leadersBody;
+                if (snap.connectionState == ConnectionState.waiting) {
+                  leadersBody = const Center(child: CircularProgressIndicator());
+                } else {
+                  final docs = snap.data?.docs ?? const [];
+                  final rows = docs.map((d) {
+                    final data = d.data();
+                    final first = (data['firstName'] ?? '').toString().trim();
+                    final last = (data['lastName'] ?? '').toString().trim();
+                    final fullName = (data['fullName'] ?? '$first $last')
+                        .toString()
+                        .trim();
+                    final fallback =
+                        fullName.isEmpty ? (data['email'] ?? 'Member').toString() : fullName;
+                    return <String, String>{'id': d.id, 'name': fallback};
+                  }).where((m) {
+                    if (query.isEmpty) return true;
+                    return m['name']!.toLowerCase().contains(query);
+                  }).toList()
+                    ..sort((a, b) => a['name']!.compareTo(b['name']!));
+
+                  leadersBody = Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.black12),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: rows.isEmpty
+                        ? const Center(child: Text('No members found.'))
+                        : ListView.builder(
+                            itemCount: rows.length,
+                            itemBuilder: (context, i) {
+                              final row = rows[i];
+                              final id = row['id']!;
+                              final name = row['name']!;
+                              final checked = selectedLeaderIds.contains(id);
+                              return CheckboxListTile(
+                                dense: true,
+                                value: checked,
+                                title: Text(name),
+                                onChanged: (v) {
+                                  setLocalState(() {
+                                    if (v == true) {
+                                      selectedLeaderIds.add(id);
+                                    } else {
+                                      selectedLeaderIds.remove(id);
+                                    }
+                                  });
+                                },
+                              );
+                            },
+                          ),
+                  );
+                }
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextField(
+                      controller: nameCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Ministry Name',
+                        hintText: 'e.g. Worship Team',
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: descCtrl,
+                      decoration:
+                          const InputDecoration(labelText: 'Description (optional)'),
+                      maxLines: 3,
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: searchCtrl,
+                      decoration: const InputDecoration(
+                        prefixIcon: Icon(Icons.search),
+                        labelText: 'Search members for leaders',
+                      ),
+                      onChanged: (v) {
+                        setLocalState(() => query = v.trim().toLowerCase());
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    Flexible(child: leadersBody),
+                    const SizedBox(height: 8),
+                    Text('Selected leaders: ${selectedLeaderIds.length}'),
+                  ],
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                if (nameCtrl.text.trim().isEmpty) {
+                  ScaffoldMessenger.of(this.context).showSnackBar(
+                    const SnackBar(content: Text('Ministry name is required.')),
+                  );
+                  return;
+                }
+                if (selectedLeaderIds.isEmpty) {
+                  ScaffoldMessenger.of(this.context).showSnackBar(
+                    const SnackBar(content: Text('Select at least one leader.')),
+                  );
+                  return;
+                }
+                Navigator.pop(dialogContext, true);
+              },
+              child: const Text('Create'),
+            ),
+          ],
+          );
+        },
+      ),
+    );
+
+    if (ok == true) {
+      await _createMinistryDirectly(
+        nameCtrl.text.trim(),
+        descCtrl.text.trim(),
+        selectedLeaderIds.toList(),
+      );
+    }
+  }
+
+  Future<void> _createMinistryDirectly(
+    String name,
+    String desc,
+    List<String> leaderMemberIds,
+  ) async {
+    if (!(_isPastor || _isAdmin)) return;
+
+    try {
+      final callable = _functions.httpsCallable('adminCreateMinistry');
+      await callable.call({
+        'name': name,
+        'description': desc,
+        'leaderMemberIds': leaderMemberIds,
+      });
+      await _bootstrap();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Created "$name" successfully.')),
+      );
+    } on FirebaseFunctionsException catch (e) {
+      if (!mounted) return;
+      if (e.code == 'not-found') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'adminCreateMinistry is not deployed yet in europe-west2. Deploy Functions and try again.',
+            ),
+          ),
+        );
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Create failed: ${e.message ?? e.code}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Create failed: $e')),
+      );
     }
   }
 
@@ -311,7 +544,7 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   Future<void> _sendJoinRequest({required String id, required String name}) async {
-    if (_uid == null || _memberId == null) {
+    if (_uid == null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Sign in first to join a ministry.')),
@@ -319,24 +552,58 @@ class _MinistriesPageState extends State<MinistriesPage>
       return;
     }
 
-    await _db.collection('join_requests').add({
-      'memberId': _memberId,            // must equal requesterMemberId() for rules
-      'ministryId': id,                 // ✅ can be doc id (new) or name (legacy)
-      'ministryName': name,             // keep name for easy lookups
-      'requestedByUid': _uid,
-      'status': 'pending',
-      'requestedAt': FieldValue.serverTimestamp(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    });
+    try {
+      final callable = _functions.httpsCallable('memberCreateJoinRequest');
+      final res = await callable.call({
+        'ministryId': id,
+        'ministryName': name,
+      });
 
-    // Track both name and id for robust "pending" UI
-    _pendingJoinKeys.add(name);
-    _pendingJoinKeys.add(id);
+      final data = (res.data is Map)
+          ? Map<String, dynamic>.from(res.data as Map)
+          : <String, dynamic>{};
+      final ministryName = (data['ministryName'] ?? name).toString();
+      final ministryId = (data['ministryId'] ?? id).toString();
+      final duplicate = data['duplicate'] == true;
+
+      _pendingJoinKeys.add(ministryName);
+      _pendingJoinKeys.add(ministryId);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            duplicate
+                ? 'You already have a pending request for "$ministryName".'
+                : 'Join request sent for "$ministryName".',
+          ),
+        ),
+      );
+    } on FirebaseFunctionsException catch (e) {
+      if (!mounted) return;
+      if (e.code == 'not-found') {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'memberCreateJoinRequest is not deployed yet in europe-west2.',
+            ),
+          ),
+        );
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Join request failed: ${e.message ?? e.code}')),
+      );
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Join request failed: $e')),
+      );
+      return;
+    }
+
     await _refreshPendingJoinRequests();
-
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('Join request sent for "$name".')));
   }
 
   // ======== Cancel Join Request ========
@@ -363,45 +630,16 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   Future<void> _cancelPendingJoin({required String id, required String name}) async {
-    if (_memberId == null || _uid == null) return;
+    if (_uid == null) return;
 
     try {
-      // Prefer direct Firestore update (fast path)
-      var q = await _db
-          .collection('join_requests')
-          .where('memberId', isEqualTo: _memberId)
-          .where('status', isEqualTo: 'pending')
-          .where('ministryId', isEqualTo: id) // might be doc id (new)
-          .limit(1)
-          .get();
-
-      if (q.docs.isEmpty) {
-        // try by ministryName
-        q = await _db
-            .collection('join_requests')
-            .where('memberId', isEqualTo: _memberId)
-            .where('status', isEqualTo: 'pending')
-            .where('ministryName', isEqualTo: name)
-            .limit(1)
-            .get();
-      }
-
-      if (q.docs.isNotEmpty) {
-        await q.docs.first.reference.update({
-          'status': 'cancelled',
-          'cancelledAt': FieldValue.serverTimestamp(),
-          'cancelledByUid': _uid,
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-      } else {
-        // Fallback via callable (covers legacy name/docId ambiguity + rules)
-        final func = _functions.httpsCallable('memberCancelJoinRequest');
-        await func.call({
-          'memberId': _memberId,
-          'ministryId': id,
-          'ministryName': name,
-        });
-      }
+      // Use callable first to avoid client-side rules failures on join_requests queries.
+      final func = _functions.httpsCallable('memberCancelJoinRequest');
+      await func.call({
+        'memberId': _memberId,
+        'ministryId': id,
+        'ministryName': name,
+      });
 
       // Update local UI state
       _pendingJoinKeys.remove(name);
@@ -411,6 +649,47 @@ class _MinistriesPageState extends State<MinistriesPage>
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Cancelled request for "$name".')),
+        );
+      }
+    } on FirebaseFunctionsException catch (e2) {
+      // Temporary fallback only when callable not deployed in this environment.
+      if (e2.code == 'not-found' && _memberId != null) {
+        try {
+          var q = await _db
+              .collection('join_requests')
+              .where('memberId', isEqualTo: _memberId)
+              .where('status', isEqualTo: 'pending')
+              .where('ministryId', isEqualTo: id)
+              .limit(1)
+              .get();
+
+          if (q.docs.isEmpty) {
+            q = await _db
+                .collection('join_requests')
+                .where('memberId', isEqualTo: _memberId)
+                .where('status', isEqualTo: 'pending')
+                .where('ministryName', isEqualTo: name)
+                .limit(1)
+                .get();
+          }
+
+          if (q.docs.isNotEmpty) {
+            await q.docs.first.reference.delete();
+            _pendingJoinKeys.remove(name);
+            _pendingJoinKeys.remove(id);
+            await _refreshPendingJoinRequests();
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Cancelled request for "$name".')),
+              );
+            }
+            return;
+          }
+        } catch (_) {}
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not cancel: ${e2.message ?? e2.code}')),
         );
       }
     } catch (e2) {
@@ -453,17 +732,11 @@ class _MinistriesPageState extends State<MinistriesPage>
     if (ok != true) return;
 
     try {
-      // Prefer callable (server-side audit & cascade), fallback to direct delete.
-      try {
-        final callable = _functions.httpsCallable('adminDeleteMinistry');
-        await callable.call({
-          'ministryId': ministryId,
-          'ministryName': ministryName,
-        });
-      } on Exception {
-        // Fallback if function not deployed or blocked by region/permissions.
-        await _db.collection('ministries').doc(ministryId).delete();
-      }
+      final callable = _functions.httpsCallable('adminDeleteMinistry');
+      await callable.call({
+        'ministryId': ministryId,
+        'ministryName': ministryName,
+      });
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -577,11 +850,11 @@ class _MinistriesPageState extends State<MinistriesPage>
     final canAccess = _canAccessByName(name);
     final signedIn = _uid != null;
     final canDelete = _isPastor || _isAdmin;
+    final pending = _isPendingFor(id: id, name: name);
 
     // Decide trailing widget:
     Widget? trailing;
     if (!canAccess && signedIn && !_isAdmin && !_isPastor) {
-      final pending = _isPendingFor(id: id, name: name);
       trailing = pending
           ? TextButton.icon(
         icon: const Icon(Icons.cancel),
@@ -619,7 +892,20 @@ class _MinistriesPageState extends State<MinistriesPage>
     return Card(
       child: ListTile(
         leading: Icon(canAccess ? Icons.groups : Icons.lock_outline),
-        title: Text(name),
+        title: Row(
+          children: [
+            Expanded(child: Text(name)),
+            if (pending)
+              const Text(
+                'Pending',
+                style: TextStyle(
+                  color: Colors.orange,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 12,
+                ),
+              ),
+          ],
+        ),
         trailing: trailing,
         onTap: () {
           if (canAccess) {
@@ -689,7 +975,9 @@ class _MinistriesPageState extends State<MinistriesPage>
             ),
             if (_isLeader)
               IconButton(
-                tooltip: 'Request New Ministry',
+                tooltip: (_isPastor || _isAdmin)
+                    ? 'Create Ministry'
+                    : 'Request New Ministry',
                 icon: const Icon(Icons.add_box),
                 onPressed: _openNewMinistryDialog,
               ),
@@ -698,7 +986,9 @@ class _MinistriesPageState extends State<MinistriesPage>
         floatingActionButton: _isLeader
             ? FloatingActionButton(
           onPressed: _openNewMinistryDialog,
-          tooltip: 'Request New Ministry',
+          tooltip: (_isPastor || _isAdmin)
+              ? 'Create Ministry'
+              : 'Request New Ministry',
           child: const Icon(Icons.add),
         )
             : null,

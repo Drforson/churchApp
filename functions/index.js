@@ -1371,6 +1371,317 @@ exports.leaderModerateJoinRequest = onCall(async (req) => {
 });
 
 /**
+ * adminCreateMinistry
+ * - pastor/admin creates a ministry directly
+ * - assigns one or more selected members as leaders
+ * - ensures selected leaders are members of the new ministry
+ */
+exports.adminCreateMinistry = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const allowed = await isUserPastorOrAdmin(uid);
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const { name, description, leaderMemberIds } = req.data || {};
+  const ministryName = S(name);
+  const ministryDescription = S(description);
+  const leaderIds = uniq(asArray(leaderMemberIds).map(S).filter(Boolean));
+
+  if (!ministryName) {
+    throw Object.assign(new Error('invalid-argument: name'), { code: 'invalid-argument' });
+  }
+  if (!leaderIds.length) {
+    throw Object.assign(new Error('invalid-argument: leaderMemberIds'), { code: 'invalid-argument' });
+  }
+
+  const nameCollision = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+  if (!nameCollision.empty) {
+    throw Object.assign(new Error('already-exists'), { code: 'already-exists' });
+  }
+
+  const leaderMemberSnaps = await Promise.all(leaderIds.map((id) => db.doc(`members/${id}`).get()));
+  const missingMemberIds = leaderMemberSnaps.filter((s) => !s.exists).map((s) => s.id);
+  if (missingMemberIds.length) {
+    throw Object.assign(new Error(`member-not-found: ${missingMemberIds.join(',')}`), { code: 'not-found' });
+  }
+
+  const linkedUidByMemberId = new Map();
+  await Promise.all(
+    leaderIds.map(async (memberId) => {
+      const linked = await findUserByMemberId(memberId);
+      if (linked?.id) linkedUidByMemberId.set(memberId, linked.id);
+    })
+  );
+  const leaderUids = uniq(Array.from(linkedUidByMemberId.values()).filter(Boolean));
+
+  const minRef = db.collection('ministries').doc();
+  await db.runTransaction(async (tx) => {
+    const memberStates = [];
+
+    for (const memberId of leaderIds) {
+      const mRef = db.doc(`members/${memberId}`);
+      const mSnap = await tx.get(mRef);
+      if (!mSnap.exists) continue;
+
+      const m = mSnap.data() || {};
+      const ministries = new Set(Array.isArray(m.ministries) ? m.ministries : []);
+      const leadershipMinistries = new Set(Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : []);
+      ministries.add(ministryName);
+      leadershipMinistries.add(ministryName);
+
+      const linkedUid = linkedUidByMemberId.get(memberId);
+      let userState = null;
+      if (linkedUid) {
+        const uRef = db.doc(`users/${linkedUid}`);
+        const uSnap = await tx.get(uRef);
+        const u = uSnap.exists ? uSnap.data() || {} : {};
+        const uLeadership = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+        uLeadership.add(ministryName);
+
+        const roleSeed = uniq([toLc(u.role), ...(Array.isArray(u.roles) ? u.roles : [])].filter(Boolean));
+        const mergedUserRoles = mergeRoles(roleSeed, ['leader'], []);
+
+        userState = {
+          linkedUid,
+          uRef,
+          uLeadership: Array.from(uLeadership),
+          mergedUserRoles,
+        };
+      }
+
+      memberStates.push({
+        mRef,
+        ministries: Array.from(ministries),
+        leadershipMinistries: Array.from(leadershipMinistries),
+        mergedMemberRoles: mergeRoles(Array.isArray(m.roles) ? m.roles : [], ['leader'], []),
+        userState,
+      });
+    }
+
+    tx.set(minRef, {
+      id: minRef.id,
+      name: ministryName,
+      description: ministryDescription,
+      approved: true,
+      createdAt: ts(),
+      updatedAt: ts(),
+      createdBy: uid,
+      leaderIds,
+      leaderUids,
+    });
+
+    for (const state of memberStates) {
+      tx.update(state.mRef, {
+        ministries: state.ministries,
+        leadershipMinistries: state.leadershipMinistries,
+        roles: normalizeRoles(state.mergedMemberRoles),
+        updatedAt: ts(),
+      });
+
+      if (state.userState) {
+        txSyncUserRoles(tx, state.userState.linkedUid, state.userState.mergedUserRoles);
+        tx.set(
+          state.userState.uRef,
+          {
+            leadershipMinistries: state.userState.uLeadership,
+            updatedAt: ts(),
+          },
+          { merge: true }
+        );
+      }
+    }
+  });
+
+  await Promise.all(leaderUids.map((u) => syncClaimsForUid(u)));
+
+  return {
+    ok: true,
+    ministryId: minRef.id,
+    ministryName,
+    leaderCount: leaderIds.length,
+  };
+});
+
+/**
+ * adminDeleteMinistry
+ * - pastor/admin removes a ministry entirely
+ * - removes ministry membership + leadership from all affected members
+ * - removes leadership ministry + stale leader role from linked users
+ * - deletes join requests and ministry feed/subcollections
+ */
+exports.adminDeleteMinistry = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const allowed = await isUserPastorOrAdmin(uid);
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const { ministryId, ministryName: ministryNameArg } = req.data || {};
+  const resolved = await resolveMinistryByNameOrId(S(ministryId) || S(ministryNameArg));
+
+  let ministryName = resolved.ministryName || S(ministryNameArg);
+  let ministryDocId = resolved.ministryDocId || null;
+
+  if (!ministryDocId && ministryName) {
+    const byName = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+    if (!byName.empty) ministryDocId = byName.docs[0].id;
+  }
+  if (!ministryName && ministryDocId) {
+    const minDoc = await db.doc(`ministries/${ministryDocId}`).get();
+    if (minDoc.exists) {
+      const d = minDoc.data() || {};
+      ministryName = S(d.name);
+    }
+  }
+
+  if (!ministryName && !ministryDocId) {
+    throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
+  }
+
+  const memberDocsById = new Map();
+  if (ministryName) {
+    const [byMembership, byLeadership] = await Promise.all([
+      db.collection('members').where('ministries', 'array-contains', ministryName).get(),
+      db.collection('members').where('leadershipMinistries', 'array-contains', ministryName).get(),
+    ]);
+    byMembership.docs.forEach((d) => memberDocsById.set(d.id, d));
+    byLeadership.docs.forEach((d) => memberDocsById.set(d.id, d));
+  }
+
+  const affectedMemberIds = Array.from(memberDocsById.keys());
+  const linkedUidByMemberId = affectedMemberIds.length
+    ? await mapMemberIdsToUids(affectedMemberIds)
+    : new Map();
+
+  const userDocsById = new Map();
+  if (ministryName) {
+    const usersByLeadMinistry = await db
+      .collection('users')
+      .where('leadershipMinistries', 'array-contains', ministryName)
+      .get();
+    usersByLeadMinistry.docs.forEach((d) => userDocsById.set(d.id, d));
+  }
+
+  for (const uidValue of linkedUidByMemberId.values()) {
+    if (!uidValue || userDocsById.has(uidValue)) continue;
+    const uSnap = await db.doc(`users/${uidValue}`).get();
+    if (uSnap.exists) userDocsById.set(uidValue, uSnap);
+  }
+
+  let batch = db.batch();
+  let ops = 0;
+  const commitBatch = async () => {
+    if (ops === 0) return;
+    await batch.commit();
+    batch = db.batch();
+    ops = 0;
+  };
+
+  for (const mSnap of memberDocsById.values()) {
+    const m = mSnap.data() || {};
+    const ministries = new Set(Array.isArray(m.ministries) ? m.ministries : []);
+    const leadershipMinistries = new Set(Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : []);
+
+    if (ministryName) {
+      ministries.delete(ministryName);
+      leadershipMinistries.delete(ministryName);
+    }
+
+    let roles = Array.isArray(m.roles) ? m.roles : [];
+    if (leadershipMinistries.size === 0) roles = mergeRoles(roles, [], ['leader']);
+
+    batch.update(mSnap.ref, {
+      ministries: Array.from(ministries),
+      leadershipMinistries: Array.from(leadershipMinistries),
+      roles: normalizeRoles(roles),
+      updatedAt: ts(),
+    });
+    ops++;
+    if (ops >= 400) await commitBatch();
+  }
+
+  for (const uSnap of userDocsById.values()) {
+    const u = uSnap.data() || {};
+    const uLeadership = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+
+    if (ministryName) uLeadership.delete(ministryName);
+
+    let uRoles = uniq([toLc(u.role), ...(Array.isArray(u.roles) ? u.roles : [])].filter(Boolean));
+    if (uLeadership.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
+
+    batch.set(
+      uSnap.ref,
+      {
+        leadershipMinistries: Array.from(uLeadership),
+        roles: normalizeRoles(uRoles),
+        role: highestRole(uRoles),
+        updatedAt: ts(),
+      },
+      { merge: true }
+    );
+    ops++;
+    if (ops >= 400) await commitBatch();
+  }
+
+  await commitBatch();
+
+  const joinRequestDocsById = new Map();
+  const queryTasks = [];
+  if (ministryName) {
+    queryTasks.push(
+      db.collection('join_requests').where('ministryName', '==', ministryName).get(),
+      db.collection('join_requests').where('ministryId', '==', ministryName).get()
+    );
+  }
+  if (ministryDocId) {
+    queryTasks.push(
+      db.collection('join_requests').where('ministryId', '==', ministryDocId).get(),
+      db.collection('join_requests').where('ministryDocId', '==', ministryDocId).get()
+    );
+  }
+  const queryResults = queryTasks.length ? await Promise.all(queryTasks) : [];
+  queryResults.forEach((qs) => qs.docs.forEach((d) => joinRequestDocsById.set(d.id, d.ref)));
+
+  if (joinRequestDocsById.size > 0) {
+    batch = db.batch();
+    ops = 0;
+    for (const ref of joinRequestDocsById.values()) {
+      batch.delete(ref);
+      ops++;
+      if (ops >= 400) {
+        await batch.commit();
+        batch = db.batch();
+        ops = 0;
+      }
+    }
+    if (ops > 0) await batch.commit();
+  }
+
+  if (ministryDocId) {
+    await db.recursiveDelete(db.doc(`ministries/${ministryDocId}`));
+  } else if (ministryName) {
+    const ministryDocs = await db.collection('ministries').where('name', '==', ministryName).get();
+    for (const d of ministryDocs.docs) {
+      await db.recursiveDelete(d.ref);
+      if (!ministryDocId) ministryDocId = d.id;
+    }
+  }
+
+  const affectedUids = uniq(Array.from(userDocsById.keys()));
+  await Promise.all(affectedUids.map((affectedUid) => syncClaimsForUid(affectedUid)));
+
+  return {
+    ok: true,
+    ministryId: ministryDocId,
+    ministryName: ministryName || null,
+    updatedMembers: affectedMemberIds.length,
+    updatedUsers: affectedUids.length,
+    deletedJoinRequests: joinRequestDocsById.size,
+  };
+});
+
+/**
  * setMinistryLeadership
  * - promote/demote leader for a ministry
  * - pastor/admin OR leaders of that ministry
@@ -1532,8 +1843,184 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
 });
 
 /**
+ * memberCreateJoinRequest
+ * - creates a pending join request via backend (bypasses fragile client rule paths)
+ * - self-heals missing users.memberId when possible
+ */
+exports.memberCreateJoinRequest = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const cache = makeCtxCache();
+  const payload = req.data || {};
+  const rawMinistryInput = S(payload.ministryId) || S(payload.ministryName);
+  if (!rawMinistryInput) {
+    throw Object.assign(new Error('invalid-argument: ministryId/ministryName'), { code: 'invalid-argument' });
+  }
+
+  let user = await getUser(uid, cache);
+  let memberId = user?.memberId || null;
+
+  // Repair missing users.memberId from members.userUid or unique email match.
+  if (!memberId) {
+    const byUid = await db.collection('members').where('userUid', '==', uid).limit(1).get();
+    if (!byUid.empty) {
+      memberId = byUid.docs[0].id;
+      await db.doc(`users/${uid}`).set({ memberId, updatedAt: ts() }, { merge: true });
+    } else {
+      const emailLc = S(user?.email || req.auth?.token?.email).toLowerCase();
+      if (emailLc) {
+        const byEmail = await db.collection('members').where('email', '==', emailLc).limit(2).get();
+        if (byEmail.size === 1) {
+          memberId = byEmail.docs[0].id;
+          await db.doc(`users/${uid}`).set({ memberId, updatedAt: ts() }, { merge: true });
+          await byEmail.docs[0].ref.set({ userUid: uid, updatedAt: ts() }, { merge: true });
+        }
+      }
+    }
+  }
+
+  if (!memberId) {
+    throw Object.assign(new Error('member-not-linked'), { code: 'failed-precondition' });
+  }
+
+  user = await getUser(uid, cache);
+  const resolved = await resolveMinistryByNameOrId(rawMinistryInput);
+  const ministryName = resolved.ministryName || S(payload.ministryName);
+  const ministryDocId = resolved.ministryDocId || null;
+
+  if (!ministryName) {
+    throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
+  }
+
+  // Avoid duplicate pending requests for same member+ministry.
+  const dupChecks = [];
+  dupChecks.push(
+    db.collection('join_requests')
+      .where('memberId', '==', memberId)
+      .where('status', '==', 'pending')
+      .where('ministryName', '==', ministryName)
+      .limit(1)
+      .get()
+  );
+  if (ministryDocId) {
+    dupChecks.push(
+      db.collection('join_requests')
+        .where('memberId', '==', memberId)
+        .where('status', '==', 'pending')
+        .where('ministryId', '==', ministryDocId)
+        .limit(1)
+        .get(),
+      db.collection('join_requests')
+        .where('memberId', '==', memberId)
+        .where('status', '==', 'pending')
+        .where('ministryDocId', '==', ministryDocId)
+        .limit(1)
+        .get()
+    );
+  }
+
+  const dupResults = await Promise.all(dupChecks);
+  const existing = dupResults.find((q) => !q.empty);
+  if (existing) {
+    return {
+      ok: true,
+      duplicate: true,
+      requestId: existing.docs[0].id,
+      memberId,
+      ministryName,
+      ministryId: ministryDocId || ministryName,
+      ministryDocId,
+    };
+  }
+
+  const ref = await db.collection('join_requests').add({
+    memberId,
+    ministryId: ministryDocId || ministryName,
+    ministryDocId: ministryDocId || null,
+    ministryName,
+    requestedByUid: uid,
+    status: 'pending',
+    requestedAt: ts(),
+    updatedAt: ts(),
+  });
+
+  return {
+    ok: true,
+    duplicate: false,
+    requestId: ref.id,
+    memberId,
+    ministryName,
+    ministryId: ministryDocId || ministryName,
+    ministryDocId,
+  };
+});
+
+/**
+ * memberListPendingJoinRequests
+ * - returns pending join requests for the signed-in member
+ * - self-heals missing users.memberId when possible
+ */
+exports.memberListPendingJoinRequests = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const cache = makeCtxCache();
+  let user = await getUser(uid, cache);
+  let memberId = user?.memberId || null;
+
+  if (!memberId) {
+    const byUid = await db.collection('members').where('userUid', '==', uid).limit(1).get();
+    if (!byUid.empty) {
+      memberId = byUid.docs[0].id;
+      await db.doc(`users/${uid}`).set({ memberId, updatedAt: ts() }, { merge: true });
+    } else {
+      const emailLc = S(user?.email || req.auth?.token?.email).toLowerCase();
+      if (emailLc) {
+        const byEmail = await db.collection('members').where('email', '==', emailLc).limit(2).get();
+        if (byEmail.size === 1) {
+          memberId = byEmail.docs[0].id;
+          await db.doc(`users/${uid}`).set({ memberId, updatedAt: ts() }, { merge: true });
+          await byEmail.docs[0].ref.set({ userUid: uid, updatedAt: ts() }, { merge: true });
+        }
+      }
+    }
+  }
+
+  if (!memberId) {
+    return { ok: true, memberId: null, items: [] };
+  }
+
+  user = await getUser(uid, cache);
+  const q = await db
+    .collection('join_requests')
+    .where('memberId', '==', memberId)
+    .where('status', '==', 'pending')
+    .limit(200)
+    .get();
+
+  const items = q.docs.map((d) => {
+    const jr = d.data() || {};
+    return {
+      requestId: d.id,
+      memberId,
+      ministryName: S(jr.ministryName),
+      ministryId: S(jr.ministryId),
+      ministryDocId: S(jr.ministryDocId),
+      status: S(jr.status || 'pending'),
+    };
+  });
+
+  return {
+    ok: true,
+    memberId: user?.memberId || memberId,
+    items,
+  };
+});
+
+/**
  * memberCancelJoinRequest
- * - member cancels own pending join request (status flip)
+ * - member cancels own pending join request (hard delete)
  */
 exports.memberCancelJoinRequest = onCall(async (req) => {
   const uid = req.auth?.uid;
@@ -1590,36 +2077,8 @@ exports.memberCancelJoinRequest = onCall(async (req) => {
   if (q.empty) throw Object.assign(new Error('no-pending-request-found'), { code: 'not-found' });
 
   const ref = q.docs[0].ref;
-  await ref.update({ status: 'cancelled', cancelledAt: ts(), cancelledByUid: uid, updatedAt: ts() });
-
-  // best-effort notify leaders
-  try {
-    const jrSnap = await ref.get();
-    const jr = jrSnap.data() || {};
-    const { ministryName, ministryDocId } = await resolveMinistryFromJoin(jr);
-
-    await writeLeaderBroadcast({
-      ministryName,
-      ministryDocId,
-      joinRequestId: ref.id,
-      requestedByUid: S(jr.requestedByUid) || uid,
-      requesterMemberId: memberId,
-      type: 'join_request_cancelled',
-    });
-
-    await writeDirectToLeaders({
-      ministryName,
-      ministryDocId,
-      joinRequestId: ref.id,
-      requestedByUid: S(jr.requestedByUid) || uid,
-      requesterMemberId: memberId,
-      type: 'join_request_cancelled',
-    });
-  } catch (e) {
-    logger.warn('memberCancelJoinRequest notify failed', { error: e });
-  }
-
-  return { ok: true };
+  await ref.delete();
+  return { ok: true, deleted: true, requestId: ref.id };
 });
 
 /* =========================================================
