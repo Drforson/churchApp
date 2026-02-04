@@ -352,6 +352,19 @@ async function mapMemberIdsToUids(memberIds) {
   return out;
 }
 
+async function getMemberDisplayName(memberId) {
+  if (!memberId) return null;
+  try {
+    const snap = await db.doc(`members/${memberId}`).get();
+    if (!snap.exists) return null;
+    const data = snap.data() || {};
+    const full = S(data.fullName) || `${S(data.firstName)} ${S(data.lastName)}`.trim();
+    return full || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
   await writeNotification({
     type, // join_request | join_request_cancelled
@@ -365,6 +378,8 @@ async function writeLeaderBroadcast({ ministryName, ministryDocId, joinRequestId
 }
 
 async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId, requestedByUid, requesterMemberId, type }) {
+  const requesterName = await getMemberDisplayName(requesterMemberId);
+
   // (A) leaders from member.leadershipMinistries
   const leadersSnap = await db
     .collection('members')
@@ -406,6 +421,28 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
     });
   }
   await batch.commit();
+
+  // Canonical in-app inbox events used by Flutter NotificationCenter.
+  await Promise.all(
+    recipients.map((recipientUid) =>
+      writeInbox(recipientUid, {
+        type,
+        title: type === 'join_request_cancelled' ? 'Join request cancelled' : 'New join request',
+        body: requesterName
+          ? `${requesterName} ${type === 'join_request_cancelled' ? 'cancelled their request for' : 'requested to join'} ${ministryName}`
+          : `${type === 'join_request_cancelled' ? 'A member cancelled their request for' : 'A member requested to join'} ${ministryName}`,
+        ministryId: ministryName,
+        ministryName,
+        ministryDocId: ministryDocId || null,
+        joinRequestId,
+        memberId: requesterMemberId || null,
+        requesterName: requesterName || null,
+        requestedByUid: requestedByUid || null,
+        route: '/view-ministry',
+        dedupeKey: `jr_${type}_${joinRequestId}_${recipientUid}`,
+      })
+    )
+  );
 }
 
 async function notifyRequesterResult({ ministryName, ministryDocId, joinRequestId, requesterMemberId, result, moderatorUid }) {
@@ -424,6 +461,26 @@ async function notifyRequesterResult({ ministryName, ministryDocId, joinRequestI
     memberId: requesterMemberId || null,
     recipientUid: recipientUid || null,
     moderatorUid: moderatorUid || null,
+  });
+
+  if (!recipientUid) return;
+
+  await writeInbox(recipientUid, {
+    type: 'join_request_result',
+    title: result === 'approved' ? 'Your join request was approved' : 'Your join request was declined',
+    body:
+      result === 'approved'
+        ? `You can now access ${ministryName}.`
+        : `Your request to join ${ministryName} was declined.`,
+    ministryId: ministryName,
+    ministryName,
+    ministryDocId: ministryDocId || null,
+    joinRequestId,
+    memberId: requesterMemberId || null,
+    moderatorUid: moderatorUid || null,
+    result,
+    route: '/view-ministry',
+    dedupeKey: `jr_result_${joinRequestId}_${result}_${recipientUid}`,
   });
 }
 
@@ -1351,20 +1408,6 @@ exports.leaderModerateJoinRequest = onCall(async (req) => {
     });
   } else {
     await jrRef.update({ status: 'rejected', moderatorUid: uid, updatedAt: ts() });
-  }
-
-  // notify requester
-  try {
-    await notifyRequesterResult({
-      ministryName,
-      ministryDocId,
-      joinRequestId: requestId,
-      requesterMemberId: memberId,
-      result: act === 'approve' ? 'approved' : 'rejected',
-      moderatorUid: uid,
-    });
-  } catch (e) {
-    logger.warn('notifyRequesterResult failed', { requestId, error: e });
   }
 
   return { ok: true };

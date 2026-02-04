@@ -1,9 +1,7 @@
 // lib/pages/notification_center_page.dart
 import 'dart:async';
 
-import 'package:church_management_app/pages/pastor_ministry_approvals_page.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -19,10 +17,6 @@ class NotificationCenterPage extends StatefulWidget {
 
 class _NotificationCenterPageState extends State<NotificationCenterPage> {
   final _db = FirebaseFirestore.instance;
-  final _auth = FirebaseAuth.instance;
-
-  String? _uid;
-  bool _isPastor = false;
 
   // Cache to avoid repeated lookups for the same moderator uid
   final Map<String, String> _nameCache = {};
@@ -30,39 +24,6 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
   @override
   void initState() {
     super.initState();
-    _bootstrapRoles();
-  }
-
-  Future<void> _bootstrapRoles() async {
-    final user = _auth.currentUser;
-    if (user == null) return;
-    _uid = user.uid;
-
-    try {
-      final uSnap = await _db.collection('users').doc(user.uid).get();
-      final u = uSnap.data() ?? {};
-      bool isPastor = (u['isPastor'] == true);
-      final uRoles = (u['roles'] is List)
-          ? List<String>.from((u['roles'] as List).map((e) => e.toString().toLowerCase()))
-          : const <String>[];
-      if (uRoles.contains('pastor')) isPastor = true;
-
-      final memberId = (u['memberId'] ?? '').toString();
-      if (!isPastor && memberId.isNotEmpty) {
-        final mSnap = await _db.collection('members').doc(memberId).get();
-        final m = mSnap.data() ?? {};
-        if (m['isPastor'] == true) isPastor = true;
-        final mRoles = (m['roles'] is List)
-            ? List<String>.from((m['roles'] as List).map((e) => e.toString().toLowerCase()))
-            : const <String>[];
-        if (mRoles.contains('pastor')) isPastor = true;
-      }
-
-      if (!mounted) return;
-      setState(() => _isPastor = isPastor);
-    } catch (_) {
-      // ignore: leave pastor=false if we can't resolve
-    }
   }
 
   // ------------------- Name resolution for moderator -------------------
@@ -110,7 +71,10 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
     final type = (ev.type ?? '').toLowerCase();
     switch (type) {
       case 'join_request':
-        return 'New join request';
+        {
+          final requester = (ev.raw['requesterName'] ?? '').toString().trim();
+          return requester.isNotEmpty ? '$requester wants to join' : 'New join request';
+        }
       case 'join_request.approved':
       case 'join_request_result':
         {
@@ -150,6 +114,7 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
 
     final type = (ev.type ?? '').toLowerCase();
     final isDecision = type == 'join_request_result' || type == 'join_request.approved';
+    final requester = (ev.raw['requesterName'] ?? '').toString().trim();
 
     // prefer moderatorName directly in payload if present
     final payloadModeratorName = (ev.raw['moderatorName'] ?? '').toString().trim();
@@ -159,6 +124,13 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
     final base = name.isEmpty ? when : '$name • $when';
 
     if (!isDecision) {
+      if (type == 'join_request' && requester.isNotEmpty) {
+        return Text(
+          '$base\n$requester requested to join',
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+        );
+      }
       return Text(
         base,
         maxLines: 2,
@@ -238,9 +210,23 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
 
   Future<void> _openFrom(InboxEvent ev) async {
     final type = (ev.type ?? '').toLowerCase();
-    final ministryDocId = (ev.raw['ministryDocId'] ?? '').toString();
+    final ministryDocId = (ev.raw['ministryDocId'] ?? '').toString().trim();
     final ministryName =
-    (ev.raw['ministryName'] ?? ev.raw['ministryId'] ?? '').toString();
+    (ev.raw['ministryName'] ?? ev.raw['ministryId'] ?? '').toString().trim();
+
+    var resolvedMinistryDocId = ministryDocId;
+    if (resolvedMinistryDocId.isEmpty && ministryName.isNotEmpty) {
+      try {
+        final q = await _db
+            .collection('ministries')
+            .where('name', isEqualTo: ministryName)
+            .limit(1)
+            .get();
+        if (q.docs.isNotEmpty) {
+          resolvedMinistryDocId = q.docs.first.id;
+        }
+      } catch (_) {}
+    }
 
     if (type == 'ministry_request_result') {
       final result = (ev.raw['result'] ?? '').toString().toLowerCase();
@@ -270,28 +256,18 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
 
     bool opened = false;
 
-    if (type == 'join_request' && _isPastor) {
-      opened = true;
-      if (mounted) {
-        await Navigator.push(
-          context,
-          MaterialPageRoute(builder: (_) => const PastorMinistryApprovalsPage()),
-        );
-      }
-    }
-
     if (!opened &&
         (type.startsWith('join_request') ||
             type == 'join_request_result' ||
             type == 'ministry_request_result')) {
-      if (ministryName.isNotEmpty || ministryDocId.isNotEmpty) {
+      if (ministryName.isNotEmpty || resolvedMinistryDocId.isNotEmpty) {
         opened = true;
         if (mounted) {
           await Navigator.push(
             context,
             MaterialPageRoute(
               builder: (_) => MinistryDetailsPage(
-                ministryId: ministryDocId.isNotEmpty ? ministryDocId : 'unknown',
+                ministryId: resolvedMinistryDocId.isNotEmpty ? resolvedMinistryDocId : 'unknown',
                 ministryName:
                 ministryName.isNotEmpty ? ministryName : '(Unknown Ministry)',
               ),
