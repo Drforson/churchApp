@@ -1,0 +1,625 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ---------------------------
+     * Core helpers
+     * --------------------------*/
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function hasClaim(name) {
+      return signedIn() && (request.auth.token[name] == true);
+    }
+
+    function userSnap(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function userData(uid) {
+      let u = userSnap(uid);
+      return u.exists ? u.data : {};
+    }
+
+    function requesterMemberId() {
+      let u = userData(request.auth.uid);
+      return ('memberId' in u && u.memberId is string) ? u.memberId : null;
+    }
+
+    function userRoles(uid) {
+      let u = userData(uid);
+      return ('roles' in u && u.roles is list) ? u.roles : [];
+    }
+
+    function userSingleRole(uid) {
+      let u = userData(uid);
+      return ('role' in u && u.role is string) ? u.role : null;
+    }
+
+    function userLeadershipMinistries(uid) {
+      let u = userData(uid);
+      return ('leadershipMinistries' in u && u.leadershipMinistries is list)
+        ? u.leadershipMinistries
+        : [];
+    }
+
+    function memberSnapById(memberId) {
+      return get(/databases/$(database)/documents/members/$(memberId));
+    }
+
+    function requesterMemberSnap() {
+      let mid = requesterMemberId();
+      return (mid != null) ? memberSnapById(mid) : null;
+    }
+
+    function memberMinistriesForUid(uid) {
+      let u = userData(uid);
+      return (
+        ('memberId' in u) &&
+        (u.memberId is string) &&
+        memberSnapById(u.memberId).exists &&
+        'ministries' in memberSnapById(u.memberId).data &&
+        memberSnapById(u.memberId).data.ministries is list
+      )
+        ? memberSnapById(u.memberId).data.ministries
+        : [];
+    }
+
+    function ministriesForMemberId(memberId) {
+      let m = memberSnapById(memberId);
+      return (m.exists && 'ministries' in m.data && m.data.ministries is list)
+        ? m.data.ministries
+        : [];
+    }
+
+    // NOTE: list intersection in rules has no loops; keep bounded.
+    function listsIntersect(a, b) {
+      return (a.size() > 0 && b.size() > 0) && (
+        (a[0] in b) ||
+        (a.size() > 1  && (a[1]  in b)) ||
+        (a.size() > 2  && (a[2]  in b)) ||
+        (a.size() > 3  && (a[3]  in b)) ||
+        (a.size() > 4  && (a[4]  in b)) ||
+        (a.size() > 5  && (a[5]  in b)) ||
+        (a.size() > 6  && (a[6]  in b)) ||
+        (a.size() > 7  && (a[7]  in b)) ||
+        (a.size() > 8  && (a[8]  in b)) ||
+        (a.size() > 9  && (a[9]  in b)) ||
+        (a.size() > 10 && (a[10] in b)) ||
+        (a.size() > 11 && (a[11] in b)) ||
+        (a.size() > 12 && (a[12] in b)) ||
+        (a.size() > 13 && (a[13] in b)) ||
+        (a.size() > 14 && (a[14] in b)) ||
+        (a.size() > 15 && (a[15] in b))
+      );
+    }
+
+    function sharesMinistryWithTarget(targetMemberId) {
+      let mine = memberMinistriesForUid(request.auth.uid);
+      let theirs = ministriesForMemberId(targetMemberId);
+      return listsIntersect(mine, theirs);
+    }
+
+    function ministryNameForDoc(ministryDocId) {
+      let m = get(/databases/$(database)/documents/ministries/$(ministryDocId));
+      return (m.exists && 'name' in m.data && m.data.name is string)
+        ? m.data.name
+        : "";
+    }
+
+    function userLeadsMinistryByName(ministryName) {
+      let mins = userLeadershipMinistries(request.auth.uid);
+      return (ministryName is string) && mins.size() > 0 && (ministryName in mins);
+    }
+
+    function userLeadsMinistryByDoc(ministryDocId) {
+      return userLeadsMinistryByName(ministryNameForDoc(ministryDocId));
+    }
+
+    function listHas(list, value) {
+      return value in list;
+    }
+
+    function userHasAdminRole() {
+      let single = userSingleRole(request.auth.uid);
+      let roles = userRoles(request.auth.uid);
+      let u = userData(request.auth.uid);
+      return (single == 'admin' || single == 'Admin' || single == 'ADMIN')
+          || listHas(roles, 'admin')
+          || listHas(roles, 'Admin')
+          || listHas(roles, 'ADMIN')
+          || ('admin' in u && u.admin == true)
+          || ('isAdmin' in u && u.isAdmin == true);
+    }
+
+    function userHasPastorRole() {
+      let single = userSingleRole(request.auth.uid);
+      let roles = userRoles(request.auth.uid);
+      let u = userData(request.auth.uid);
+      return (single == 'pastor' || single == 'Pastor' || single == 'PASTOR')
+          || listHas(roles, 'pastor')
+          || listHas(roles, 'Pastor')
+          || listHas(roles, 'PASTOR')
+          || ('pastor' in u && u.pastor == true)
+          || ('isPastor' in u && u.isPastor == true);
+    }
+
+    function userHasLeaderRole() {
+      let single = userSingleRole(request.auth.uid);
+      let roles = userRoles(request.auth.uid);
+      let u = userData(request.auth.uid);
+      return (single == 'leader' || single == 'Leader' || single == 'LEADER')
+          || listHas(roles, 'leader')
+          || listHas(roles, 'Leader')
+          || listHas(roles, 'LEADER')
+          || ('leader' in u && u.leader == true)
+          || ('isLeader' in u && u.isLeader == true);
+    }
+
+    function memberHasRoleFromRequester(memberRole) {
+      let m = requesterMemberSnap();
+      return (
+        m != null &&
+        m.exists &&
+        'roles' in m.data &&
+        m.data.roles is list &&
+        (memberRole in m.data.roles)
+      );
+    }
+
+    function isAdmin() {
+      return signedIn() && (
+        userHasAdminRole()
+        || hasClaim('admin')
+        || hasClaim('isAdmin')
+        || memberHasRoleFromRequester('admin')
+        || memberHasRoleFromRequester('Admin')
+        || memberHasRoleFromRequester('ADMIN')
+      );
+    }
+
+    function isPastor() {
+      return signedIn() && (
+        userHasPastorRole()
+        || hasClaim('pastor')
+        || hasClaim('isPastor')
+        || memberHasRoleFromRequester('pastor')
+        || memberHasRoleFromRequester('Pastor')
+        || memberHasRoleFromRequester('PASTOR')
+      );
+    }
+
+    function isLeader() {
+      let mins = userLeadershipMinistries(request.auth.uid);
+      return signedIn() && (
+        userHasLeaderRole()
+        || hasClaim('leader')
+        || hasClaim('isLeader')
+        || (mins is list && mins.size() > 0)
+        || memberHasRoleFromRequester('leader')
+        || memberHasRoleFromRequester('Leader')
+        || memberHasRoleFromRequester('LEADER')
+      );
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).changedKeys();
+    }
+
+    function keysChangedOnly(keys) {
+      return request.resource.data.diff(resource.data).changedKeys().hasOnly(keys);
+    }
+
+    function listOrEmpty(x) {
+      return (x is list) ? x : [];
+    }
+
+    function likesToggleValid() {
+      let before = ('likes' in resource.data) ? listOrEmpty(resource.data.likes) : [];
+      let after  = ('likes' in request.resource.data) ? listOrEmpty(request.resource.data.likes) : [];
+      let likeOk   = (after.size() == before.size() + 1)
+        && !(request.auth.uid in before)
+        && (request.auth.uid in after);
+      let unlikeOk = (after.size() == before.size() - 1)
+        && (request.auth.uid in before)
+        && !(request.auth.uid in after);
+      return likeOk || unlikeOk;
+    }
+
+    /* ---------------------------
+     * USERS
+     * --------------------------*/
+   match /users/{userId} {
+  // Read:
+  // - self
+  // - or someone with admin/pastor/leader claims
+  allow read: if signedIn() && (
+    request.auth.uid == userId
+    || hasClaim('admin')
+    || hasClaim('isAdmin')
+    || hasClaim('pastor')
+    || hasClaim('isPastor')
+    || hasClaim('leader')
+    || hasClaim('isLeader')
+  );
+
+  allow create: if signedIn() && request.auth.uid == userId;
+
+  function selfUserSafeUpdate(userId) {
+    return signedIn()
+      && request.auth.uid == userId
+      && !changedKeys().hasAny(['roles','role','leadershipMinistries','memberId'])
+      && changedKeys().hasOnly(['email','linkedAt','createdAt','updatedAt']);
+  }
+
+  function leaderMayUpdateLeadershipMinistries() {
+    return (isLeader() || isAdmin() || isPastor())
+      && changedKeys().hasOnly(['leadershipMinistries','updatedAt']);
+  }
+
+  allow update: if selfUserSafeUpdate(userId) || leaderMayUpdateLeadershipMinistries();
+  allow delete: if false;
+}
+
+
+    /* ---------------------------
+     * MEMBERS
+     * --------------------------*/
+    match /members/{memberId} {
+      // read (including email-based self lookup for signup prefill)
+      allow read: if signedIn() && (
+        memberId == requesterMemberId()
+        || (
+          'userUid' in resource.data
+          && resource.data.userUid is string
+          && resource.data.userUid == request.auth.uid
+        )
+        || isAdmin()
+        || isPastor()
+        || sharesMinistryWithTarget(memberId)
+        || isLeader()
+        || (
+          'email' in resource.data
+          && resource.data.email is string
+          && resource.data.email == userData(request.auth.uid).email
+        )
+      );
+
+      // Create: admin/pastor OR self-created doc
+      allow create: if isAdmin() || isPastor()
+        || (signedIn()
+          && (('createdByUid' in request.resource.data
+                && request.resource.data.createdByUid == request.auth.uid)
+            || ('userUid' in request.resource.data
+                && request.resource.data.userUid == request.auth.uid)));
+
+      allow delete: if isAdmin() || isPastor();
+
+      // Self-update via memberId OR userUid OR email match
+      function selfMemberSafeUpdate() {
+        return signedIn()
+          && (
+            memberId == requesterMemberId()
+            || (
+              'userUid' in resource.data
+              && resource.data.userUid is string
+              && resource.data.userUid == request.auth.uid
+            )
+            || (
+              'email' in resource.data
+              && resource.data.email is string
+              && request.auth.token.email == resource.data.email
+            )
+          )
+          && changedKeys().hasOnly([
+            'firstName',
+            'lastName',
+            'fullName',
+            'email',
+            'phoneNumber',
+            'gender',
+            'maritalStatus',
+            'address',
+            'preferredContactMethod',
+            'emergencyContactName',
+            'emergencyContactNumber',
+            'emergencyContactPhone',
+            'emergencyContactRelationship',
+            'consentToDataUse',
+            'dateOfBirth',
+            'isVisitor',
+            'updatedAt'
+          ])
+          && !changedKeys().hasAny(['roles','leadershipMinistries','isPastor']);
+      }
+
+      function leaderScopedMemberUpdate() {
+        return isLeader()
+          && sharesMinistryWithTarget(memberId)
+          && changedKeys().hasOnly(['ministries','leadershipMinistries','updatedAt'])
+          && !changedKeys().hasAny(['roles','isPastor']);
+      }
+
+      allow update: if isAdmin() || isPastor() || selfMemberSafeUpdate() || leaderScopedMemberUpdate();
+    }
+
+    /* ---------------------------
+     * INBOX
+     * --------------------------*/
+    match /inbox/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+
+      match /events/{eventId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    /* ---------------------------
+     * MINISTRIES
+     * --------------------------*/
+    match /ministries/{ministryId} {
+      allow read: if signedIn();
+      allow delete: if isAdmin() || isPastor();
+      allow create, update: if false;
+
+      match /posts/{postId} {
+        allow read: if signedIn();
+
+        allow create: if signedIn()
+          && request.resource.data.authorId == request.auth.uid
+          && (ministryNameForDoc(ministryId) != "")
+          && (ministryNameForDoc(ministryId) in memberMinistriesForUid(request.auth.uid))
+          && (
+            ('text' in request.resource.data)
+            || ('media' in request.resource.data)
+            || ('links' in request.resource.data)
+            || ('imageUrl' in request.resource.data)
+            || ('linkUrl' in request.resource.data)
+          )
+          && ('createdAt' in request.resource.data);
+
+        allow delete: if signedIn() && (
+          resource.data.authorId == request.auth.uid
+          || isLeader()
+          || isAdmin()
+          || isPastor()
+        );
+
+        allow update: if signedIn() && (
+          (
+            resource.data.authorId == request.auth.uid
+            && request.resource.data.diff(resource.data).changedKeys().hasOnly(
+              ['text','media','links','imageUrl','linkUrl','updatedAt']
+            )
+          )
+          || (
+            (
+              request.resource.data.diff(resource.data).changedKeys().hasOnly(['likes'])
+              || request.resource.data.diff(resource.data).changedKeys().hasOnly(['likes','updatedAt'])
+            )
+            && likesToggleValid()
+          )
+        );
+
+        match /reactions/{reactionId} {
+          allow read: if signedIn();
+          allow create: if signedIn()
+            && request.resource.data.authorUid == request.auth.uid
+            && (ministryNameForDoc(ministryId) in memberMinistriesForUid(request.auth.uid))
+            && request.resource.data.keys().hasOnly(['authorUid','emoji','createdAt','updatedAt']);
+          allow delete: if signedIn() && (
+            resource.data.authorUid == request.auth.uid
+            || isLeader()
+            || isAdmin()
+            || isPastor()
+          );
+          allow update: if false;
+        }
+
+        match /comments/{commentId} {
+          allow read: if signedIn();
+          allow create: if signedIn()
+            && request.resource.data.authorId == request.auth.uid
+            && (ministryNameForDoc(ministryId) in memberMinistriesForUid(request.auth.uid))
+            && request.resource.data.keys().hasOnly(['authorId','text','createdAt','updatedAt']);
+          allow delete: if signedIn() && (
+            resource.data.authorId == request.auth.uid
+            || get(/databases/$(database)/documents/ministries/$(ministryId)/posts/$(postId)).data.authorId == request.auth.uid
+            || isLeader()
+            || isAdmin()
+            || isPastor()
+          );
+          allow update: if false;
+        }
+      }
+    }
+
+    /* ---------------------------
+     * SERMONS
+     * --------------------------*/
+    match /sermons/{id} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin() || isPastor() || isLeader();
+    }
+
+    /* ---------------------------
+     * NOTIFICATIONS
+     * --------------------------*/
+    match /notifications/{id} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin() || isPastor();
+    }
+
+    /* ---------------------------
+     * JOIN REQUESTS
+     * --------------------------*/
+    function leaderModeratesJoin() {
+      return isLeader() && (
+        userLeadsMinistryByName(resource.data.ministryName)
+        || userLeadsMinistryByDoc(resource.data.ministryId)
+        || userLeadsMinistryByDoc(resource.data.ministryDocId)
+      );
+    }
+
+    function isRequesterCancelling() {
+      return signedIn()
+        && (resource.data.memberId == requesterMemberId())
+        && (resource.data.status == 'pending')
+        && (request.resource.data.status == 'cancelled')
+        && keysChangedOnly(['status','cancelledAt','cancelledByUid','updatedAt']);
+    }
+
+    function leaderModeratesJoinUpdate() {
+      return leaderModeratesJoin()
+        && resource.data.status == 'pending'
+        && (request.resource.data.status == 'approved'
+            || request.resource.data.status == 'rejected')
+        && keysChangedOnly(['status','moderatorUid','approvedAt','rejectedAt','updatedAt']);
+    }
+
+    function adminOrPastorModeratesJoinUpdate() {
+      return (isAdmin() || isPastor())
+        && resource.data.status == 'pending'
+        && (request.resource.data.status == 'approved'
+            || request.resource.data.status == 'rejected')
+        && keysChangedOnly(['status','moderatorUid','approvedAt','rejectedAt','updatedAt']);
+    }
+
+    match /join_requests/{requestId} {
+      allow read: if signedIn() && (
+        isAdmin()
+        || isPastor()
+        || isLeader()
+        || (resource.data.memberId == requesterMemberId())
+      );
+
+      allow create: if signedIn()
+        && request.resource.data.memberId == requesterMemberId()
+        && request.resource.data.requestedByUid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly([
+          'memberId',
+          'ministryId',
+          'ministryDocId',
+          'ministryName',
+          'requestedByUid',
+          'status',
+          'requestedAt',
+          'updatedAt'
+        ])
+        && ('requestedAt' in request.resource.data);
+
+      allow update: if signedIn() && (
+        adminOrPastorModeratesJoinUpdate()
+        || leaderModeratesJoinUpdate()
+        || isRequesterCancelling()
+      );
+
+      allow delete: if signedIn() && (
+        isAdmin()
+        || isPastor()
+        || leaderModeratesJoin()
+        || (resource.data.memberId == requesterMemberId()
+            && resource.data.status == 'pending')
+      );
+    }
+
+    /* ---------------------------
+     * EVENTS / RSVPs
+     * --------------------------*/
+    match /events/{eventId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin() || isLeader() || isPastor();
+    }
+
+    match /event_rsvps/{rsvpId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['userId','eventId','createdAt','updatedAt','status']);
+      allow update, delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    /* ---------------------------
+     * OTHER COLLECTIONS
+     * --------------------------*/
+    match /ministry_creation_requests/{requestId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && isLeader();
+      allow update: if false;
+      allow delete: if signedIn()
+        && resource.data.status == 'pending'
+        && (
+          resource.data.requestedByUid == request.auth.uid
+          || isAdmin()
+          || isPastor()
+        );
+    }
+
+    match /baptismRequests/{id} {
+      allow read: if signedIn() && (
+        isAdmin()
+        || isLeader()
+        || isPastor()
+        || resource.data.requestedByUid == request.auth.uid
+      );
+      allow create: if signedIn()
+        && request.resource.data.requestedByUid == request.auth.uid;
+      allow update: if signedIn() && (isAdmin() || isLeader() || isPastor());
+      allow delete: if signedIn() && (
+        isAdmin()
+        || isLeader()
+        || isPastor()
+        || (resource.data.requestedByUid == request.auth.uid
+            && resource.data.status == 'pending')
+      );
+    }
+
+    match /prayerRequests/{id} {
+      allow create: if signedIn();
+      allow read: if isPastor() || isAdmin() || resource.data.requestedByUid == request.auth.uid;
+      allow update, delete: if isPastor() || isAdmin()
+        || (resource.data.requestedByUid == request.auth.uid
+            && resource.data.status == 'pending');
+
+      match /followups/{fupId} {
+        allow read, create, update, delete: if isPastor() || isAdmin();
+      }
+    }
+
+    match /followups/{fupId} {
+      allow read, create, update, delete: if isPastor() || isAdmin();
+    }
+
+    match /ministry_approval_actions/{actionId} {
+      allow create: if signedIn() && (isPastor() || isAdmin());
+      allow read, update, delete: if false;
+    }
+
+    match /attendance/{dateKey} {
+      allow read, write: if isAdmin() || isLeader() || isPastor();
+
+      match /records/{recordId} {
+        allow read, create, update, delete: if isAdmin() || isLeader() || isPastor();
+      }
+    }
+
+    match /noticeboard/{noticeId} {
+      allow read: if signedIn();
+      allow write: if isAdmin() || isLeader() || isPastor();
+    }
+
+    match /announcements/{id} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin() || isLeader() || isPastor();
+    }
+
+    /* ---------------------------
+     * Default deny
+     * --------------------------*/
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

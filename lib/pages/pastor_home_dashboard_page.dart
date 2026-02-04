@@ -228,18 +228,20 @@ class _PastorStatsGrid extends StatelessWidget {
           crossAxisSpacing: 12,
           mainAxisSpacing: 12,
           childAspectRatio: ratio,
-          children: const [
+          children: [
             _PastorStatTile(
               label: 'Members',
               icon: Icons.groups,
               query: _PastorStatQuery.members,
+              onTap: () => Navigator.pushNamed(context, '/view-members'),
             ),
             _PastorStatTile(
               label: 'Ministries',
               icon: Icons.church,
               query: _PastorStatQuery.ministries,
+              onTap: () => Navigator.pushNamed(context, '/view-ministry'),
             ),
-            _PastorStatTile(
+            const _PastorStatTile(
               label: 'Upcoming',
               icon: Icons.event_available,
               query: _PastorStatQuery.upcomingEvents,
@@ -248,6 +250,7 @@ class _PastorStatsGrid extends StatelessWidget {
               label: 'Follow-ups',
               icon: Icons.task_alt_rounded,
               query: _PastorStatQuery.followUps,
+              onTap: () => Navigator.pushNamed(context, '/my-follow-up'),
             ),
           ],
         );
@@ -262,11 +265,13 @@ class _PastorStatTile extends StatelessWidget {
   final String label;
   final IconData icon;
   final _PastorStatQuery query;
+  final VoidCallback? onTap;
 
   const _PastorStatTile({
     required this.label,
     required this.icon,
     required this.query,
+    this.onTap,
   });
 
   Stream<int> _stream() {
@@ -294,7 +299,7 @@ class _PastorStatTile extends StatelessWidget {
       stream: _stream(),
       builder: (context, snap) {
         final count = snap.data ?? 0;
-        return Container(
+        final tile = Ink(
           decoration: BoxDecoration(
             color: Colors.white,
             borderRadius: BorderRadius.circular(14),
@@ -349,6 +354,15 @@ class _PastorStatTile extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+        );
+
+        return Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: onTap,
+            child: tile,
           ),
         );
       },

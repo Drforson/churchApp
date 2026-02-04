@@ -485,6 +485,9 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
     case '/follow-up':
       return MaterialPageRoute(builder: (_) => const FollowUpPage());
 
+    case '/my-follow-up':
+      return MaterialPageRoute(builder: (_) => const FollowUpPage());
+
     case '/post-announcements':
       return MaterialPageRoute(
           builder: (_) => PostAnnouncementsPage());
