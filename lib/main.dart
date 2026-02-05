@@ -24,7 +24,7 @@ import 'pages/admin_dashboard_page.dart';
 import 'pages/admin_upload_page.dart';
 import 'pages/home_dashboard_page.dart';
 import 'pages/forms_page.dart';
-import 'pages/add_event_page.dart';
+import 'pages/events_page.dart';
 import 'pages/follow_up_page.dart';
 import 'pages/giving_page.dart';
 import 'pages/membership_form_page.dart';
@@ -461,7 +461,7 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
       return MaterialPageRoute(builder: (_) => FormsPage());
 
     case '/events':
-      return MaterialPageRoute(builder: (_) => AddEventPage());
+      return MaterialPageRoute(builder: (_) => const EventsPage());
 
     case '/register-member':
       return MaterialPageRoute(

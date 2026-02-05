@@ -390,17 +390,20 @@ async function writeDirectToLeaders({ ministryName, ministryDocId, joinRequestId
 
   // (B) leaders from ministries doc leaderUids/leaderIds
   let ministryLeaderUids = [];
+  let ministryLeaderMemberIds = [];
   const mins = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
   if (!mins.empty) {
     const mData = mins.docs[0].data() || {};
     const fromLeaderUids = Array.isArray(mData.leaderUids) ? mData.leaderUids : [];
     const fromLeaderIds = Array.isArray(mData.leaderIds) ? mData.leaderIds : [];
-    ministryLeaderUids = uniq([...fromLeaderUids, ...fromLeaderIds].filter(Boolean));
+    ministryLeaderUids = uniq(fromLeaderUids.filter(Boolean));
+    ministryLeaderMemberIds = uniq(fromLeaderIds.filter(Boolean));
     ministryDocId = ministryDocId || mins.docs[0].id;
   }
 
   // map memberIds -> uids (chunked in queries)
-  const map = leaderMemberIds.length ? await mapMemberIdsToUids(leaderMemberIds) : new Map();
+  const allLeaderMemberIds = uniq([...leaderMemberIds, ...ministryLeaderMemberIds]);
+  const map = allLeaderMemberIds.length ? await mapMemberIdsToUids(allLeaderMemberIds) : new Map();
   const uidsFromMembers = Array.from(map.values());
 
   const recipients = uniq([...uidsFromMembers, ...ministryLeaderUids].filter(Boolean));
@@ -1361,6 +1364,316 @@ async function hasMinistryModerationRights(uid, ministryName) {
   if (await isUserPastorOrAdmin(uid)) return true;
   return await isLeaderOfMinistry(uid, ministryName);
 }
+
+async function getLeaderMinistryNames(uid, cache) {
+  const names = new Set();
+  const u = await getUser(uid, cache);
+  if (u && Array.isArray(u.leadershipMinistries)) {
+    u.leadershipMinistries.map(S).filter(Boolean).forEach((n) => names.add(n));
+  }
+
+  const memberId = u?.memberId || (await findMemberIdByUid(uid, cache));
+  if (memberId) {
+    const m = await getMemberById(memberId, cache);
+    if (m && Array.isArray(m.leadershipMinistries)) {
+      m.leadershipMinistries.map(S).filter(Boolean).forEach((n) => names.add(n));
+    }
+  }
+  return Array.from(names);
+}
+
+/**
+ * getAdminDashboardStats
+ * - Admin/Pastor: global members + global pending join requests
+ * - Leader: members + pending join requests scoped to ministries they lead
+ */
+exports.getAdminDashboardStats = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const cache = makeCtxCache();
+  const isPastorAdmin = await isUserPastorOrAdmin(uid);
+  const role = await getUserRole(uid, cache);
+  const isLeader = role === 'leader';
+
+  if (!isPastorAdmin && !isLeader) {
+    throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+  }
+  const membersAgg = await db.collection('members').count().get();
+  const membersTotal = Number(membersAgg.data().count || 0);
+
+  // Fast path for pastor/admin: full counts.
+  if (isPastorAdmin) {
+    const pendingAgg = await db.collection('join_requests').where('status', '==', 'pending').count().get();
+
+    return {
+      ok: true,
+      scope: 'global',
+      membersCount: membersTotal,
+      pendingJoinRequestsCount: Number(pendingAgg.data().count || 0),
+    };
+  }
+
+  const leaderMinistries = await getLeaderMinistryNames(uid, cache);
+  if (!leaderMinistries.length) {
+    return {
+      ok: true,
+      scope: 'leader',
+      leaderMinistries,
+      membersCount: membersTotal,
+      pendingJoinRequestsCount: 0,
+    };
+  }
+
+  const memberIds = new Set();
+  const pendingJoinRequestIds = new Set();
+  const ministryDocIds = new Set();
+
+  // Resolve doc ids for led ministry names (for joins stored by doc id).
+  for (let i = 0; i < leaderMinistries.length; i += 10) {
+    const chunk = leaderMinistries.slice(i, i + 10);
+    const mins = await db.collection('ministries').where('name', 'in', chunk).get();
+    mins.docs.forEach((d) => ministryDocIds.add(d.id));
+  }
+
+  for (let i = 0; i < leaderMinistries.length; i += 10) {
+    const chunk = leaderMinistries.slice(i, i + 10);
+
+    const [memberQs, byName, byLegacyNameId] = await Promise.all([
+      db.collection('members').where('ministries', 'array-contains-any', chunk).get(),
+      db.collection('join_requests').where('status', '==', 'pending').where('ministryName', 'in', chunk).get(),
+      db.collection('join_requests').where('status', '==', 'pending').where('ministryId', 'in', chunk).get(),
+    ]);
+
+    memberQs.docs.forEach((d) => memberIds.add(d.id));
+    byName.docs.forEach((d) => pendingJoinRequestIds.add(d.id));
+    byLegacyNameId.docs.forEach((d) => pendingJoinRequestIds.add(d.id));
+  }
+
+  const docIds = Array.from(ministryDocIds);
+  for (let i = 0; i < docIds.length; i += 10) {
+    const chunk = docIds.slice(i, i + 10);
+    const [byDocId, byMinistryIdDoc] = await Promise.all([
+      db.collection('join_requests').where('status', '==', 'pending').where('ministryDocId', 'in', chunk).get(),
+      db.collection('join_requests').where('status', '==', 'pending').where('ministryId', 'in', chunk).get(),
+    ]);
+    byDocId.docs.forEach((d) => pendingJoinRequestIds.add(d.id));
+    byMinistryIdDoc.docs.forEach((d) => pendingJoinRequestIds.add(d.id));
+  }
+
+  return {
+    ok: true,
+    scope: 'leader',
+    leaderMinistries,
+    membersCount: membersTotal,
+    pendingJoinRequestsCount: pendingJoinRequestIds.size,
+  };
+});
+
+/**
+ * leaderListPendingJoinRequestsForMinistry
+ * - returns pending join requests scoped to one ministry
+ * - allowed for pastor/admin OR leader of that ministry
+ */
+exports.leaderListPendingJoinRequestsForMinistry = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const arg = req.data || {};
+  const resolved = await resolveMinistryByNameOrId(S(arg.ministryId) || S(arg.ministryName));
+  let ministryName = resolved.ministryName || S(arg.ministryName);
+  let ministryDocId = resolved.ministryDocId || null;
+
+  if (!ministryName && ministryDocId) {
+    const minDoc = await db.doc(`ministries/${ministryDocId}`).get();
+    if (minDoc.exists) {
+      const d = minDoc.data() || {};
+      ministryName = S(d.name);
+    }
+  }
+
+  if (!ministryName) {
+    throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
+  }
+
+  const allowed = await hasMinistryModerationRights(uid, ministryName);
+  if (!allowed) {
+    throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+  }
+
+  const jobs = [
+    db.collection('join_requests').where('status', '==', 'pending').where('ministryName', '==', ministryName).get(),
+    db.collection('join_requests').where('status', '==', 'pending').where('ministryId', '==', ministryName).get(),
+  ];
+
+  if (ministryDocId) {
+    jobs.push(
+      db.collection('join_requests').where('status', '==', 'pending').where('ministryId', '==', ministryDocId).get(),
+      db.collection('join_requests').where('status', '==', 'pending').where('ministryDocId', '==', ministryDocId).get()
+    );
+  }
+
+  const snaps = await Promise.all(jobs);
+  const merged = new Map();
+  snaps.forEach((qs) => qs.docs.forEach((d) => merged.set(d.id, d)));
+
+  const items = Array.from(merged.values()).map((d) => {
+    const jr = d.data() || {};
+    const requestedAtMs = jr.requestedAt && typeof jr.requestedAt.toMillis === 'function'
+      ? jr.requestedAt.toMillis()
+      : 0;
+    return {
+      requestId: d.id,
+      memberId: S(jr.memberId),
+      ministryName: S(jr.ministryName),
+      ministryId: S(jr.ministryId),
+      ministryDocId: S(jr.ministryDocId),
+      requestedByUid: S(jr.requestedByUid),
+      status: S(jr.status || 'pending'),
+      requestedAtMs,
+    };
+  });
+
+  // Attach best-effort requester display names for UI.
+  await Promise.all(items.map(async (it) => {
+    it.requesterName = (await getMemberDisplayName(it.memberId)) || '';
+  }));
+
+  items.sort((a, b) => Number(b.requestedAtMs || 0) - Number(a.requestedAtMs || 0));
+
+  return {
+    ok: true,
+    ministryName,
+    ministryDocId: ministryDocId || null,
+    items,
+  };
+});
+
+/**
+ * getGracepointEvents
+ * - server-side fetch/scrape of gracepointuk.com upcoming events
+ */
+exports.getGracepointEvents = onCall(async () => {
+  const base = 'https://gracepointuk.com';
+  const pages = [
+    `${base}/`,
+    `${base}/events/`,
+    `${base}/events-calendar/`,
+  ];
+
+  const eventUrls = new Set();
+  const items = [];
+
+  const absUrl = (href) => {
+    const h = S(href);
+    if (!h) return null;
+    if (h.startsWith('http://') || h.startsWith('https://')) return h;
+    if (h.startsWith('/')) return `${base}${h}`;
+    if (h.startsWith('?')) return `${base}/${h}`;
+    return `${base}/${h}`;
+  };
+
+  const parseDate = (txt) => {
+    const s = S(txt);
+    if (!s) return null;
+    const m = s.match(/(\d{4}-\d{2}-\d{2})[\sT]+(\d{2}:\d{2})/);
+    if (m) {
+      const d = new Date(`${m[1]}T${m[2]}:00`);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    const d2 = new Date(s);
+    if (!Number.isNaN(d2.getTime())) return d2;
+    return null;
+  };
+
+  for (const page of pages) {
+    try {
+      const res = await fetch(page, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Cloud Functions; ChurchApp)',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      });
+      if (!res.ok) continue;
+      const html = await res.text();
+
+      // JSON-LD events
+      const scripts = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+      for (const s of scripts) {
+        try {
+          const parsed = JSON.parse(s[1]);
+          const nodes = Array.isArray(parsed) ? parsed : [parsed];
+          for (const n of nodes) {
+            const t = toLc(n?.['@type']);
+            if (t !== 'event') continue;
+            const title = S(n.name);
+            const start = parseDate(n.startDate);
+            if (!title || !start) continue;
+            const url = absUrl(n.url);
+            items.push({
+              id: `ext_${title.toLowerCase().replace(/\s+/g, '-')}_${start.getTime()}`,
+              title,
+              description: S(n.description),
+              startDateIso: start.toISOString(),
+              endDateIso: parseDate(n.endDate)?.toISOString() || null,
+              location: S(n?.location?.name),
+              link: url,
+            });
+            if (url && /[?&]event=\d+/i.test(url)) eventUrls.add(url);
+          }
+        } catch (_) {}
+      }
+
+      // event links
+      const links = [...html.matchAll(/href=["']([^"']*[?&]event=\d+[^"']*)["']/gi)];
+      for (const l of links) {
+        const u = absUrl(l[1]);
+        if (u) eventUrls.add(u);
+      }
+    } catch (_) {}
+  }
+
+  for (const url of Array.from(eventUrls).slice(0, 40)) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Cloud Functions; ChurchApp)' },
+      });
+      if (!res.ok) continue;
+      const html = await res.text();
+
+      const title = S((html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1]).replace(/<[^>]+>/g, '').trim();
+      const startRaw = (html.match(/DetailsStart:\s*`([^`]+)`/i) || [])[1] || '';
+      const start = parseDate(startRaw || html);
+      if (!title || !start) continue;
+      items.push({
+        id: `ext_${title.toLowerCase().replace(/\s+/g, '-')}_${start.getTime()}`,
+        title,
+        description: '',
+        startDateIso: start.toISOString(),
+        endDateIso: null,
+        location: '',
+        link: url,
+      });
+    } catch (_) {}
+  }
+
+  const dedupe = new Map();
+  for (const it of items) {
+    const day = S(it.startDateIso).slice(0, 10);
+    const key = `${toLc(it.title)}|${day}`;
+    if (!dedupe.has(key)) dedupe.set(key, it);
+  }
+
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const out = Array.from(dedupe.values())
+    .filter((it) => {
+      const t = new Date(it.startDateIso).getTime();
+      return Number.isFinite(t) && t >= cutoff;
+    })
+    .sort((a, b) => new Date(a.startDateIso) - new Date(b.startDateIso));
+
+  return { ok: true, items: out };
+});
 
 /**
  * leaderModerateJoinRequest

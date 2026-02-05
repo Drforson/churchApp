@@ -168,6 +168,17 @@ service cloud.firestore {
       );
     }
 
+    function requesterLeadsAnyMinistry() {
+      let m = requesterMemberSnap();
+      return (
+        m != null &&
+        m.exists &&
+        'leadershipMinistries' in m.data &&
+        m.data.leadershipMinistries is list &&
+        m.data.leadershipMinistries.size() > 0
+      );
+    }
+
     function isAdmin() {
       return signedIn() && (
         userHasAdminRole()
@@ -197,6 +208,7 @@ service cloud.firestore {
         || hasClaim('leader')
         || hasClaim('isLeader')
         || (mins is list && mins.size() > 0)
+        || requesterLeadsAnyMinistry()
         || memberHasRoleFromRequester('leader')
         || memberHasRoleFromRequester('Leader')
         || memberHasRoleFromRequester('LEADER')

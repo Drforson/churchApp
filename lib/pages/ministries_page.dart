@@ -69,7 +69,8 @@ class _MinistriesPageState extends State<MinistriesPage>
   Future<void> _refreshPendingJoinRequests() async {
     _pendingJoinKeys.clear();
     try {
-      final callable = _functions.httpsCallable('memberListPendingJoinRequests');
+      final callable =
+          _functions.httpsCallable('memberListPendingJoinRequests');
       final res = await callable.call();
       final data = (res.data is Map)
           ? Map<String, dynamic>.from(res.data as Map)
@@ -82,7 +83,8 @@ class _MinistriesPageState extends State<MinistriesPage>
 
       final items = (data['items'] is List)
           ? List<Map<String, dynamic>>.from(
-              (data['items'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
+              (data['items'] as List)
+                  .map((e) => Map<String, dynamic>.from(e as Map)),
             )
           : const <Map<String, dynamic>>[];
 
@@ -137,6 +139,8 @@ class _MinistriesPageState extends State<MinistriesPage>
     _uid = user.uid;
 
     try {
+      final token = await user.getIdTokenResult(true);
+      final claims = token.claims ?? const <String, dynamic>{};
       final u = await _db.collection('users').doc(user.uid).get();
       final data = u.data() ?? {};
 
@@ -146,17 +150,25 @@ class _MinistriesPageState extends State<MinistriesPage>
       // ---- Legacy fallbacks tolerated by rules ----
       final legacyRoles = (data['roles'] is List)
           ? List<String>.from(
-          (data['roles'] as List).map((e) => e.toString().toLowerCase()))
+              (data['roles'] as List).map((e) => e.toString().toLowerCase()))
           : const <String>[];
 
-      _isAdmin =
-          role == 'admin' || data['isAdmin'] == true || legacyRoles.contains('admin');
-      _isPastor =
-          role == 'pastor' || data['isPastor'] == true || legacyRoles.contains('pastor');
+      _isAdmin = role == 'admin' ||
+          data['isAdmin'] == true ||
+          data['admin'] == true ||
+          legacyRoles.contains('admin') ||
+          claims['admin'] == true ||
+          claims['isAdmin'] == true;
+      _isPastor = role == 'pastor' ||
+          data['isPastor'] == true ||
+          data['pastor'] == true ||
+          legacyRoles.contains('pastor') ||
+          claims['pastor'] == true ||
+          claims['isPastor'] == true;
 
       final lmUser = (data['leadershipMinistries'] is List)
           ? List<String>.from(
-          (data['leadershipMinistries'] as List).map((e) => e.toString()))
+              (data['leadershipMinistries'] as List).map((e) => e.toString()))
           : const <String>[];
 
       // Treat admin/pastor as leaders for UI affordances
@@ -164,8 +176,11 @@ class _MinistriesPageState extends State<MinistriesPage>
           _isPastor ||
           role == 'leader' ||
           data['isLeader'] == true ||
+          data['leader'] == true ||
           legacyRoles.contains('leader') ||
-          lmUser.isNotEmpty;
+          lmUser.isNotEmpty ||
+          claims['leader'] == true ||
+          claims['isLeader'] == true;
 
       final mid = (data['memberId'] ?? '').toString();
       Set<String> memberMins = {};
@@ -190,8 +205,19 @@ class _MinistriesPageState extends State<MinistriesPage>
                 .where((e) => e.isNotEmpty),
           );
         }
-        if (md['isPastor'] == true) _isPastor = true;
+        final memberRoles = (md['roles'] is List)
+            ? List<String>.from(
+                (md['roles'] as List).map((e) => e.toString().toLowerCase()),
+              )
+            : const <String>[];
+        if (md['isPastor'] == true || memberRoles.contains('pastor'))
+          _isPastor = true;
+        if (memberRoles.contains('admin')) _isAdmin = true;
+        if (memberRoles.contains('leader') || leaderMins.isNotEmpty)
+          _isLeader = true;
       }
+
+      if (_isAdmin || _isPastor) _isLeader = true;
 
       _memberId = mid.isNotEmpty ? mid : null;
       _memberMinistries
@@ -245,7 +271,7 @@ class _MinistriesPageState extends State<MinistriesPage>
             TextField(
               controller: descCtrl,
               decoration:
-              const InputDecoration(labelText: 'Description (optional)'),
+                  const InputDecoration(labelText: 'Description (optional)'),
               maxLines: 3,
             ),
             const SizedBox(height: 10),
@@ -256,8 +282,12 @@ class _MinistriesPageState extends State<MinistriesPage>
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Submit')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Submit')),
         ],
       ),
     );
@@ -284,136 +314,142 @@ class _MinistriesPageState extends State<MinistriesPage>
       builder: (dialogContext) => StatefulBuilder(
         builder: (context, setLocalState) {
           final mq = MediaQuery.of(dialogContext);
-          final contentHeight = (((mq.size.height - mq.viewInsets.bottom) * 0.72) - 2)
-              .clamp(278.0, 618.0)
-              .toDouble();
+          final contentHeight =
+              (((mq.size.height - mq.viewInsets.bottom) * 0.72) - 2)
+                  .clamp(278.0, 618.0)
+                  .toDouble();
 
           return AlertDialog(
-            insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            insetPadding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             title: const Text('Create Ministry'),
             content: AnimatedContainer(
               duration: const Duration(milliseconds: 180),
               curve: Curves.easeOut,
               width: 460,
               height: contentHeight,
-            child: FutureBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              future: membersFuture,
-              builder: (context, snap) {
-                Widget leadersBody;
-                if (snap.connectionState == ConnectionState.waiting) {
-                  leadersBody = const Center(child: CircularProgressIndicator());
-                } else {
-                  final docs = snap.data?.docs ?? const [];
-                  final rows = docs.map((d) {
-                    final data = d.data();
-                    final first = (data['firstName'] ?? '').toString().trim();
-                    final last = (data['lastName'] ?? '').toString().trim();
-                    final fullName = (data['fullName'] ?? '$first $last')
-                        .toString()
-                        .trim();
-                    final fallback =
-                        fullName.isEmpty ? (data['email'] ?? 'Member').toString() : fullName;
-                    return <String, String>{'id': d.id, 'name': fallback};
-                  }).where((m) {
-                    if (query.isEmpty) return true;
-                    return m['name']!.toLowerCase().contains(query);
-                  }).toList()
-                    ..sort((a, b) => a['name']!.compareTo(b['name']!));
+              child: FutureBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                future: membersFuture,
+                builder: (context, snap) {
+                  Widget leadersBody;
+                  if (snap.connectionState == ConnectionState.waiting) {
+                    leadersBody =
+                        const Center(child: CircularProgressIndicator());
+                  } else {
+                    final docs = snap.data?.docs ?? const [];
+                    final rows = docs.map((d) {
+                      final data = d.data();
+                      final first = (data['firstName'] ?? '').toString().trim();
+                      final last = (data['lastName'] ?? '').toString().trim();
+                      final fullName = (data['fullName'] ?? '$first $last')
+                          .toString()
+                          .trim();
+                      final fallback = fullName.isEmpty
+                          ? (data['email'] ?? 'Member').toString()
+                          : fullName;
+                      return <String, String>{'id': d.id, 'name': fallback};
+                    }).where((m) {
+                      if (query.isEmpty) return true;
+                      return m['name']!.toLowerCase().contains(query);
+                    }).toList()
+                      ..sort((a, b) => a['name']!.compareTo(b['name']!));
 
-                  leadersBody = Container(
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Colors.black12),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: rows.isEmpty
-                        ? const Center(child: Text('No members found.'))
-                        : ListView.builder(
-                            itemCount: rows.length,
-                            itemBuilder: (context, i) {
-                              final row = rows[i];
-                              final id = row['id']!;
-                              final name = row['name']!;
-                              final checked = selectedLeaderIds.contains(id);
-                              return CheckboxListTile(
-                                dense: true,
-                                value: checked,
-                                title: Text(name),
-                                onChanged: (v) {
-                                  setLocalState(() {
-                                    if (v == true) {
-                                      selectedLeaderIds.add(id);
-                                    } else {
-                                      selectedLeaderIds.remove(id);
-                                    }
-                                  });
-                                },
-                              );
-                            },
-                          ),
-                  );
-                }
+                    leadersBody = Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.black12),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: rows.isEmpty
+                          ? const Center(child: Text('No members found.'))
+                          : ListView.builder(
+                              itemCount: rows.length,
+                              itemBuilder: (context, i) {
+                                final row = rows[i];
+                                final id = row['id']!;
+                                final name = row['name']!;
+                                final checked = selectedLeaderIds.contains(id);
+                                return CheckboxListTile(
+                                  dense: true,
+                                  value: checked,
+                                  title: Text(name),
+                                  onChanged: (v) {
+                                    setLocalState(() {
+                                      if (v == true) {
+                                        selectedLeaderIds.add(id);
+                                      } else {
+                                        selectedLeaderIds.remove(id);
+                                      }
+                                    });
+                                  },
+                                );
+                              },
+                            ),
+                    );
+                  }
 
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    TextField(
-                      controller: nameCtrl,
-                      decoration: const InputDecoration(
-                        labelText: 'Ministry Name',
-                        hintText: 'e.g. Worship Team',
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextField(
+                        controller: nameCtrl,
+                        decoration: const InputDecoration(
+                          labelText: 'Ministry Name',
+                          hintText: 'e.g. Worship Team',
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: descCtrl,
-                      decoration:
-                          const InputDecoration(labelText: 'Description (optional)'),
-                      maxLines: 3,
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: searchCtrl,
-                      decoration: const InputDecoration(
-                        prefixIcon: Icon(Icons.search),
-                        labelText: 'Search members for leaders',
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: descCtrl,
+                        decoration: const InputDecoration(
+                            labelText: 'Description (optional)'),
+                        maxLines: 3,
                       ),
-                      onChanged: (v) {
-                        setLocalState(() => query = v.trim().toLowerCase());
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    Flexible(child: leadersBody),
-                    const SizedBox(height: 8),
-                    Text('Selected leaders: ${selectedLeaderIds.length}'),
-                  ],
-                );
-              },
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                if (nameCtrl.text.trim().isEmpty) {
-                  ScaffoldMessenger.of(this.context).showSnackBar(
-                    const SnackBar(content: Text('Ministry name is required.')),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: searchCtrl,
+                        decoration: const InputDecoration(
+                          prefixIcon: Icon(Icons.search),
+                          labelText: 'Search members for leaders',
+                        ),
+                        onChanged: (v) {
+                          setLocalState(() => query = v.trim().toLowerCase());
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      Flexible(child: leadersBody),
+                      const SizedBox(height: 8),
+                      Text('Selected leaders: ${selectedLeaderIds.length}'),
+                    ],
                   );
-                  return;
-                }
-                if (selectedLeaderIds.isEmpty) {
-                  ScaffoldMessenger.of(this.context).showSnackBar(
-                    const SnackBar(content: Text('Select at least one leader.')),
-                  );
-                  return;
-                }
-                Navigator.pop(dialogContext, true);
-              },
-              child: const Text('Create'),
+                },
+              ),
             ),
-          ],
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  if (nameCtrl.text.trim().isEmpty) {
+                    ScaffoldMessenger.of(this.context).showSnackBar(
+                      const SnackBar(
+                          content: Text('Ministry name is required.')),
+                    );
+                    return;
+                  }
+                  if (selectedLeaderIds.isEmpty) {
+                    ScaffoldMessenger.of(this.context).showSnackBar(
+                      const SnackBar(
+                          content: Text('Select at least one leader.')),
+                    );
+                    return;
+                  }
+                  Navigator.pop(dialogContext, true);
+                },
+                child: const Text('Create'),
+              ),
+            ],
           );
         },
       ),
@@ -474,7 +510,8 @@ class _MinistriesPageState extends State<MinistriesPage>
     if (!_isLeader) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only leaders can create new ministries.')),
+        const SnackBar(
+            content: Text('Only leaders can create new ministries.')),
       );
       return;
     }
@@ -515,7 +552,8 @@ class _MinistriesPageState extends State<MinistriesPage>
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Request submitted for "$name". Pastor notified.')),
+        SnackBar(
+            content: Text('Request submitted for "$name". Pastor notified.')),
       );
     } catch (e) {
       if (!mounted) return;
@@ -526,7 +564,8 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   // ======== Join Request ========
-  Future<void> _showJoinPrompt({required String id, required String name}) async {
+  Future<void> _showJoinPrompt(
+      {required String id, required String name}) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -535,15 +574,20 @@ class _MinistriesPageState extends State<MinistriesPage>
           'You are not a member of this ministry. Would you like to send a join request?',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text('Send')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Send')),
         ],
       ),
     );
     if (ok == true) await _sendJoinRequest(id: id, name: name);
   }
 
-  Future<void> _sendJoinRequest({required String id, required String name}) async {
+  Future<void> _sendJoinRequest(
+      {required String id, required String name}) async {
     if (_uid == null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -607,7 +651,8 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   // ======== Cancel Join Request ========
-  Future<void> _confirmCancelJoin({required String id, required String name}) async {
+  Future<void> _confirmCancelJoin(
+      {required String id, required String name}) async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -629,7 +674,8 @@ class _MinistriesPageState extends State<MinistriesPage>
     }
   }
 
-  Future<void> _cancelPendingJoin({required String id, required String name}) async {
+  Future<void> _cancelPendingJoin(
+      {required String id, required String name}) async {
     if (_uid == null) return;
 
     try {
@@ -714,12 +760,14 @@ class _MinistriesPageState extends State<MinistriesPage>
         title: const Text('Delete ministry'),
         content: Text(
           'Are you sure you want to delete "$ministryName"?\n\n'
-              'This will remove the ministry record. '
-              'If you have a Cloud Function to clean up memberships/feeds, it will run. '
-              'This action cannot be undone.',
+          'This will remove the ministry record. '
+          'If you have a Cloud Function to clean up memberships/feeds, it will run. '
+          'This action cannot be undone.',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () => Navigator.pop(context, true),
@@ -758,11 +806,11 @@ class _MinistriesPageState extends State<MinistriesPage>
       .orderBy('name')
       .snapshots()
       .map((qs) => qs.docs
-      .map((d) => {
-    'id': d.id,
-    'name': (d.data()['name'] ?? '').toString(),
-  })
-      .toList());
+          .map((d) => {
+                'id': d.id,
+                'name': (d.data()['name'] ?? '').toString(),
+              })
+          .toList());
 
   // Pending-only (defensive normalization too)
   Stream<List<Map<String, dynamic>>> _myPendingCreationRequestsStream() {
@@ -775,20 +823,20 @@ class _MinistriesPageState extends State<MinistriesPage>
         .orderBy('requestedAt', descending: true)
         .snapshots()
         .map((qs) => qs.docs
-        .map((d) {
-      final map = d.data();
-      final rawStatus = (map['status'] ?? '').toString();
-      final status = rawStatus.trim().toLowerCase(); // normalize
-      final name = (map['name'] ?? '').toString();
-      return {
-        'id': d.id,
-        'name': name,
-        'status': status,
-      };
-    })
-    // client-side defensive filter (ignores stale/odd-cased docs)
-        .where((m) => (m['status'] as String) == 'pending')
-        .toList());
+            .map((d) {
+              final map = d.data();
+              final rawStatus = (map['status'] ?? '').toString();
+              final status = rawStatus.trim().toLowerCase(); // normalize
+              final name = (map['name'] ?? '').toString();
+              return {
+                'id': d.id,
+                'name': name,
+                'status': status,
+              };
+            })
+            // client-side defensive filter (ignores stale/odd-cased docs)
+            .where((m) => (m['status'] as String) == 'pending')
+            .toList());
   }
 
   // All requests for the second tab (history view)
@@ -799,16 +847,14 @@ class _MinistriesPageState extends State<MinistriesPage>
         .where('requestedByUid', isEqualTo: _uid)
         .orderBy('requestedAt', descending: true)
         .snapshots()
-        .map((qs) => qs.docs
-        .map((d) {
-      final map = d.data();
-      return {
-        'id': d.id,
-        'name': (map['name'] ?? '').toString(),
-        'status': (map['status'] ?? '').toString().trim().toLowerCase(),
-      };
-    })
-        .toList());
+        .map((qs) => qs.docs.map((d) {
+              final map = d.data();
+              return {
+                'id': d.id,
+                'name': (map['name'] ?? '').toString(),
+                'status': (map['status'] ?? '').toString().trim().toLowerCase(),
+              };
+            }).toList());
   }
 
   // ======== UI helpers ========
@@ -857,15 +903,15 @@ class _MinistriesPageState extends State<MinistriesPage>
     if (!canAccess && signedIn && !_isAdmin && !_isPastor) {
       trailing = pending
           ? TextButton.icon(
-        icon: const Icon(Icons.cancel),
-        label: const Text('Cancel request'),
-        onPressed: () => _confirmCancelJoin(id: id, name: name),
-      )
+              icon: const Icon(Icons.cancel),
+              label: const Text('Cancel request'),
+              onPressed: () => _confirmCancelJoin(id: id, name: name),
+            )
           : TextButton.icon(
-        icon: const Icon(Icons.person_add_alt_1),
-        label: const Text('Join'),
-        onPressed: () => _showJoinPrompt(id: id, name: name),
-      );
+              icon: const Icon(Icons.person_add_alt_1),
+              label: const Text('Join'),
+              onPressed: () => _showJoinPrompt(id: id, name: name),
+            );
     } else if (canDelete) {
       trailing = PopupMenuButton<String>(
         onSelected: (v) {
@@ -929,9 +975,9 @@ class _MinistriesPageState extends State<MinistriesPage>
   }
 
   Widget _sectionHeader(String t) => Padding(
-    padding: const EdgeInsets.fromLTRB(12, 16, 12, 8),
-    child: Text(t, style: Theme.of(context).textTheme.titleMedium),
-  );
+        padding: const EdgeInsets.fromLTRB(12, 16, 12, 8),
+        child: Text(t, style: Theme.of(context).textTheme.titleMedium),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -959,16 +1005,16 @@ class _MinistriesPageState extends State<MinistriesPage>
                   controller: _searchCtrl,
                   decoration: InputDecoration(
                     hintText: 'Search ministries…',
-                    border:
-                    OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8)),
                     contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                     suffixIcon: _query.isEmpty
                         ? const Icon(Icons.search)
                         : IconButton(
-                      icon: const Icon(Icons.clear),
-                      onPressed: () => _searchCtrl.clear(),
-                    ),
+                            icon: const Icon(Icons.clear),
+                            onPressed: () => _searchCtrl.clear(),
+                          ),
                   ),
                 ),
               ),
@@ -985,12 +1031,12 @@ class _MinistriesPageState extends State<MinistriesPage>
         ),
         floatingActionButton: _isLeader
             ? FloatingActionButton(
-          onPressed: _openNewMinistryDialog,
-          tooltip: (_isPastor || _isAdmin)
-              ? 'Create Ministry'
-              : 'Request New Ministry',
-          child: const Icon(Icons.add),
-        )
+                onPressed: _openNewMinistryDialog,
+                tooltip: (_isPastor || _isAdmin)
+                    ? 'Create Ministry'
+                    : 'Request New Ministry',
+                child: const Icon(Icons.add),
+              )
             : null,
         body: TabBarView(
           children: [
@@ -1007,11 +1053,11 @@ class _MinistriesPageState extends State<MinistriesPage>
                   // Filter by search query (case-insensitive)
                   final all = snap.data!
                       .where((m) => _query.isEmpty
-                      ? true
-                      : m['name']
-                      .toString()
-                      .toLowerCase()
-                      .contains(_query.toLowerCase()))
+                          ? true
+                          : m['name']
+                              .toString()
+                              .toLowerCase()
+                              .contains(_query.toLowerCase()))
                       .toList();
 
                   final fullAccess = _isAdmin || _isPastor;
@@ -1021,9 +1067,9 @@ class _MinistriesPageState extends State<MinistriesPage>
                       : {..._memberMinistries, ..._leaderMinistries};
 
                   final myList =
-                  all.where((m) => mySet.contains(m['name'])).toList();
+                      all.where((m) => mySet.contains(m['name'])).toList();
                   final otherList =
-                  all.where((m) => !mySet.contains(m['name'])).toList();
+                      all.where((m) => !mySet.contains(m['name'])).toList();
 
                   return ListView(
                     children: [
@@ -1039,9 +1085,12 @@ class _MinistriesPageState extends State<MinistriesPage>
                             // Filter out locally dismissed AND ensure status is truly 'pending'
                             final reqs = reqSnap.data!
                                 .where((r) =>
-                            !_dismissedReqIds.contains(r['id'] as String) &&
-                                (r['status'] as String).trim().toLowerCase() ==
-                                    'pending')
+                                    !_dismissedReqIds
+                                        .contains(r['id'] as String) &&
+                                    (r['status'] as String)
+                                            .trim()
+                                            .toLowerCase() ==
+                                        'pending')
                                 .toList();
 
                             if (reqs.isEmpty) return const SizedBox.shrink();
@@ -1059,18 +1108,19 @@ class _MinistriesPageState extends State<MinistriesPage>
                                     child: Card(
                                       child: ListTile(
                                         title: Text(name),
-                                        subtitle:
-                                        const Text('Awaiting pastoral approval'),
+                                        subtitle: const Text(
+                                            'Awaiting pastoral approval'),
                                         trailing: Chip(
                                           label: const Text('PENDING'),
                                           backgroundColor:
-                                          Colors.orange.withOpacity(0.15),
-                                          labelStyle:
-                                          const TextStyle(color: Colors.orange),
+                                              Colors.orange.withOpacity(0.15),
+                                          labelStyle: const TextStyle(
+                                              color: Colors.orange),
                                         ),
                                         // 👇 Tap to disintegrate locally (pure UX; no write)
                                         onTap: () {
-                                          setState(() => _dismissedReqIds.add(id));
+                                          setState(
+                                              () => _dismissedReqIds.add(id));
                                         },
                                       ),
                                     ),
@@ -1128,9 +1178,8 @@ class _MinistriesPageState extends State<MinistriesPage>
                           trailing: Chip(
                             label: Text(status.toUpperCase()),
                             backgroundColor:
-                            _statusColor(status).withOpacity(0.15),
-                            labelStyle:
-                            TextStyle(color: _statusColor(status)),
+                                _statusColor(status).withOpacity(0.15),
+                            labelStyle: TextStyle(color: _statusColor(status)),
                           ),
                         ),
                       );

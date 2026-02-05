@@ -8,14 +8,13 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:async/async.dart' show StreamZip;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/link_preview_service.dart';
 import '../models/member_model.dart';
 
 class MinistryDetailsPage extends StatefulWidget {
-  final String ministryId;   // ministries/{docId}
+  final String ministryId; // ministries/{docId}
   final String ministryName; // human-readable name used in members[].ministries
 
   const MinistryDetailsPage({
@@ -28,7 +27,8 @@ class MinistryDetailsPage extends StatefulWidget {
   State<MinistryDetailsPage> createState() => _MinistryDetailsPageState();
 }
 
-class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTickerProviderStateMixin {
+class _MinistryDetailsPageState extends State<MinistryDetailsPage>
+    with SingleTickerProviderStateMixin {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
   final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
@@ -37,6 +37,7 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
   String? _uid;
   bool _isLeaderHere = false;
   bool _isAdminOrPastor = false;
+  int _pendingRequestsReloadKey = 0;
 
   // Feed compose
   final _postCtrl = TextEditingController();
@@ -61,14 +62,20 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
 
   Future<void> _bootstrap() async {
     final u = _auth.currentUser;
-    setState(() { _uid = u?.uid; });
+    setState(() {
+      _uid = u?.uid;
+    });
     if (u == null) return;
 
     final userSnap = await _db.collection('users').doc(u.uid).get();
     final data = userSnap.data() ?? {};
-    final roles = (data['roles'] is List) ? List<String>.from(data['roles']) : const <String>[];
+    final roles = (data['roles'] is List)
+        ? List<String>.from(data['roles'])
+        : const <String>[];
     final roleSingle = (data['role'] ?? '').toString().toLowerCase();
-    List<String> leads = (data['leadershipMinistries'] is List) ? List<String>.from(data['leadershipMinistries']) : const <String>[];
+    List<String> leads = (data['leadershipMinistries'] is List)
+        ? List<String>.from(data['leadershipMinistries'])
+        : const <String>[];
 
     // 🔎 Also check linked member doc for leadershipMinistries (in case user doc isn't synced)
     try {
@@ -76,7 +83,9 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
       if (memberId.isNotEmpty) {
         final m = await _db.collection('members').doc(memberId).get();
         final md = m.data() ?? {};
-        final mLeads = (md['leadershipMinistries'] is List) ? List<String>.from(md['leadershipMinistries']) : const <String>[];
+        final mLeads = (md['leadershipMinistries'] is List)
+            ? List<String>.from(md['leadershipMinistries'])
+            : const <String>[];
         // union
         leads = <String>{...leads, ...mLeads}.toList();
       }
@@ -84,7 +93,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
 
     final isAdmin = roles.contains('admin') || roleSingle == 'admin';
     final isPastor = roles.contains('pastor') || roleSingle == 'pastor';
-    final isLeaderHere = leads.contains(widget.ministryName) || isAdmin || isPastor;
+    final isLeaderHere =
+        leads.contains(widget.ministryName) || isAdmin || isPastor;
 
     setState(() {
       _isLeaderHere = isLeaderHere;
@@ -96,7 +106,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
 
   // Strongly-typed stream of members in this ministry using MemberModel
   Stream<List<MemberModel>> _membersStream() {
-    return _db.collection('members')
+    return _db
+        .collection('members')
         .where('ministries', arrayContains: widget.ministryName)
         .snapshots()
         .map((qs) {
@@ -114,7 +125,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
     });
   }
 
-  Future<void> _promoteDemote({required String memberId, required bool makeLeader}) async {
+  Future<void> _promoteDemote(
+      {required String memberId, required bool makeLeader}) async {
     try {
       await _functions.httpsCallable('setMinistryLeadership').call({
         'memberId': memberId,
@@ -122,15 +134,14 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
         'makeLeader': makeLeader,
       });
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(makeLeader ? 'Promoted to leader' : 'Demoted from leader'))
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                makeLeader ? 'Promoted to leader' : 'Demoted from leader')));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Action failed: $e'))
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Action failed: $e')));
       }
     }
   }
@@ -143,14 +154,12 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
       });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Removed from ministry'))
-        );
+            const SnackBar(content: Text('Removed from ministry')));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Remove failed: $e'))
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Remove failed: $e')));
       }
     }
   }
@@ -158,7 +167,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
   Widget _memberTileFromModel(MemberModel m) {
     final String fullNameRaw = ('${m.firstName} ${m.lastName}').trim();
     final String fullName = fullNameRaw.isEmpty ? 'Member' : fullNameRaw;
-    final bool isLeaderOfThis = m.leadershipMinistries.contains(widget.ministryName);
+    final bool isLeaderOfThis =
+        m.leadershipMinistries.contains(widget.ministryName);
     final email = m.email.trim();
     final phone = (m.phoneNumber ?? '').trim();
 
@@ -174,8 +184,12 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
           title: Text(title),
           content: Text(message),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Confirm')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel')),
+            FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Confirm')),
           ],
         ),
       );
@@ -183,18 +197,21 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
         try {
           await run();
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(success)));
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text(success)));
           }
         } catch (e) {
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed: $e')));
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text('Failed: $e')));
           }
         }
       }
     }
 
     return ListTile(
-      leading: CircleAvatar(child: Text(fullName.isNotEmpty ? fullName[0].toUpperCase() : '?')),
+      leading: CircleAvatar(
+          child: Text(fullName.isNotEmpty ? fullName[0].toUpperCase() : '?')),
       title: Row(
         children: [
           if (isLeaderOfThis) ...[
@@ -217,102 +234,99 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           if (email.isNotEmpty) Text(email),
-          if (phone.isNotEmpty) Text(phone, style: const TextStyle(fontSize: 12)),
+          if (phone.isNotEmpty)
+            Text(phone, style: const TextStyle(fontSize: 12)),
         ],
       ),
       isThreeLine: phone.isNotEmpty,
       trailing: _isLeaderHere
           ? PopupMenuButton<String>(
-        onSelected: (v) {
-          if (v == 'promote') {
-            _confirmAndRun(
-              title: 'Promote to Leader',
-              message: 'Give $fullName leader permissions in ${widget.ministryName}?',
-              run: () => _promoteDemote(memberId: m.id, makeLeader: true),
-              success: 'Promoted to leader',
-            );
-          }
-          if (v == 'demote') {
-            _confirmAndRun(
-              title: 'Demote from Leader',
-              message: 'Remove $fullName leader permissions in ${widget.ministryName}?',
-              run: () => _promoteDemote(memberId: m.id, makeLeader: false),
-              success: 'Demoted from leader',
-            );
-          }
-          if (v == 'remove') {
-            _confirmAndRun(
-              title: 'Remove from Ministry',
-              message: 'Remove $fullName from ${widget.ministryName}? They will lose access to this ministry feed.',
-              run: () => _removeFromMinistry(m.id),
-              success: 'Removed from ministry',
-            );
-          }
-        },
-        itemBuilder: (ctx) => [
-          if (!isLeaderOfThis) const PopupMenuItem(
-            value: 'promote',
-            child: Row(children: [Icon(Icons.upgrade, size: 18), SizedBox(width: 8), Text('Promote to Leader')]),
-          ),
-          if (isLeaderOfThis) const PopupMenuItem(
-            value: 'demote',
-            child: Row(children: [Icon(Icons.remove_moderator_outlined, size: 18), SizedBox(width: 8), Text('Demote from Leader')]),
-          ),
-          const PopupMenuItem(
-            value: 'remove',
-            child: Row(children: [Icon(Icons.person_remove_outlined, size: 18), SizedBox(width: 8), Text('Remove from Ministry')]),
-          ),
-        ],
-      )
+              onSelected: (v) {
+                if (v == 'promote') {
+                  _confirmAndRun(
+                    title: 'Promote to Leader',
+                    message:
+                        'Give $fullName leader permissions in ${widget.ministryName}?',
+                    run: () => _promoteDemote(memberId: m.id, makeLeader: true),
+                    success: 'Promoted to leader',
+                  );
+                }
+                if (v == 'demote') {
+                  _confirmAndRun(
+                    title: 'Demote from Leader',
+                    message:
+                        'Remove $fullName leader permissions in ${widget.ministryName}?',
+                    run: () =>
+                        _promoteDemote(memberId: m.id, makeLeader: false),
+                    success: 'Demoted from leader',
+                  );
+                }
+                if (v == 'remove') {
+                  _confirmAndRun(
+                    title: 'Remove from Ministry',
+                    message:
+                        'Remove $fullName from ${widget.ministryName}? They will lose access to this ministry feed.',
+                    run: () => _removeFromMinistry(m.id),
+                    success: 'Removed from ministry',
+                  );
+                }
+              },
+              itemBuilder: (ctx) => [
+                if (!isLeaderOfThis)
+                  const PopupMenuItem(
+                    value: 'promote',
+                    child: Row(children: [
+                      Icon(Icons.upgrade, size: 18),
+                      SizedBox(width: 8),
+                      Text('Promote to Leader')
+                    ]),
+                  ),
+                if (isLeaderOfThis)
+                  const PopupMenuItem(
+                    value: 'demote',
+                    child: Row(children: [
+                      Icon(Icons.remove_moderator_outlined, size: 18),
+                      SizedBox(width: 8),
+                      Text('Demote from Leader')
+                    ]),
+                  ),
+                const PopupMenuItem(
+                  value: 'remove',
+                  child: Row(children: [
+                    Icon(Icons.person_remove_outlined, size: 18),
+                    SizedBox(width: 8),
+                    Text('Remove from Ministry')
+                  ]),
+                ),
+              ],
+            )
           : null,
     );
   }
 
   /* ================= Pending Join Requests (leaders only) ================= */
-  // Merge multiple queries to cover different stored field styles & status casing
-  Stream<List<DocumentSnapshot<Map<String, dynamic>>>> _pendingRequestsMerged() {
-    final q1 = _db.collection('join_requests')
-        .where('status', isEqualTo: 'pending')
-        .where('ministryName', isEqualTo: widget.ministryName)
-        .snapshots();
-    final q1b = _db.collection('join_requests')
-        .where('status', isEqualTo: 'Pending')
-        .where('ministryName', isEqualTo: widget.ministryName)
-        .snapshots();
-    final q2 = _db.collection('join_requests')
-        .where('status', isEqualTo: 'pending')
-        .where('ministryId', isEqualTo: widget.ministryId)
-        .snapshots();
-    final q2b = _db.collection('join_requests')
-        .where('status', isEqualTo: 'Pending')
-        .where('ministryId', isEqualTo: widget.ministryId)
-        .snapshots();
-    final q3 = _db.collection('join_requests')
-        .where('status', isEqualTo: 'pending')
-        .where('ministryDocId', isEqualTo: widget.ministryId)
-        .snapshots();
-    final q3b = _db.collection('join_requests')
-        .where('status', isEqualTo: 'Pending')
-        .where('ministryDocId', isEqualTo: widget.ministryId)
-        .snapshots();
-
-    // combineLatest manually by listening to all and merging unique docs
-    return q1.combineLatestAll([q1b, q2, q2b, q3, q3b]).map((lists) {
-      final allSnaps = lists.cast<QuerySnapshot<Map<String, dynamic>>>();
-      final merged = <String, DocumentSnapshot<Map<String, dynamic>>>{};
-      for (final s in allSnaps) {
-        for (final d in s.docs) {
-          merged[d.id] = d;
-        }
-      }
-      final out = merged.values.toList();
-      out.sort((a, b) {
-        final ta = (a.data()?['requestedAt'] as Timestamp?)?.toDate() ?? DateTime.fromMillisecondsSinceEpoch(0);
-        final tb = (b.data()?['requestedAt'] as Timestamp?)?.toDate() ?? DateTime.fromMillisecondsSinceEpoch(0);
-        return tb.compareTo(ta);
+  Future<List<Map<String, dynamic>>> _fetchPendingRequests() async {
+    try {
+      final res = await _functions
+          .httpsCallable('leaderListPendingJoinRequestsForMinistry')
+          .call({
+        'ministryId': widget.ministryId,
+        'ministryName': widget.ministryName,
       });
-      return out;
-    });
+      final data = (res.data is Map)
+          ? Map<String, dynamic>.from(res.data as Map)
+          : <String, dynamic>{};
+      final items = (data['items'] is List)
+          ? List<Map<String, dynamic>>.from(
+              (data['items'] as List)
+                  .map((e) => Map<String, dynamic>.from(e as Map)),
+            )
+          : const <Map<String, dynamic>>[];
+      return items;
+    } catch (e) {
+      debugPrint('[MinistryDetails] pending requests load failed: $e');
+      return const <Map<String, dynamic>>[];
+    }
   }
 
   Future<void> _moderateJoinRequest(String requestId, String decision) async {
@@ -325,18 +339,22 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
       });
     } catch (_) {
       // Fallback to direct write (should be allowed by your rules for leaders)
+      final now = FieldValue.serverTimestamp();
       await _db.collection('join_requests').doc(requestId).update({
         'status': decision,
-        'updatedAt': FieldValue.serverTimestamp(),
-        'moderatedByUid': _uid,
+        'moderatorUid': _uid,
+        if (decision == 'approved') 'approvedAt': now,
+        if (decision == 'rejected') 'rejectedAt': now,
+        'updatedAt': now,
       });
     }
   }
 
   Widget _pendingRequestsSection() {
     if (!_isLeaderHere) return const SizedBox.shrink();
-    return StreamBuilder<List<DocumentSnapshot<Map<String, dynamic>>>>(
-      stream: _pendingRequestsMerged(),
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      key: ValueKey('pending_$_pendingRequestsReloadKey'),
+      future: _fetchPendingRequests(),
       builder: (context, snap) {
         if (snap.connectionState == ConnectionState.waiting) {
           return const Padding(
@@ -352,7 +370,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
               child: ListTile(
                 leading: const Icon(Icons.inbox_outlined),
                 title: const Text('No pending requests'),
-                subtitle: Text('We look for: status=pending and {ministryName=${widget.ministryName} | ministryId/ministryDocId=${widget.ministryId}}'),
+                subtitle: Text(
+                    'We look for: status=pending and {ministryName=${widget.ministryName} | ministryId/ministryDocId=${widget.ministryId}}'),
               ),
             ),
           );
@@ -365,18 +384,22 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
             children: [
               for (final r in items)
                 _JoinRequestTile(
-                  request: r,
+                  requestData: r,
                   onApprove: () async {
-                    await _moderateJoinRequest(r.id, 'approved');
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request approved')));
-                    }
+                    await _moderateJoinRequest(
+                        (r['requestId'] ?? '').toString(), 'approved');
+                    if (!mounted) return;
+                    setState(() => _pendingRequestsReloadKey++);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Request approved')));
                   },
                   onReject: () async {
-                    await _moderateJoinRequest(r.id, 'rejected');
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request rejected')));
-                    }
+                    await _moderateJoinRequest(
+                        (r['requestId'] ?? '').toString(), 'rejected');
+                    if (!mounted) return;
+                    setState(() => _pendingRequestsReloadKey++);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Request rejected')));
                   },
                 ),
             ],
@@ -405,7 +428,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
       _postCtrl.clear();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Post failed: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Post failed: $e')));
       }
     } finally {
       if (mounted) setState(() => _posting = false);
@@ -433,16 +457,22 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
       await post.reference.delete();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Delete failed: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Delete failed: $e')));
       }
     }
   }
 
-  Stream<QuerySnapshot<Map<String, dynamic>>> _commentsStream(DocumentReference<Map<String, dynamic>> postRef) {
-    return postRef.collection('comments').orderBy('createdAt', descending: false).snapshots();
+  Stream<QuerySnapshot<Map<String, dynamic>>> _commentsStream(
+      DocumentReference<Map<String, dynamic>> postRef) {
+    return postRef
+        .collection('comments')
+        .orderBy('createdAt', descending: false)
+        .snapshots();
   }
 
-  Future<void> _addComment(DocumentReference<Map<String, dynamic>> postRef, String text) async {
+  Future<void> _addComment(
+      DocumentReference<Map<String, dynamic>> postRef, String text) async {
     if (text.trim().isEmpty || _uid == null) return;
     await postRef.collection('comments').add({
       'authorId': _uid,
@@ -458,7 +488,10 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
       final memberId = u.data()?['memberId'];
       if (memberId != null) {
         final m = await _db.collection('members').doc(memberId).get();
-        final fullName = (m.data()?['fullName'] ?? '${m.data()?['firstName'] ?? ''} ${m.data()?['lastName'] ?? ''}').toString().trim();
+        final fullName = (m.data()?['fullName'] ??
+                '${m.data()?['firstName'] ?? ''} ${m.data()?['lastName'] ?? ''}')
+            .toString()
+            .trim();
         if (fullName.isNotEmpty) {
           _uidToNameCache[uid] = fullName;
           return fullName;
@@ -487,7 +520,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
         return InkWell(
           onTap: () async {
             final uri = Uri.tryParse(url);
-            if (uri != null) launchUrl(uri, mode: LaunchMode.externalApplication);
+            if (uri != null)
+              launchUrl(uri, mode: LaunchMode.externalApplication);
           },
           child: Card(
             margin: const EdgeInsets.only(top: 8),
@@ -499,20 +533,28 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
                   if (data.imageUrl != null)
                     Padding(
                       padding: const EdgeInsets.only(right: 12),
-                      child: Image.network(data.imageUrl!, width: 72, height: 72, fit: BoxFit.cover),
+                      child: Image.network(data.imageUrl!,
+                          width: 72, height: 72, fit: BoxFit.cover),
                     ),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        if (data.title != null) Text(data.title!, style: const TextStyle(fontWeight: FontWeight.w600)),
-                        if (data.description != null) Padding(
-                          padding: const EdgeInsets.only(top: 4.0),
-                          child: Text(data.description!, maxLines: 3, overflow: TextOverflow.ellipsis),
-                        ),
+                        if (data.title != null)
+                          Text(data.title!,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w600)),
+                        if (data.description != null)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4.0),
+                            child: Text(data.description!,
+                                maxLines: 3, overflow: TextOverflow.ellipsis),
+                          ),
                         Padding(
                           padding: const EdgeInsets.only(top: 6.0),
-                          child: Text(url, style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
+                          child: Text(url,
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.blueGrey)),
                         ),
                       ],
                     ),
@@ -530,11 +572,15 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
     final d = post.data() ?? {};
     final String text = (d['text'] ?? '').toString();
     final String authorId = (d['authorId'] ?? '').toString();
-    final List<String> likes = List<String>.from(d['likes'] ?? const <String>[]);
+    final List<String> likes =
+        List<String>.from(d['likes'] ?? const <String>[]);
     final int likeCount = likes.length;
     final bool iLiked = _uid != null && likes.contains(_uid);
-    final bool canDelete = _uid == authorId || _isLeaderHere || _isAdminOrPastor;
-    final DateTime? createdAt = (d['createdAt'] is Timestamp) ? (d['createdAt'] as Timestamp).toDate() : null;
+    final bool canDelete =
+        _uid == authorId || _isLeaderHere || _isAdminOrPastor;
+    final DateTime? createdAt = (d['createdAt'] is Timestamp)
+        ? (d['createdAt'] as Timestamp).toDate()
+        : null;
     final url = _firstUrl(text);
 
     final postRef = post.reference;
@@ -552,11 +598,19 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
                 final name = snap.data ?? 'Member';
                 return Row(
                   children: [
-                    CircleAvatar(radius: 14, child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
+                    CircleAvatar(
+                        radius: 14,
+                        child: Text(
+                            name.isNotEmpty ? name[0].toUpperCase() : '?')),
                     const SizedBox(width: 8),
-                    Expanded(child: Text(name, style: const TextStyle(fontWeight: FontWeight.w600))),
+                    Expanded(
+                        child: Text(name,
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w600))),
                     if (createdAt != null)
-                      Text(DateFormat('dd MMM, HH:mm').format(createdAt), style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                      Text(DateFormat('dd MMM, HH:mm').format(createdAt),
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.grey)),
                     if (canDelete)
                       IconButton(
                         icon: const Icon(Icons.delete_outline),
@@ -567,10 +621,11 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
                 );
               },
             ),
-            if (text.isNotEmpty) Padding(
-              padding: const EdgeInsets.only(top: 8.0),
-              child: Text(text),
-            ),
+            if (text.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8.0),
+                child: Text(text),
+              ),
             if (url != null) _linkPreview(url),
             Row(
               children: [
@@ -592,7 +647,8 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
                   children: [
                     for (final c in docs)
                       FutureBuilder<String>(
-                        future: _displayNameForUid((c['authorId'] ?? '').toString()),
+                        future: _displayNameForUid(
+                            (c['authorId'] ?? '').toString()),
                         builder: (context, s) {
                           final name = s.data ?? 'Member';
                           final txt = (c['text'] ?? '').toString();
@@ -601,13 +657,21 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
                             child: Row(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                CircleAvatar(radius: 12, child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
+                                CircleAvatar(
+                                    radius: 12,
+                                    child: Text(name.isNotEmpty
+                                        ? name[0].toUpperCase()
+                                        : '?')),
                                 const SizedBox(width: 8),
-                                Expanded(child: RichText(
+                                Expanded(
+                                    child: RichText(
                                   text: TextSpan(
                                     style: DefaultTextStyle.of(context).style,
                                     children: [
-                                      TextSpan(text: '$name ', style: const TextStyle(fontWeight: FontWeight.w600)),
+                                      TextSpan(
+                                          text: '$name ',
+                                          style: const TextStyle(
+                                              fontWeight: FontWeight.w600)),
                                       TextSpan(text: txt),
                                     ],
                                   ),
@@ -656,11 +720,13 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
                       return const Center(child: CircularProgressIndicator());
                     }
                     final members = snap.data ?? const <MemberModel>[];
-                    if (members.isEmpty) return const Center(child: Text('No members yet.'));
+                    if (members.isEmpty)
+                      return const Center(child: Text('No members yet.'));
                     return ListView.separated(
                       itemCount: members.length,
                       separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (context, i) => _memberTileFromModel(members[i]),
+                      itemBuilder: (context, i) =>
+                          _memberTileFromModel(members[i]),
                     );
                   },
                 ),
@@ -698,14 +764,17 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
               const Divider(height: 1),
               Expanded(
                 child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                  stream: _postsCol.orderBy('createdAt', descending: true).snapshots(),
+                  stream: _postsCol
+                      .orderBy('createdAt', descending: true)
+                      .snapshots(),
                   builder: (context, snap) {
                     if (!snap.hasData) {
                       return const Center(child: CircularProgressIndicator());
                     }
                     final docs = snap.data!.docs;
                     if (docs.isEmpty) {
-                      return const Center(child: Text('No posts yet. Be the first!'));
+                      return const Center(
+                          child: Text('No posts yet. Be the first!'));
                     }
                     return ListView.builder(
                       itemCount: docs.length,
@@ -723,20 +792,29 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage> with SingleTi
 }
 
 class _JoinRequestTile extends StatelessWidget {
-  final DocumentSnapshot<Map<String, dynamic>> request;
+  final Map<String, dynamic> requestData;
   final Future<void> Function() onApprove;
   final Future<void> Function() onReject;
 
   const _JoinRequestTile({
-    required this.request,
+    required this.requestData,
     required this.onApprove,
     required this.onReject,
   });
 
   Future<Map<String, String>> _memberBasics(String memberId) async {
-    final m = await FirebaseFirestore.instance.collection('members').doc(memberId).get();
+    if (memberId.isEmpty) {
+      return {'name': 'Member', 'email': '', 'phone': ''};
+    }
+    final m = await FirebaseFirestore.instance
+        .collection('members')
+        .doc(memberId)
+        .get();
     final d = m.data() ?? {};
-    final full = (d['fullName'] ?? '${d['firstName'] ?? ''} ${d['lastName'] ?? ''}').toString().trim();
+    final full =
+        (d['fullName'] ?? '${d['firstName'] ?? ''} ${d['lastName'] ?? ''}')
+            .toString()
+            .trim();
     final email = (d['email'] ?? '').toString().trim();
     final phone = (d['phoneNumber'] ?? d['phone'] ?? '').toString().trim();
     return {
@@ -762,9 +840,15 @@ class _JoinRequestTile extends StatelessWidget {
             children: [
               Row(
                 children: [
-                  CircleAvatar(radius: 18, child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
+                  CircleAvatar(
+                      radius: 18,
+                      child:
+                          Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
                   const SizedBox(width: 12),
-                  Expanded(child: Text(name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600))),
+                  Expanded(
+                      child: Text(name,
+                          style: const TextStyle(
+                              fontSize: 18, fontWeight: FontWeight.w600))),
                 ],
               ),
               const SizedBox(height: 12),
@@ -798,7 +882,9 @@ class _JoinRequestTile extends StatelessWidget {
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
-                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
+                  TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('Close')),
                 ],
               ),
             ],
@@ -810,44 +896,62 @@ class _JoinRequestTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final d = request.data() ?? {};
+    final d = requestData;
     final String memberId = (d['memberId'] ?? '').toString();
-    final DateTime? when = (d['requestedAt'] is Timestamp) ? (d['requestedAt'] as Timestamp).toDate() : null;
-    final String whenStr = when != null ? DateFormat('dd MMM, HH:mm').format(when) : '';
+    DateTime? when;
+    if (d['requestedAt'] is Timestamp) {
+      when = (d['requestedAt'] as Timestamp).toDate();
+    } else if (d['requestedAtMs'] is num) {
+      when = DateTime.fromMillisecondsSinceEpoch(
+          (d['requestedAtMs'] as num).toInt());
+    }
+    final String whenStr =
+        when != null ? DateFormat('dd MMM, HH:mm').format(when) : '';
 
     return FutureBuilder<Map<String, String>>(
       future: _memberBasics(memberId),
       builder: (context, snap) {
-        final name = (snap.data?['name'] ?? 'Member');
+        final nameFromRequest = (d['requesterName'] ?? '').toString().trim();
+        final name = nameFromRequest.isNotEmpty
+            ? nameFromRequest
+            : (snap.data?['name'] ?? 'Member');
         final email = (snap.data?['email'] ?? '');
         final phone = (snap.data?['phone'] ?? '');
 
         return ListTile(
-          leading: CircleAvatar(child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
-          title: Text(name),
+          leading: CircleAvatar(
+              child: Text(name.isNotEmpty ? name[0].toUpperCase() : '?')),
+          title: Text(
+            name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
           subtitle: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(whenStr.isNotEmpty ? 'Requested • $whenStr' : 'Requested'),
-              if (email.isNotEmpty) Text(email, style: const TextStyle(fontSize: 12)),
-              if (phone.isNotEmpty) Text(phone, style: const TextStyle(fontSize: 12)),
+              if (email.isNotEmpty)
+                Text(email, style: const TextStyle(fontSize: 12)),
+              if (phone.isNotEmpty)
+                Text(phone, style: const TextStyle(fontSize: 12)),
             ],
           ),
           isThreeLine: email.isNotEmpty || phone.isNotEmpty,
-          trailing: Wrap(
-            spacing: 8,
+          onTap: snap.hasData
+              ? () => _showProfileSheet(context, snap.data!)
+              : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              TextButton(
-                onPressed: snap.hasData ? () => _showProfileSheet(context, snap.data!) : null,
-                child: const Text('Profile'),
-              ),
-              OutlinedButton(
+              IconButton(
+                tooltip: 'Decline',
                 onPressed: onReject,
-                child: const Text('Decline'),
+                icon: const Icon(Icons.close_rounded, color: Colors.red),
               ),
-              FilledButton(
+              IconButton(
+                tooltip: 'Accept',
                 onPressed: onApprove,
-                child: const Text('Accept'),
+                icon: const Icon(Icons.check_rounded, color: Colors.green),
               ),
             ],
           ),
@@ -912,12 +1016,5 @@ class _CommentComposerState extends State<_CommentComposer> {
         ],
       ),
     );
-  }
-}
-
-extension _CombineExt<T> on Stream<T> {
-  Stream<List<T>> combineLatestAll(List<Stream<T>> others) {
-    final streams = <Stream<T>>[this, ...others];
-    return StreamZip<T>(streams).asBroadcastStream();
   }
 }

@@ -1,8 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:html/parser.dart' as html_parser;
+import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class EventsPage extends StatefulWidget {
   const EventsPage({super.key});
@@ -14,390 +20,690 @@ class EventsPage extends StatefulWidget {
 class _EventsPageState extends State<EventsPage> {
   final _auth = FirebaseAuth.instance;
   final _db = FirebaseFirestore.instance;
+  final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
 
-  // UI state
-  String _search = '';
-  final _searchCtrl = TextEditingController();
-  Timer? _debounce;
-  String _scope = 'Upcoming'; // Upcoming | Past
-  String _visibility = 'All'; // All | Church-wide | My ministries
-
-  // Role state
+  String? _uid;
   bool _isAdmin = false;
+  bool _isPastor = false;
   bool _isLeader = false;
   Set<String> _leadershipMinistries = {};
-  String? _uid;
+
+  Future<List<_UiEvent>>? _externalFuture;
+
+  bool get _canCreate => _isAdmin || _isPastor || _isLeader;
 
   @override
   void initState() {
     super.initState();
     _uid = _auth.currentUser?.uid;
+    _externalFuture = _fetchGracepointEvents();
     _primeRole();
-    _searchCtrl.addListener(_onSearchChanged);
-  }
-
-  @override
-  void dispose() {
-    _searchCtrl.removeListener(_onSearchChanged);
-    _searchCtrl.dispose();
-    _debounce?.cancel();
-    super.dispose();
-  }
-
-  void _onSearchChanged() {
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 250), () {
-      setState(() => _search = _searchCtrl.text.trim().toLowerCase());
-    });
   }
 
   Future<void> _primeRole() async {
     final uid = _uid;
     if (uid == null) return;
 
+    final token = await _auth.currentUser?.getIdTokenResult(true);
+    final claims = token?.claims ?? const <String, dynamic>{};
+
     final userDoc = await _db.collection('users').doc(uid).get();
-    final user = userDoc.data() ?? {};
-    final roles = List<String>.from(user['roles'] ?? const []);
-    final memberId = user['memberId'] as String?;
+    final user = userDoc.data() ?? const <String, dynamic>{};
+    final role = (user['role'] ?? '').toString().toLowerCase().trim();
+    final roles = (user['roles'] is List)
+        ? List<String>.from(
+            (user['roles'] as List).map((e) => e.toString().toLowerCase()))
+        : const <String>[];
+    final memberId = (user['memberId'] ?? '').toString();
+    final leadsFromUser = (user['leadershipMinistries'] is List)
+        ? List<String>.from(
+            (user['leadershipMinistries'] as List).map((e) => e.toString()))
+        : const <String>[];
 
-    bool isAdmin = roles.contains('admin');
-    bool isLeader = roles.contains('leader');
-    final fromUsers = List<String>.from(user['leadershipMinistries'] ?? const []);
-    final ministries = <String>{...fromUsers};
+    bool isAdmin = role == 'admin' ||
+        roles.contains('admin') ||
+        user['isAdmin'] == true ||
+        user['admin'] == true ||
+        claims['isAdmin'] == true ||
+        claims['admin'] == true;
+    bool isPastor = role == 'pastor' ||
+        roles.contains('pastor') ||
+        user['isPastor'] == true ||
+        user['pastor'] == true ||
+        claims['isPastor'] == true ||
+        claims['pastor'] == true;
+    bool isLeader = role == 'leader' ||
+        roles.contains('leader') ||
+        user['isLeader'] == true ||
+        user['leader'] == true ||
+        claims['isLeader'] == true ||
+        claims['leader'] == true ||
+        leadsFromUser.isNotEmpty;
 
-    if (memberId != null) {
-      final memDoc = await _db.collection('members').doc(memberId).get();
-      final mem = memDoc.data() ?? {};
-      final fromMembers = List<String>.from(mem['leadershipMinistries'] ?? const []);
-      ministries.addAll(fromMembers);
-      if (!isAdmin && fromMembers.isNotEmpty) isLeader = true;
+    final leadership = <String>{...leadsFromUser};
+
+    if (memberId.isNotEmpty) {
+      final memberDoc = await _db.collection('members').doc(memberId).get();
+      final member = memberDoc.data() ?? const <String, dynamic>{};
+      final mRoles = (member['roles'] is List)
+          ? List<String>.from(
+              (member['roles'] as List).map((e) => e.toString().toLowerCase()))
+          : const <String>[];
+      final mLeads = (member['leadershipMinistries'] is List)
+          ? List<String>.from(
+              (member['leadershipMinistries'] as List).map((e) => e.toString()))
+          : const <String>[];
+      leadership.addAll(mLeads);
+      if (mRoles.contains('admin')) isAdmin = true;
+      if (mRoles.contains('pastor') || member['isPastor'] == true)
+        isPastor = true;
+      if (mRoles.contains('leader') || mLeads.isNotEmpty) isLeader = true;
     }
 
+    if (!mounted) return;
     setState(() {
       _isAdmin = isAdmin;
-      _isLeader = isLeader;
-      _leadershipMinistries = ministries;
+      _isPastor = isPastor;
+      _isLeader = isLeader || isAdmin || isPastor;
+      _leadershipMinistries = leadership;
     });
   }
 
-  // ======== Queries ========
+  Stream<List<_UiEvent>> _upcomingLocalEvents() {
+    return _db.collection('events').limit(500).snapshots().map((snap) {
+      final now = DateTime.now();
+      final all = snap.docs.map(_fromFirestore).toList();
+      final upcoming = all.where((e) {
+        final start = e.startDate;
+        if (start == null) return true;
+        return !start.isBefore(DateTime(now.year, now.month, now.day));
+      }).toList();
+      upcoming.sort((a, b) => (a.startDate ?? DateTime(1900))
+          .compareTo(b.startDate ?? DateTime(1900)));
+      return upcoming;
+    });
+  }
 
-  Stream<QuerySnapshot<Map<String, dynamic>>> _eventsStream() {
-    final now = Timestamp.now();
-    Query<Map<String, dynamic>> q = _db.collection('events').withConverter<Map<String, dynamic>>(
-      fromFirestore: (s, _) => s.data() ?? {},
-      toFirestore: (m, _) => m,
+  _UiEvent _fromFirestore(DocumentSnapshot<Map<String, dynamic>> d) {
+    final e = d.data() ?? const <String, dynamic>{};
+    final start = _coerceDate(
+      e['startDate'] ?? e['date'] ?? e['eventDate'] ?? e['scheduledAt'],
     );
+    final end = _coerceDate(e['endDate']);
+    return _UiEvent(
+      id: d.id,
+      title: (e['title'] ?? 'Untitled event').toString(),
+      description: (e['description'] ?? '').toString(),
+      startDate: start,
+      endDate: end,
+      location: (e['location'] ?? '').toString(),
+      ministryId: (e['ministryId'] ?? '').toString(),
+      source: _EventSource.local,
+      link: null,
+    );
+  }
 
-    // Time scope
-    if (_scope == 'Upcoming') {
-      q = q.where('startDate', isGreaterThanOrEqualTo: now).orderBy('startDate');
-    } else {
-      q = q.where('startDate', isLessThan: now).orderBy('startDate', descending: true);
-    }
+  DateTime? _coerceDate(dynamic v) {
+    if (v == null) return null;
+    if (v is Timestamp) return v.toDate();
+    if (v is DateTime) return v;
+    if (v is int) return DateTime.fromMillisecondsSinceEpoch(v);
+    if (v is String) return _tryParseDate(v);
+    return null;
+  }
 
-    // Visibility scope
-    if (_visibility == 'Church-wide') {
-      // church-wide => ministryId missing/empty
-      q = q.where('ministryId', whereIn: [null, '']).limit(50);
-    } else if (_visibility == 'My ministries') {
-      // leaders/members: ministryId is one of my leadership ministries (leaders) OR membership
-      // Here we filter by leadership for management focus. If you want membership, pass your list here.
-      final list = _leadershipMinistries.toList();
-      if (list.isEmpty) {
-        // nothing to show if no ministries
-        q = q.where('ministryId', isEqualTo: '__none__'); // will produce zero results
-      } else {
-        // Firestore whereIn max 10 items — split if needed
-        final slice = list.take(10).toList();
-        q = q.where('ministryId', whereIn: slice);
+  Future<List<_UiEvent>> _fetchGracepointEvents() async {
+    try {
+      final fromCallable = await _fetchGracepointEventsViaCallable();
+      if (fromCallable.isNotEmpty) return fromCallable;
+
+      final out = <_UiEvent>[];
+      out.addAll(await _fetchGracepointEventsFromApi());
+      final pages = <String>[
+        'https://gracepointuk.com/',
+        'https://gracepointuk.com/events/',
+        'https://gracepointuk.com/events-calendar/',
+      ];
+      final eventLinks = <String>{};
+
+      for (final page in pages) {
+        final res = await http.get(
+          Uri.parse(page),
+          headers: const {
+            'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)',
+            'Accept':
+                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        );
+        if (res.statusCode < 200 || res.statusCode >= 300) continue;
+
+        final doc = html_parser.parse(res.body);
+        final scripts =
+            doc.querySelectorAll('script[type="application/ld+json"]');
+        for (final s in scripts) {
+          final raw = s.text.trim();
+          if (raw.isEmpty) continue;
+          try {
+            final parsed = jsonDecode(raw);
+            _collectJsonLdEvents(parsed, out);
+          } catch (_) {}
+        }
+
+        final anchors =
+            doc.querySelectorAll('a[href*="?event="], a[href*="&event="]');
+        for (final a in anchors) {
+          final resolved = _resolveGracepointUrl(a.attributes['href'] ?? '');
+          if (resolved != null) eventLinks.add(resolved);
+        }
       }
-    } else {
-      // All: no extra filter
-      q = q.limit(50);
+
+      for (final url in eventLinks.take(24)) {
+        final item = await _parseGracepointEventDetail(url);
+        if (item != null) out.add(item);
+      }
+
+      if (out.isEmpty) {
+        final links = await _discoverGracepointEventLinksFromSitemap();
+        for (final url in links.take(30)) {
+          final item = await _parseGracepointEventDetail(url);
+          if (item != null) out.add(item);
+        }
+      }
+
+      final cutoff = DateTime.now().subtract(const Duration(days: 1));
+      final filtered = out
+          .where((e) => e.startDate == null || e.startDate!.isAfter(cutoff))
+          .toList();
+      filtered.sort((a, b) {
+        final ad =
+            a.startDate ?? DateTime.now().add(const Duration(days: 36500));
+        final bd =
+            b.startDate ?? DateTime.now().add(const Duration(days: 36500));
+        return ad.compareTo(bd);
+      });
+      return filtered;
+    } catch (_) {
+      return const <_UiEvent>[];
+    }
+  }
+
+  Future<List<_UiEvent>> _fetchGracepointEventsViaCallable() async {
+    try {
+      final res = await _functions.httpsCallable('getGracepointEvents').call();
+      final data = (res.data is Map)
+          ? Map<String, dynamic>.from(res.data as Map)
+          : <String, dynamic>{};
+      final list = (data['items'] is List)
+          ? List<Map<String, dynamic>>.from(
+              (data['items'] as List)
+                  .map((e) => Map<String, dynamic>.from(e as Map)),
+            )
+          : const <Map<String, dynamic>>[];
+      return list
+          .map((e) {
+            final start = _coerceDate(e['startDateIso']);
+            return _UiEvent(
+              id: (e['id'] ?? '').toString(),
+              title: (e['title'] ?? '').toString(),
+              description: (e['description'] ?? '').toString(),
+              startDate: start,
+              endDate: _coerceDate(e['endDateIso']),
+              location: (e['location'] ?? '').toString(),
+              ministryId: '',
+              source: _EventSource.external,
+              link: (e['link'] ?? '').toString().trim().isEmpty
+                  ? null
+                  : (e['link'] ?? '').toString().trim(),
+            );
+          })
+          .where((e) => e.title.trim().isNotEmpty && e.startDate != null)
+          .toList();
+    } catch (_) {
+      return const <_UiEvent>[];
+    }
+  }
+
+  Future<List<_UiEvent>> _fetchGracepointEventsFromApi() async {
+    final out = <_UiEvent>[];
+    final endpoints = <String>[
+      'https://gracepointuk.com/wp-json/tribe/events/v1/events',
+      'https://gracepointuk.com/wp-json/wp/v2/tribe_events?per_page=100',
+      'https://gracepointuk.com/wp-json/wp/v2/events?per_page=100',
+    ];
+
+    for (final url in endpoints) {
+      try {
+        final res = await http.get(
+          Uri.parse(url),
+          headers: const {
+            'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)',
+            'Accept': 'application/json,text/plain,*/*',
+          },
+        );
+        if (res.statusCode < 200 || res.statusCode >= 300) continue;
+        final body = jsonDecode(res.body);
+
+        if (body is Map && body['events'] is List) {
+          for (final raw in body['events'] as List) {
+            if (raw is! Map) continue;
+            final title = _wpTitle(raw['title']);
+            final start = _coerceDate(
+                raw['start_date'] ?? raw['startDate'] ?? raw['date']);
+            if (title.isEmpty || start == null) continue;
+            out.add(_UiEvent(
+              id: 'ext_${title.hashCode}_${start.millisecondsSinceEpoch}',
+              title: title,
+              description: _wpText(raw['description']),
+              startDate: start,
+              endDate: _coerceDate(raw['end_date'] ?? raw['endDate']),
+              location: _wpText(raw['venue']),
+              ministryId: '',
+              source: _EventSource.external,
+              link: _wpText(raw['url']),
+            ));
+          }
+        } else if (body is List) {
+          for (final raw in body) {
+            if (raw is! Map) continue;
+            final title = _wpTitle(raw['title']);
+            final start = _coerceDate(
+                raw['start_date'] ?? raw['date'] ?? raw['startDate']);
+            if (title.isEmpty || start == null) continue;
+            out.add(_UiEvent(
+              id: 'ext_${title.hashCode}_${start.millisecondsSinceEpoch}',
+              title: title,
+              description: _wpText(raw['excerpt']) + _wpText(raw['content']),
+              startDate: start,
+              endDate: _coerceDate(raw['end_date'] ?? raw['endDate']),
+              location: '',
+              ministryId: '',
+              source: _EventSource.external,
+              link: _wpText(raw['link']),
+            ));
+          }
+        }
+      } catch (_) {}
     }
 
-    return q.snapshots();
+    return out;
   }
 
-  // ======== Permissions helpers (must match your rules) ========
-
-  bool _canManageEvent(Map<String, dynamic> e) {
-    if (_isAdmin) return true;
-    if (!_isLeader) return false;
-    final mid = (e['ministryId'] ?? '') as String;
-    // Leaders can manage BOTH church-wide (empty) and their ministries
-    return mid.isEmpty || _leadershipMinistries.contains(mid);
+  String _wpTitle(dynamic value) {
+    if (value is Map) {
+      return _wpText(value['rendered']).trim();
+    }
+    return _wpText(value).trim();
   }
 
-  bool _canCreate() => _isAdmin || _isLeader;
-
-  // ======== RSVP ========
-
-  Stream<int> _rsvpCount(String eventId) {
-    return _db
-        .collection('event_rsvps')
-        .where('eventId', isEqualTo: eventId)
-        .snapshots()
-        .map((snap) => snap.size);
+  String _wpText(dynamic value) {
+    final raw = (value ?? '').toString().trim();
+    if (raw.isEmpty) return '';
+    try {
+      return html_parser.parse(raw).body?.text.trim() ?? raw;
+    } catch (_) {
+      return raw;
+    }
   }
 
-  Stream<bool> _myRsvped(String eventId) {
-    final uid = _uid;
-    if (uid == null) return const Stream<bool>.empty();
-    final id = '$eventId-$uid';
-    return _db.collection('event_rsvps').doc(id).snapshots().map((d) => d.exists);
+  void _collectJsonLdEvents(dynamic node, List<_UiEvent> out) {
+    if (node is List) {
+      for (final n in node) {
+        _collectJsonLdEvents(n, out);
+      }
+      return;
+    }
+    if (node is! Map) return;
+
+    final type = (node['@type'] ?? '').toString().toLowerCase();
+    if (type == 'event') {
+      final title = (node['name'] ?? '').toString().trim();
+      final startRaw = (node['startDate'] ?? '').toString().trim();
+      final start = _tryParseDate(startRaw);
+      if (title.isNotEmpty && start != null) {
+        final location = node['location'] is Map
+            ? ((node['location']['name'] ?? '').toString())
+            : '';
+        final link = (node['url'] ?? '').toString().trim();
+        out.add(_UiEvent(
+          id: 'ext_${title.hashCode}_${start.millisecondsSinceEpoch}',
+          title: title,
+          description: (node['description'] ?? '').toString(),
+          startDate: start,
+          endDate: _tryParseDate((node['endDate'] ?? '').toString()),
+          location: location,
+          ministryId: '',
+          source: _EventSource.external,
+          link: link.isEmpty ? null : link,
+        ));
+      }
+    }
+
+    for (final v in node.values) {
+      _collectJsonLdEvents(v, out);
+    }
   }
 
-  Future<void> _toggleRsvp(String eventId, bool on) async {
-    final uid = _uid;
-    if (uid == null) return;
-    final id = '$eventId-$uid';
-    final ref = _db.collection('event_rsvps').doc(id);
-    if (on) {
-      await ref.set(
-        {
-          'eventId': eventId,
-          'userId': uid,
-          'status': 'going',
-          'createdAt': FieldValue.serverTimestamp(),
-          'updatedAt': FieldValue.serverTimestamp(),
+  DateTime? _tryParseDate(String raw) {
+    if (raw.trim().isEmpty) return null;
+    final clean =
+        raw.replaceAll('\n', ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+    final iso = DateTime.tryParse(clean);
+    if (iso != null) return iso;
+
+    const fmts = <String>[
+      'd MMM yyyy',
+      'dd MMM yyyy',
+      'd MMMM yyyy',
+      'dd MMMM yyyy',
+      'MMM d, yyyy',
+      'MMMM d, yyyy',
+      'EEE, d MMM yyyy',
+      'EEEE, d MMMM yyyy',
+    ];
+    for (final f in fmts) {
+      try {
+        return DateFormat(f).parseLoose(clean);
+      } catch (_) {}
+    }
+    final isoChunk =
+        RegExp(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})').firstMatch(clean);
+    if (isoChunk != null) {
+      return DateTime.tryParse(isoChunk.group(1)!.replaceFirst(' ', 'T'));
+    }
+    return null;
+  }
+
+  String? _resolveGracepointUrl(String href) {
+    final h = href.trim();
+    if (h.isEmpty) return null;
+    if (h.startsWith('http://') || h.startsWith('https://')) return h;
+    if (h.startsWith('/')) return 'https://gracepointuk.com$h';
+    if (h.startsWith('?')) return 'https://gracepointuk.com/$h';
+    return 'https://gracepointuk.com/$h';
+  }
+
+  Future<_UiEvent?> _parseGracepointEventDetail(String url) async {
+    try {
+      final res = await http.get(
+        Uri.parse(url),
+        headers: const {
+          'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)',
+          'Accept':
+              'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-        SetOptions(merge: true),
       );
-    } else {
-      await ref.delete();
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final doc = html_parser.parse(res.body);
+      final text = doc.body?.text ?? '';
+
+      final title =
+          (doc.querySelector('h1, h2, .entry-title')?.text ?? '').trim();
+      if (title.isEmpty) return null;
+
+      DateTime? start = _tryParseDate(text);
+      final isoWrapped =
+          RegExp(r'`(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})`').firstMatch(text);
+      if (isoWrapped != null) {
+        start ??=
+            DateTime.tryParse(isoWrapped.group(1)!.replaceFirst(' ', 'T'));
+      }
+      if (start == null) return null;
+
+      final location = (doc
+                  .querySelector(
+                      '.event-location, .location, .tribe-events-venue-details')
+                  ?.text ??
+              '')
+          .trim();
+      final description = (doc
+                  .querySelector(
+                      'p, .entry-summary, .tribe-events-single-event-description')
+                  ?.text ??
+              '')
+          .trim();
+
+      return _UiEvent(
+        id: 'ext_${title.hashCode}_${start.millisecondsSinceEpoch}',
+        title: title,
+        description: description,
+        startDate: start,
+        endDate: null,
+        location: location,
+        ministryId: '',
+        source: _EventSource.external,
+        link: url,
+      );
+    } catch (_) {
+      return null;
     }
   }
 
-  // ======== Create / Edit / Delete ========
+  Future<List<String>> _discoverGracepointEventLinksFromSitemap() async {
+    final found = <String>{};
+    final roots = <String>[
+      'https://gracepointuk.com/sitemap_index.xml',
+      'https://gracepointuk.com/wp-sitemap.xml',
+    ];
 
-  Future<void> _deleteEvent(String eventId) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Delete event?'),
-        content: const Text('This action cannot be undone.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    await _db.collection('events').doc(eventId).delete();
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Event deleted')));
+    for (final root in roots) {
+      try {
+        final res = await http.get(
+          Uri.parse(root),
+          headers: const {'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)'},
+        );
+        if (res.statusCode < 200 || res.statusCode >= 300) continue;
+        final locs = RegExp(r'<loc>(.*?)</loc>', caseSensitive: false)
+            .allMatches(res.body)
+            .map((m) => m.group(1)?.trim() ?? '')
+            .where((s) => s.isNotEmpty)
+            .toList();
+
+        for (final loc in locs) {
+          if (loc.contains('?event=')) {
+            found.add(loc);
+            continue;
+          }
+          if (!loc.endsWith('.xml')) continue;
+          try {
+            final child = await http.get(
+              Uri.parse(loc),
+              headers: const {'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)'},
+            );
+            if (child.statusCode < 200 || child.statusCode >= 300) continue;
+            final childLocs = RegExp(r'<loc>(.*?)</loc>', caseSensitive: false)
+                .allMatches(child.body)
+                .map((m) => m.group(1)?.trim() ?? '')
+                .where((s) => s.contains('?event='))
+                .toList();
+            found.addAll(childLocs);
+          } catch (_) {}
+        }
+      } catch (_) {}
     }
+    return found.toList();
   }
 
-  Future<void> _openEditor({DocumentSnapshot<Map<String, dynamic>>? doc}) async {
-    final data = doc?.data();
+  List<_UiEvent> _mergeAndDedupe(
+      List<_UiEvent> local, List<_UiEvent> external) {
+    final map = <String, _UiEvent>{};
+
+    // Local first so it wins when duplicate appears on external site.
+    for (final e in [...local, ...external]) {
+      final k = _eventKey(e);
+      map.putIfAbsent(k, () => e);
+    }
+
+    final all = map.values.toList();
+    all.sort((a, b) {
+      final ad = a.startDate ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final bd = b.startDate ?? DateTime.fromMillisecondsSinceEpoch(0);
+      return ad.compareTo(bd);
+    });
+    return all;
+  }
+
+  String _eventKey(_UiEvent e) {
+    final title = e.title.toLowerCase().trim();
+    final day = e.startDate == null
+        ? 'no-date'
+        : DateFormat('yyyy-MM-dd').format(e.startDate!);
+    return '$title|$day';
+  }
+
+  Future<void> _openCreator() async {
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (_) => EventEditorSheet(
-        existing: data,
-        docId: doc?.id,
-        isAdmin: _isAdmin,
-        isLeader: _isLeader,
+      builder: (_) => _CreateEventSheet(
+        canChurchWide: _isAdmin || _isPastor,
         leadershipMinistries: _leadershipMinistries.toList()..sort(),
       ),
     );
   }
 
-  // ======== UI ========
+  Future<void> _openLink(String? url) async {
+    final u = (url ?? '').trim();
+    if (u.isEmpty) return;
+    final uri = Uri.tryParse(u);
+    if (uri == null) return;
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Events'),
-        actions: [
-          PopupMenuButton<String>(
-            initialValue: _scope,
-            onSelected: (v) => setState(() => _scope = v),
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'Upcoming', child: Text('Upcoming')),
-              PopupMenuItem(value: 'Past', child: Text('Past')),
-            ],
-            icon: const Icon(Icons.schedule),
-            tooltip: 'Time',
-          ),
-          PopupMenuButton<String>(
-            initialValue: _visibility,
-            onSelected: (v) => setState(() => _visibility = v),
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'All', child: Text('All')),
-              PopupMenuItem(value: 'Church-wide', child: Text('Church-wide')),
-              PopupMenuItem(value: 'My ministries', child: Text('My ministries')),
-            ],
-            icon: const Icon(Icons.filter_alt),
-            tooltip: 'Scope',
-          ),
-        ],
-      ),
-      floatingActionButton: _canCreate()
+      appBar: AppBar(title: const Text('Upcoming Events')),
+      floatingActionButton: _canCreate
           ? FloatingActionButton.extended(
-        onPressed: () => _openEditor(),
-        icon: const Icon(Icons.add),
-        label: const Text('New event'),
-      )
+              onPressed: _openCreator,
+              icon: const Icon(Icons.add),
+              label: const Text('Create Event'),
+            )
           : null,
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-            child: TextField(
-              controller: _searchCtrl,
-              decoration: InputDecoration(
-                prefixIcon: const Icon(Icons.search),
-                hintText: 'Search by title or description…',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
-              ),
-            ),
-          ),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: _eventsStream(),
-              builder: (context, snap) {
-                if (snap.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
+      body: RefreshIndicator(
+        onRefresh: () async {
+          await _primeRole();
+          setState(() => _externalFuture = _fetchGracepointEvents());
+        },
+        child: StreamBuilder<List<_UiEvent>>(
+          stream: _upcomingLocalEvents(),
+          builder: (context, localSnap) {
+            if (localSnap.connectionState == ConnectionState.waiting) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final local = localSnap.data ?? const <_UiEvent>[];
+            return FutureBuilder<List<_UiEvent>>(
+              future: _externalFuture,
+              builder: (context, extSnap) {
+                final external = extSnap.data ?? const <_UiEvent>[];
+                final events = _mergeAndDedupe(local, external);
+
+                if (events.isEmpty) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('No upcoming events.'),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Local: ${local.length} • Gracepoint: ${external.length}',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Pull down to refresh.',
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
                 }
-                final docs = (snap.data?.docs ?? []).where((d) {
-                  if (_search.isEmpty) return true;
-                  final m = d.data();
-                  final t = (m['title'] ?? '').toString().toLowerCase();
-                  final desc = (m['description'] ?? '').toString().toLowerCase();
-                  final where = '$t $desc';
-                  return where.contains(_search);
-                }).toList();
 
-                if (docs.isEmpty) {
-                  return const Center(child: Text('No events found.'));
-                }
-
-                return ListView.separated(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                  itemCount: docs.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 10),
-                  itemBuilder: (context, i) {
-                    final d = docs[i];
-                    final e = d.data();
-                    final title = (e['title'] ?? 'Untitled').toString();
-                    final start = (e['startDate'] as Timestamp?)?.toDate();
-                    final end = (e['endDate'] as Timestamp?)?.toDate();
-                    final loc = (e['location'] ?? '').toString();
-                    final desc = (e['description'] ?? '').toString();
-                    final ministryId = (e['ministryId'] ?? '') as String; // '' => Church-wide
-                    final canManage = _canManageEvent(e);
-
-                    return Card(
-                      elevation: 2,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                return GridView.builder(
+                  padding: const EdgeInsets.all(14),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 12,
+                    childAspectRatio: 0.86,
+                  ),
+                  itemCount: events.length,
+                  itemBuilder: (_, i) {
+                    final e = events[i];
+                    final dateStr = e.startDate == null
+                        ? 'Date TBC'
+                        : DateFormat('EEE, d MMM • h:mm a')
+                            .format(e.startDate!.toLocal());
+                    final sourceLabel = e.source == _EventSource.local
+                        ? 'Church App'
+                        : 'Gracepoint UK';
+                    return InkWell(
+                      borderRadius: BorderRadius.circular(14),
+                      onTap: e.source == _EventSource.external
+                          ? () => _openLink(e.link)
+                          : null,
+                      child: Ink(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(14),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.06),
+                              blurRadius: 10,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                        padding: const EdgeInsets.all(12),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            // Title + badges + actions
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(title,
-                                          style: const TextStyle(
-                                              fontSize: 16, fontWeight: FontWeight.w700)),
-                                      const SizedBox(height: 4),
-                                      Wrap(
-                                        spacing: 8,
-                                        runSpacing: 6,
-                                        children: [
-                                          _Badge(
-                                            icon: Icons.schedule,
-                                            label: start != null
-                                                ? _fmtDateRange(start, end)
-                                                : 'Date TBC',
-                                          ),
-                                          if (loc.isNotEmpty)
-                                            _Badge(icon: Icons.place_outlined, label: loc),
-                                          Chip(
-                                            label: Text(
-                                              ministryId.isEmpty ? 'Church-wide' : ministryId,
-                                              style: TextStyle(
-                                                fontWeight: ministryId.isEmpty ? FontWeight.w700 : FontWeight.w600,
-                                              ),
-                                            ),
-                                            avatar: Icon(
-                                              ministryId.isEmpty
-                                                  ? Icons.public
-                                                  : Icons.groups_2_outlined,
-                                              size: 18,
-                                            ),
-                                            backgroundColor: ministryId.isEmpty
-                                                ? Colors.indigo.shade50
-                                                : Colors.teal.shade50,
-                                            shape: RoundedRectangleBorder(
-                                              borderRadius: BorderRadius.circular(16),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                if (canManage)
-                                  Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      IconButton(
-                                        tooltip: 'Edit',
-                                        onPressed: () => _openEditor(doc: d),
-                                        icon: const Icon(Icons.edit),
-                                      ),
-                                      IconButton(
-                                        tooltip: 'Delete',
-                                        onPressed: () => _deleteEvent(d.id),
-                                        icon: const Icon(Icons.delete_outline),
-                                      ),
-                                    ],
-                                  ),
-                              ],
+                            Text(
+                              e.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.w700, fontSize: 15),
                             ),
-                            if (desc.isNotEmpty) ...[
-                              const SizedBox(height: 8),
-                              Text(desc, style: TextStyle(color: Colors.grey.shade700)),
+                            const SizedBox(height: 8),
+                            Text(dateStr,
+                                maxLines: 2, overflow: TextOverflow.ellipsis),
+                            if (e.location.trim().isNotEmpty) ...[
+                              const SizedBox(height: 6),
+                              Text(
+                                e.location.trim(),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                    fontSize: 12, color: Colors.black87),
+                              ),
                             ],
-                            const SizedBox(height: 10),
+                            const Spacer(),
                             Row(
                               children: [
-                                StreamBuilder<bool>(
-                                  stream: _myRsvped(d.id),
-                                  builder: (context, s) {
-                                    final joined = s.data == true;
-                                    return FilledButton.icon(
-                                      onPressed: () => _toggleRsvp(d.id, !joined),
-                                      icon: Icon(joined ? Icons.check : Icons.event_available),
-                                      label: Text(joined ? 'Going' : 'RSVP'),
-                                    );
-                                  },
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    color: e.source == _EventSource.local
+                                        ? Colors.indigo.withOpacity(0.12)
+                                        : Colors.teal.withOpacity(0.12),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    sourceLabel,
+                                    style: const TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600),
+                                  ),
                                 ),
-                                const SizedBox(width: 12),
-                                StreamBuilder<int>(
-                                  stream: _rsvpCount(d.id),
-                                  builder: (context, s) {
-                                    final count = s.data ?? 0;
-                                    return Text('$count going',
-                                        style: TextStyle(color: Colors.grey.shade600));
-                                  },
-                                )
+                                const Spacer(),
+                                if (e.source == _EventSource.external)
+                                  const Icon(Icons.open_in_new, size: 16),
                               ],
                             ),
                           ],
@@ -407,83 +713,63 @@ class _EventsPageState extends State<EventsPage> {
                   },
                 );
               },
-            ),
-          ),
-        ],
+            );
+          },
+        ),
       ),
     );
   }
-
-  String _fmtDateRange(DateTime start, DateTime? end) {
-    final sameDay = end != null &&
-        start.year == end.year && start.month == end.month && start.day == end.day;
-    final date = MaterialLocalizations.of(context).formatMediumDate(start);
-    final timeStart = TimeOfDay.fromDateTime(start).format(context);
-    if (end == null) return '$date • $timeStart';
-    final timeEnd = TimeOfDay.fromDateTime(end).format(context);
-    return sameDay ? '$date • $timeStart–$timeEnd' : '$date • $timeStart → ${MaterialLocalizations.of(context).formatMediumDate(end)} • $timeEnd';
-  }
 }
 
-// ======== Editor Sheet ========
+enum _EventSource { local, external }
 
-class EventEditorSheet extends StatefulWidget {
-  final Map<String, dynamic>? existing;
-  final String? docId;
-  final bool isAdmin;
-  final bool isLeader;
+class _UiEvent {
+  final String id;
+  final String title;
+  final String description;
+  final DateTime? startDate;
+  final DateTime? endDate;
+  final String location;
+  final String ministryId;
+  final _EventSource source;
+  final String? link;
+
+  const _UiEvent({
+    required this.id,
+    required this.title,
+    required this.description,
+    required this.startDate,
+    required this.endDate,
+    required this.location,
+    required this.ministryId,
+    required this.source,
+    required this.link,
+  });
+}
+
+class _CreateEventSheet extends StatefulWidget {
+  final bool canChurchWide;
   final List<String> leadershipMinistries;
 
-  const EventEditorSheet({
-    super.key,
-    this.existing,
-    this.docId,
-    required this.isAdmin,
-    required this.isLeader,
+  const _CreateEventSheet({
+    required this.canChurchWide,
     required this.leadershipMinistries,
   });
 
   @override
-  State<EventEditorSheet> createState() => _EventEditorSheetState();
+  State<_CreateEventSheet> createState() => _CreateEventSheetState();
 }
 
-class _EventEditorSheetState extends State<EventEditorSheet> {
+class _CreateEventSheetState extends State<_CreateEventSheet> {
   final _db = FirebaseFirestore.instance;
-  final _formKey = GlobalKey<FormState>();
+  final _form = GlobalKey<FormState>();
+  final _title = TextEditingController();
+  final _description = TextEditingController();
+  final _location = TextEditingController();
 
-  late TextEditingController _title;
-  late TextEditingController _description;
-  late TextEditingController _location;
   DateTime? _start;
   DateTime? _end;
-  String _ministryChoice = ''; // '' => church-wide
-
-  List<String> _allMinistries = [];
-
-  @override
-  void initState() {
-    super.initState();
-    final e = widget.existing ?? {};
-    _title = TextEditingController(text: e['title'] ?? '');
-    _description = TextEditingController(text: e['description'] ?? '');
-    _location = TextEditingController(text: e['location'] ?? '');
-    _ministryChoice = (e['ministryId'] ?? '') as String;
-    _start = (e['startDate'] as Timestamp?)?.toDate();
-    _end = (e['endDate'] as Timestamp?)?.toDate();
-    _loadMinistryNames();
-  }
-
-  Future<void> _loadMinistryNames() async {
-    // Admin can pick any ministry; leader only their own list
-    if (widget.isAdmin) {
-      final qs = await _db.collection('ministries').get();
-      setState(() => _allMinistries =
-      qs.docs.map((d) => (d.data()['name'] ?? '').toString()).where((s) => s.isNotEmpty).toList()
-        ..sort());
-    } else if (widget.isLeader) {
-      setState(() => _allMinistries = [...widget.leadershipMinistries]..sort());
-    }
-  }
+  String _ministry = '';
 
   @override
   void dispose() {
@@ -493,26 +779,28 @@ class _EventEditorSheetState extends State<EventEditorSheet> {
     super.dispose();
   }
 
-  Future<void> _pickDateTime({required bool start}) async {
-    final now = DateTime.now();
-    final init = start ? (_start ?? now.add(const Duration(hours: 2))) : (_end ?? _start ?? now.add(const Duration(hours: 3)));
-
-    final date = await showDatePicker(
+  Future<void> _pick({required bool start}) async {
+    final base = start
+        ? (_start ?? DateTime.now().add(const Duration(hours: 2)))
+        : (_end ?? _start ?? DateTime.now().add(const Duration(hours: 3)));
+    final d = await showDatePicker(
       context: context,
-      firstDate: DateTime(now.year - 1),
-      lastDate: DateTime(now.year + 5),
-      initialDate: init,
+      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+      lastDate: DateTime.now().add(const Duration(days: 3650)),
+      initialDate: base,
     );
-    if (date == null) return;
-
-    final time = await showTimePicker(context: context, initialTime: TimeOfDay.fromDateTime(init));
-    if (time == null) return;
-
-    final dt = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    if (d == null) return;
+    final t = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(base),
+    );
+    if (t == null) return;
+    final dt = DateTime(d.year, d.month, d.day, t.hour, t.minute);
     setState(() {
       if (start) {
         _start = dt;
-        if (_end != null && _end!.isBefore(_start!)) _end = _start!.add(const Duration(hours: 1));
+        if (_end != null && _end!.isBefore(_start!))
+          _end = _start!.add(const Duration(hours: 1));
       } else {
         _end = dt;
       }
@@ -520,159 +808,107 @@ class _EventEditorSheetState extends State<EventEditorSheet> {
   }
 
   Future<void> _save() async {
-    if (!_formKey.currentState!.validate()) return;
-    if (_start == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please pick a start date/time')));
-      return;
-    }
-    if (_end != null && _end!.isBefore(_start!)) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('End must be after start')));
-      return;
-    }
+    if (!_form.currentState!.validate()) return;
+    if (_start == null) return;
 
-    final payload = {
+    await _db.collection('events').add({
       'title': _title.text.trim(),
       'description': _description.text.trim(),
       'location': _location.text.trim(),
       'startDate': Timestamp.fromDate(_start!),
       'endDate': _end != null ? Timestamp.fromDate(_end!) : null,
-      // IMPORTANT: '' indicates Church-wide. Your rules must allow leaders when empty.
-      'ministryId': _ministryChoice, // '' or ministry NAME
+      'ministryId': _ministry,
+      'createdAt': FieldValue.serverTimestamp(),
       'updatedAt': FieldValue.serverTimestamp(),
-    };
+    });
 
-    if (widget.docId == null) {
-      await _db.collection('events').add({
-        ...payload,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-      if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Event created')));
-    } else {
-      await _db.collection('events').doc(widget.docId).update(payload);
-      if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Event updated')));
-    }
+    if (!mounted) return;
+    Navigator.pop(context);
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Event created')));
   }
 
   @override
   Widget build(BuildContext context) {
-    final canPickMinistry = widget.isAdmin || widget.isLeader;
+    final options = <String>[
+      if (widget.canChurchWide) '',
+      ...widget.leadershipMinistries,
+    ].toSet().toList();
+
+    if (!options.contains(_ministry))
+      _ministry = options.isEmpty ? '' : options.first;
 
     return Padding(
-      padding: EdgeInsets.only(
-        left: 16,
-        right: 16,
-        top: 16,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
-      ),
+      padding: EdgeInsets.fromLTRB(
+          16, 16, 16, MediaQuery.of(context).viewInsets.bottom + 16),
       child: Form(
-        key: _formKey,
+        key: _form,
         child: ListView(
           shrinkWrap: true,
           children: [
-            Row(
-              children: [
-                Text(widget.docId == null ? 'New Event' : 'Edit Event',
-                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                const Spacer(),
-                IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close)),
-              ],
-            ),
-            const SizedBox(height: 8),
+            const Text('Create Event',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 12),
             TextFormField(
               controller: _title,
-              decoration: const InputDecoration(labelText: 'Title', border: OutlineInputBorder()),
-              validator: (v) => (v == null || v.trim().isEmpty) ? 'Required' : null,
+              decoration: const InputDecoration(
+                  labelText: 'Title', border: OutlineInputBorder()),
+              validator: (v) =>
+                  (v == null || v.trim().isEmpty) ? 'Required' : null,
             ),
             const SizedBox(height: 10),
             TextFormField(
               controller: _description,
               maxLines: 3,
-              decoration: const InputDecoration(labelText: 'Description', border: OutlineInputBorder()),
+              decoration: const InputDecoration(
+                  labelText: 'Description', border: OutlineInputBorder()),
             ),
             const SizedBox(height: 10),
             TextFormField(
               controller: _location,
-              decoration: const InputDecoration(labelText: 'Location', border: OutlineInputBorder()),
+              decoration: const InputDecoration(
+                  labelText: 'Location', border: OutlineInputBorder()),
             ),
             const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () => _pickDateTime(start: true),
-                    icon: const Icon(Icons.schedule),
-                    label: Text(_start == null
-                        ? 'Pick start'
-                        : '${MaterialLocalizations.of(context).formatFullDate(_start!)} • ${TimeOfDay.fromDateTime(_start!).format(context)}'),
-                  ),
-                ),
-              ],
+            OutlinedButton.icon(
+              onPressed: () => _pick(start: true),
+              icon: const Icon(Icons.schedule),
+              label: Text(_start == null
+                  ? 'Pick start'
+                  : DateFormat('EEE, d MMM • h:mm a')
+                      .format(_start!.toLocal())),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () => _pick(start: false),
+              icon: const Icon(Icons.schedule_send),
+              label: Text(_end == null
+                  ? 'Pick end (optional)'
+                  : DateFormat('EEE, d MMM • h:mm a').format(_end!.toLocal())),
             ),
             const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () => _pickDateTime(start: false),
-                    icon: const Icon(Icons.schedule_send),
-                    label: Text(_end == null
-                        ? 'Pick end (optional)'
-                        : '${MaterialLocalizations.of(context).formatFullDate(_end!)} • ${TimeOfDay.fromDateTime(_end!).format(context)}'),
-                  ),
-                ),
-              ],
+            DropdownButtonFormField<String>(
+              value: _ministry,
+              items: options
+                  .map(
+                    (m) => DropdownMenuItem(
+                      value: m,
+                      child: Text(m.isEmpty ? 'Church-wide' : m),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (v) => setState(() => _ministry = v ?? ''),
+              decoration: const InputDecoration(
+                  labelText: 'Visibility', border: OutlineInputBorder()),
             ),
-            const SizedBox(height: 10),
-            if (canPickMinistry)
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Visibility / Ownership', style: TextStyle(fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 6),
-                  DropdownButtonFormField<String>(
-                    value: _ministryChoice,
-                    items: [
-                      const DropdownMenuItem(value: '', child: Text('Church-wide')),
-                      ..._allMinistries.map((m) => DropdownMenuItem(value: m, child: Text(m))),
-                    ],
-                    onChanged: (v) => setState(() => _ministryChoice = v ?? ''),
-                    decoration: const InputDecoration(border: OutlineInputBorder()),
-                  ),
-                ],
-              ),
-            const SizedBox(height: 16),
-            FilledButton.icon(onPressed: _save, icon: const Icon(Icons.save), label: const Text('Save')),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              onPressed: _save,
+              icon: const Icon(Icons.save),
+              label: const Text('Save'),
+            ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-// ======== Small UI helper ========
-class _Badge extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _Badge({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.grey.shade100,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.grey.shade300),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: Colors.grey.shade700),
-          const SizedBox(width: 6),
-          Text(label, style: TextStyle(color: Colors.grey.shade800)),
-        ],
       ),
     );
   }
