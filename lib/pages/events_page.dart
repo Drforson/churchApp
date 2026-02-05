@@ -27,6 +27,7 @@ class _EventsPageState extends State<EventsPage> {
   bool _isPastor = false;
   bool _isLeader = false;
   Set<String> _leadershipMinistries = {};
+  String _eventsDebug = 'fetching sources...';
 
   Future<List<_UiEvent>>? _externalFuture;
 
@@ -106,6 +107,7 @@ class _EventsPageState extends State<EventsPage> {
       _isPastor = isPastor;
       _isLeader = isLeader || isAdmin || isPastor;
       _leadershipMinistries = leadership;
+      _externalFuture = _fetchGracepointEvents();
     });
   }
 
@@ -153,16 +155,25 @@ class _EventsPageState extends State<EventsPage> {
   }
 
   Future<List<_UiEvent>> _fetchGracepointEvents() async {
+    final trail = <String>[];
     try {
-      final fromCallable = await _fetchGracepointEventsViaCallable();
-      if (fromCallable.isNotEmpty) return fromCallable;
-
       final out = <_UiEvent>[];
+      final fromCallable = await _fetchGracepointEventsViaCallable();
+      trail.add('callable=${fromCallable.length}');
+      out.addAll(fromCallable);
+
       out.addAll(await _fetchGracepointEventsFromApi());
+      trail.add('api=${out.length}');
+      out.addAll(await _fetchGracepointEventsFromFeeds());
+      trail.add('feed=${out.length}');
+      out.addAll(await _fetchGracepointEventsFromAjaxMonths());
+      trail.add('ajax=${out.length}');
+
       final pages = <String>[
         'https://gracepointuk.com/',
         'https://gracepointuk.com/events/',
         'https://gracepointuk.com/events-calendar/',
+        'https://gracepointuk.com/events-2/',
       ];
       final eventLinks = <String>{};
 
@@ -178,6 +189,7 @@ class _EventsPageState extends State<EventsPage> {
         if (res.statusCode < 200 || res.statusCode >= 300) continue;
 
         final doc = html_parser.parse(res.body);
+        _collectGracepointListingEvents(doc, out);
         final scripts =
             doc.querySelectorAll('script[type="application/ld+json"]');
         for (final s in scripts) {
@@ -189,25 +201,32 @@ class _EventsPageState extends State<EventsPage> {
           } catch (_) {}
         }
 
-        final anchors =
-            doc.querySelectorAll('a[href*="?event="], a[href*="&event="]');
+        final anchors = doc.querySelectorAll(
+          'a[href*="?event="], a[href*="&event="], a[href*="/event"], a[href*="/events/"]',
+        );
         for (final a in anchors) {
           final resolved = _resolveGracepointUrl(a.attributes['href'] ?? '');
-          if (resolved != null) eventLinks.add(resolved);
+          if (resolved != null &&
+              resolved.startsWith('https://gracepointuk.com/')) {
+            eventLinks.add(resolved);
+          }
         }
       }
+      trail.add('list=${out.length}');
 
-      for (final url in eventLinks.take(24)) {
+      for (final url in eventLinks.take(40)) {
         final item = await _parseGracepointEventDetail(url);
         if (item != null) out.add(item);
       }
+      trail.add('detail=${out.length}');
 
       if (out.isEmpty) {
         final links = await _discoverGracepointEventLinksFromSitemap();
-        for (final url in links.take(30)) {
+        for (final url in links.take(40)) {
           final item = await _parseGracepointEventDetail(url);
           if (item != null) out.add(item);
         }
+        trail.add('sitemap=${out.length}');
       }
 
       final cutoff = DateTime.now().subtract(const Duration(days: 1));
@@ -221,8 +240,16 @@ class _EventsPageState extends State<EventsPage> {
             b.startDate ?? DateTime.now().add(const Duration(days: 36500));
         return ad.compareTo(bd);
       });
+      final synced = await _syncExternalEventsToFirestore(filtered);
+      if (synced > 0) {
+        trail.add('synced=$synced');
+      }
+      trail.add('upcoming=${filtered.length}');
+      if (mounted) setState(() => _eventsDebug = trail.join(' | '));
       return filtered;
-    } catch (_) {
+    } catch (e) {
+      if (mounted)
+        setState(() => _eventsDebug = '${trail.join(' | ')} | err=$e');
       return const <_UiEvent>[];
     }
   }
@@ -328,6 +355,110 @@ class _EventsPageState extends State<EventsPage> {
     return out;
   }
 
+  Future<List<_UiEvent>> _fetchGracepointEventsFromFeeds() async {
+    final out = <_UiEvent>[];
+    final feeds = <String>[
+      'https://gracepointuk.com/events/feed/',
+      'https://gracepointuk.com/feed/',
+    ];
+
+    for (final url in feeds) {
+      try {
+        final res = await http.get(
+          Uri.parse(url),
+          headers: const {
+            'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)',
+            'Accept': 'application/rss+xml,application/xml,text/xml,*/*',
+          },
+        );
+        if (res.statusCode < 200 || res.statusCode >= 300) continue;
+        final xml = res.body;
+
+        final items = RegExp(r'<item>([\s\S]*?)</item>', caseSensitive: false)
+            .allMatches(xml)
+            .map((m) => m.group(1) ?? '')
+            .where((s) => s.isNotEmpty);
+
+        for (final raw in items) {
+          final title = _decodeXml(_firstTag(raw, 'title')).trim();
+          if (title.isEmpty) continue;
+          final link = _decodeXml(_firstTag(raw, 'link')).trim();
+          final dateRaw = _decodeXml(_firstTag(raw, 'pubDate')).trim();
+          final description =
+              _wpText(_decodeXml(_firstTag(raw, 'description')));
+          final start = _coerceDate(dateRaw);
+          if (start == null) continue;
+
+          out.add(
+            _UiEvent(
+              id: 'ext_${title.hashCode}_${start.millisecondsSinceEpoch}',
+              title: title,
+              description: description,
+              startDate: start,
+              endDate: null,
+              location: '',
+              ministryId: '',
+              source: _EventSource.external,
+              link: link.isEmpty ? null : link,
+            ),
+          );
+        }
+      } catch (_) {}
+    }
+    return out;
+  }
+
+  Future<List<_UiEvent>> _fetchGracepointEventsFromAjaxMonths() async {
+    final out = <_UiEvent>[];
+    final startMonth = DateTime(DateTime.now().year, DateTime.now().month);
+
+    for (var i = 0; i < 10; i++) {
+      final month = DateTime(startMonth.year, startMonth.month + i, 1);
+      final monthKey = DateFormat('yyyy-MM').format(month);
+      try {
+        final res = await http.post(
+          Uri.parse('https://gracepointuk.com/wp-admin/admin-ajax.php'),
+          headers: const {
+            'User-Agent': 'Mozilla/5.0 (Flutter; ChurchApp)',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Accept': '*/*',
+          },
+          body: {
+            'action': 'imic_event_grid',
+            'date': monthKey,
+            'term': '',
+          },
+        );
+        if (res.statusCode < 200 || res.statusCode >= 300) continue;
+
+        final body = res.body;
+        final chunks = body.split('~!');
+        final htmlChunk = chunks.length > 1 ? chunks[1] : body;
+        if (htmlChunk.trim().isEmpty) continue;
+
+        final doc =
+            html_parser.parse('<ul id="monthly-events">$htmlChunk</ul>');
+        _collectGracepointListingEvents(doc, out);
+      } catch (_) {}
+    }
+    return out;
+  }
+
+  String _firstTag(String xml, String tag) {
+    final m = RegExp('<$tag[^>]*>([\\s\\S]*?)</$tag>', caseSensitive: false)
+        .firstMatch(xml);
+    return m?.group(1) ?? '';
+  }
+
+  String _decodeXml(String s) {
+    return s
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'");
+  }
+
   String _wpTitle(dynamic value) {
     if (value is Map) {
       return _wpText(value['rendered']).trim();
@@ -342,6 +473,63 @@ class _EventsPageState extends State<EventsPage> {
       return html_parser.parse(raw).body?.text.trim() ?? raw;
     } catch (_) {
       return raw;
+    }
+  }
+
+  void _collectGracepointListingEvents(
+    dynamic doc,
+    List<_UiEvent> out,
+  ) {
+    final items = doc.querySelectorAll(
+      '#monthly-events li.event-list-item, #monthly-events li.event-dynamic, li.event-list-item',
+    );
+    if (items.isEmpty) return;
+
+    for (final item in items) {
+      final title = (item.querySelector('a.event-title')?.text ??
+              item.querySelector('.adore_event_title')?.text ??
+              '')
+          .trim();
+      if (title.isEmpty) continue;
+
+      var dateRaw =
+          (item.querySelector('.adore_event_cdate')?.text ?? '').trim();
+      if (dateRaw.isEmpty) {
+        final day = (item.querySelector('.event-day')?.text ?? '').trim();
+        final month = (item.querySelector('.event-month')?.text ?? '').trim();
+        if (day.isNotEmpty && month.isNotEmpty) {
+          dateRaw = '$day $month';
+        }
+      }
+      final start = _coerceDate(dateRaw);
+      if (start == null) continue;
+
+      final location = (item.querySelector('.event-location-address')?.text ??
+              item.querySelector('.event-location')?.text ??
+              '')
+          .trim();
+
+      var link = (item.querySelector('a.event-title')?.attributes['href'] ?? '')
+          .trim();
+      if (link.isEmpty) {
+        link = (item.querySelector('.adore_event_url')?.text ?? '').trim();
+      }
+      link = link.replaceAll('&#038;', '&').replaceAll('&amp;', '&');
+      final resolvedLink = _resolveGracepointUrl(link);
+
+      out.add(
+        _UiEvent(
+          id: 'ext_${title.hashCode}_${start.millisecondsSinceEpoch}',
+          title: title,
+          description: '',
+          startDate: start,
+          endDate: null,
+          location: location,
+          ministryId: '',
+          source: _EventSource.external,
+          link: resolvedLink,
+        ),
+      );
     }
   }
 
@@ -414,7 +602,7 @@ class _EventsPageState extends State<EventsPage> {
   }
 
   String? _resolveGracepointUrl(String href) {
-    final h = href.trim();
+    final h = href.replaceAll('&#038;', '&').replaceAll('&amp;', '&').trim();
     if (h.isEmpty) return null;
     if (h.startsWith('http://') || h.startsWith('https://')) return h;
     if (h.startsWith('/')) return 'https://gracepointuk.com$h';
@@ -550,6 +738,84 @@ class _EventsPageState extends State<EventsPage> {
     return '$title|$day';
   }
 
+  String _externalEventDocId(_UiEvent e) {
+    final raw = _eventKey(e).replaceAll('|', '_');
+    var safe = raw.replaceAll(RegExp(r'[^a-z0-9_]+'), '_');
+    safe = safe.replaceAll(RegExp(r'_+'), '_');
+    safe = safe.replaceAll(RegExp(r'^_+|_+$'), '');
+    if (safe.isEmpty) {
+      safe = 'unknown_${DateTime.now().millisecondsSinceEpoch}';
+    }
+    if (safe.length > 120) {
+      safe = safe.substring(0, 120);
+    }
+    return 'gracepoint_$safe';
+  }
+
+  Future<int> _syncExternalEventsToFirestore(List<_UiEvent> external) async {
+    if (external.isEmpty) return 0;
+
+    try {
+      final localSnap = await _db.collection('events').limit(1200).get();
+      final existingKeys = <String>{};
+      for (final d in localSnap.docs) {
+        existingKeys.add(_eventKey(_fromFirestore(d)));
+      }
+
+      var batch = _db.batch();
+      var ops = 0;
+      var inserted = 0;
+
+      Future<void> commitIfNeeded({bool force = false}) async {
+        if (ops == 0) return;
+        if (force || ops >= 400) {
+          await batch.commit();
+          batch = _db.batch();
+          ops = 0;
+        }
+      }
+
+      for (final e in external) {
+        final key = _eventKey(e);
+        if (existingKeys.contains(key)) continue;
+        if (e.startDate == null) continue;
+
+        final ref = _db.collection('events').doc(_externalEventDocId(e));
+        batch.set(
+          ref,
+          {
+            'title': e.title.trim(),
+            'description': e.description.trim(),
+            'startDate': Timestamp.fromDate(e.startDate!),
+            'endDate':
+                e.endDate != null ? Timestamp.fromDate(e.endDate!) : null,
+            'location': e.location.trim(),
+            'ministryId': '',
+            'source': 'gracepoint',
+            'externalSource': 'gracepointuk.com',
+            'externalUrl': e.link,
+            'externalKey': key,
+            'createdAt': FieldValue.serverTimestamp(),
+            'updatedAt': FieldValue.serverTimestamp(),
+          },
+          SetOptions(merge: true),
+        );
+        ops++;
+        inserted++;
+        existingKeys.add(key);
+        await commitIfNeeded();
+      }
+
+      await commitIfNeeded(force: true);
+      return inserted;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _eventsDebug = '$_eventsDebug | syncErr=$e');
+      }
+      return 0;
+    }
+  }
+
   Future<void> _openCreator() async {
     await showModalBottomSheet(
       context: context,
@@ -610,6 +876,12 @@ class _EventsPageState extends State<EventsPage> {
                           const SizedBox(height: 8),
                           Text(
                             'Local: ${local.length} • Gracepoint: ${external.length}',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Debug: ${_eventsDebug.trim().isEmpty ? "none" : _eventsDebug}',
+                            textAlign: TextAlign.center,
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                           const SizedBox(height: 8),

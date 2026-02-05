@@ -1597,6 +1597,47 @@ exports.getGracepointEvents = onCall(async () => {
       if (!res.ok) continue;
       const html = await res.text();
 
+      // Parse server-rendered list items used by Gracepoint's events template.
+      const listingBlocks = [...html.matchAll(/<li class="[^"]*event-list-item[^"]*"[\s\S]*?<\/li>/gi)];
+      for (const b of listingBlocks) {
+        const block = b[0];
+        const title = S((block.match(/class="event-title"[^>]*>([\s\S]*?)<\/a>/i) || [])[1])
+          .replace(/<[^>]+>/g, '')
+          .replace(/&#038;|&amp;/g, '&')
+          .trim();
+        if (!title) continue;
+
+        let dateRaw = S((block.match(/class="adore_event_cdate">([\s\S]*?)<\/span>/i) || [])[1]).trim();
+        if (!dateRaw) {
+          const day = S((block.match(/class="event-day">([\s\S]*?)<\/span>/i) || [])[1]).trim();
+          const month = S((block.match(/class="event-month">([\s\S]*?)<\/span>/i) || [])[1]).trim();
+          if (day && month) dateRaw = `${day} ${month}`;
+        }
+        const start = parseDate(dateRaw);
+        if (!start) continue;
+
+        let href = S((block.match(/class="event-title"[^>]*href="([^"]+)"/i) || [])[1]).trim();
+        if (!href) {
+          href = S((block.match(/class="adore_event_url">([\s\S]*?)<\/span>/i) || [])[1]).trim();
+        }
+        href = href.replace(/&#038;|&amp;/g, '&');
+        const link = absUrl(href);
+        const location = S((block.match(/class="event-location-address">([\s\S]*?)<\/span>/i) || [])[1])
+          .replace(/<[^>]+>/g, '')
+          .trim();
+
+        items.push({
+          id: `ext_${title.toLowerCase().replace(/\s+/g, '-')}_${start.getTime()}`,
+          title,
+          description: '',
+          startDateIso: start.toISOString(),
+          endDateIso: null,
+          location,
+          link,
+        });
+        if (link && /[?&]event=/i.test(link)) eventUrls.add(link);
+      }
+
       // JSON-LD events
       const scripts = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
       for (const s of scripts) {
