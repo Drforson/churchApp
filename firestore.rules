@@ -215,6 +215,22 @@ service cloud.firestore {
       );
     }
 
+    // Attendance access should be based on user roles/claims without requiring
+    // member lookups (avoids missing memberId edge cases).
+    function canViewAttendance() {
+      return signedIn() && (
+        hasClaim('admin')
+        || hasClaim('isAdmin')
+        || hasClaim('pastor')
+        || hasClaim('isPastor')
+        || hasClaim('leader')
+        || hasClaim('isLeader')
+        || userHasAdminRole()
+        || userHasPastorRole()
+        || userHasLeaderRole()
+      );
+    }
+
     function changedKeys() {
       return request.resource.data.diff(resource.data).changedKeys();
     }
@@ -614,15 +630,15 @@ service cloud.firestore {
     }
 
     match /attendance/{dateKey} {
-      allow read, write: if isAdmin() || isLeader() || isPastor();
+      allow read, write: if canViewAttendance();
 
       match /records/{recordId} {
-        allow read, create, update, delete: if isAdmin() || isLeader() || isPastor();
+        allow read, create, update, delete: if canViewAttendance();
       }
     }
 
     match /attendance_windows/{windowId} {
-      allow read: if isAdmin() || isLeader() || isPastor();
+      allow read: if canViewAttendance();
       allow write: if false;
     }
 

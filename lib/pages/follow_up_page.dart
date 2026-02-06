@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:flutter/foundation.dart';
 
 class FollowUpPage extends StatefulWidget {
   const FollowUpPage({super.key});
@@ -255,6 +256,9 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
             builder: (context, snap) {
               final data = snap.data?.data() as Map<String, dynamic>? ?? {};
               final roles = List<String>.from(data['roles'] ?? const []);
+              final role = (data['role'] ?? '').toString();
+              final memberId = (data['memberId'] ?? '').toString();
+              final uid = FirebaseAuth.instance.currentUser?.uid ?? 'unknown';
               final roleText = roles.contains('admin')
                   ? 'Admin'
                   : roles.contains('leader')
@@ -264,12 +268,25 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                 padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 6),
                 child: Align(
                   alignment: Alignment.centerLeft,
-                  child: Chip(
-                    label: Text('Role: $roleText'),
-                    avatar: Icon(
-                      roles.contains('admin') ? Icons.security : roles.contains('leader') ? Icons.verified : Icons.person,
-                      size: 18,
-                    ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Chip(
+                        label: Text('Role: $roleText'),
+                        avatar: Icon(
+                          roles.contains('admin') ? Icons.security : roles.contains('leader') ? Icons.verified : Icons.person,
+                          size: 18,
+                        ),
+                      ),
+                      if (!kReleaseMode)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'UID: $uid\nrole: ${role.isEmpty ? '—' : role}\nmemberId: ${memberId.isEmpty ? '—' : memberId}',
+                            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black54),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               );

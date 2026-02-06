@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 class AttendancePingService {
   AttendancePingService._();
@@ -13,6 +14,10 @@ class AttendancePingService {
   final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
   final _auth = FirebaseAuth.instance;
   final _messaging = FirebaseMessaging.instance;
+  final _fln = FlutterLocalNotificationsPlugin();
+
+  static const String _channelId = 'default_channel';
+  static const String _channelName = 'General';
 
   GlobalKey<NavigatorState>? _navKey;
   bool _initialized = false;
@@ -52,6 +57,11 @@ class AttendancePingService {
 
   Future<void> _handleMessage(RemoteMessage m, {required String source}) async {
     if (!_isAttendancePing(m)) return;
+    _showWelcomeNotification(
+      title: (m.notification?.title ?? 'Welcome to service').toString(),
+      body: (m.data['welcomeMessage'] ?? m.notification?.body ?? 'Attendance check-in is open.')
+          .toString(),
+    );
     final windowId = (m.data['windowId'] ?? '').toString().trim();
     if (windowId.isEmpty) return;
     if (_handledWindowIds.contains(windowId)) return;
@@ -97,7 +107,9 @@ class AttendancePingService {
       final data = (res.data is Map) ? Map<String, dynamic>.from(res.data as Map) : <String, dynamic>{};
       final status = (data['status'] ?? '').toString();
       if (status == 'present') {
-        _toast(context, '✅ You are marked present.');
+        final msg = 'Welcome! You are marked present.';
+        _toast(context, msg);
+        _showWelcomeNotification(title: 'Welcome', body: msg);
       } else if (status == 'absent') {
         _toast(context, '⚠️ You are outside the radius and marked absent.');
       } else {
@@ -177,5 +189,27 @@ class AttendancePingService {
 
   void _toast(BuildContext context, String msg) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _showWelcomeNotification({
+    required String title,
+    required String body,
+  }) async {
+    try {
+      await _fln.show(
+        id: DateTime.now().millisecondsSinceEpoch.remainder(1 << 31),
+        title: title,
+        body: body,
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            _channelId,
+            _channelName,
+            importance: Importance.high,
+            priority: Priority.high,
+          ),
+          iOS: DarwinNotificationDetails(),
+        ),
+      );
+    } catch (_) {}
   }
 }

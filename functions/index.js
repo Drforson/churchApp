@@ -2624,10 +2624,11 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
 
   for (const doc of qs.docs) {
     const w = doc.data();
+    const welcomeMessage = 'Welcome! Attendance check-in is open. Tap to confirm.';
     const payload = {
       notification: {
-        title: 'Attendance Check-in',
-        body: 'Open the app to confirm your attendance.',
+        title: 'Welcome to service',
+        body: welcomeMessage,
       },
       data: {
         type: 'attendance_window_ping',
@@ -2638,6 +2639,7 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
         lat: String(w.churchLocation.lat),
         lng: String(w.churchLocation.lng),
         radius: String(w.radiusMeters || 500),
+        welcomeMessage,
       },
     };
 
