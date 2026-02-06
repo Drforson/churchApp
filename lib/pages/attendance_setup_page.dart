@@ -24,6 +24,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
   final _addrCtrl = TextEditingController();
   List<AutocompletePrediction> _predictions = [];
   Place? _selectedPlace;
+  String? _selectedPlaceId;
 
   // ---- Window form
   final _formKey = GlobalKey<FormState>();
@@ -80,6 +81,16 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
         });
         return;
       }
+      // Ensure user doc + claims are synced before we read claims.
+      try {
+        await _functions.httpsCallable('ensureUserDoc').call();
+      } catch (_) {}
+      try {
+        await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call();
+      } catch (_) {}
+      try {
+        await u.getIdToken(true);
+      } catch (_) {}
       final token = await u.getIdTokenResult(true);
       final c = token.claims ?? {};
       // Allow admin, pastor, or leader
@@ -107,6 +118,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       setState(() {
         _predictions = [];
         _selectedPlace = null;
+        _selectedPlaceId = null;
       });
       return;
     }
@@ -152,6 +164,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       final place = det.place; // may be null
       setState(() {
         _selectedPlace = place;
+        _selectedPlaceId = p.placeId;
         final display = place?.address ?? place?.name;
         if (display != null) {
           _addrCtrl.text = display;
@@ -203,7 +216,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
 
     final lat = _selectedPlace!.latLng!.lat;
     final lng = _selectedPlace!.latLng!.lng;
-    final placeId = _selectedPlace?.id;
+    final placeId = _selectedPlaceId ?? _selectedPlace?.id;
     final addr = _addrCtrl.text.trim();
     final title =
     _titleCtrl.text.trim().isEmpty ? 'Service' : _titleCtrl.text.trim();
@@ -232,6 +245,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
 
     setState(() => _creating = true);
     try {
+      debugPrint('[AttendanceSetup] saving window for $dateKey ($title)');
       await _functions.httpsCallable('upsertAttendanceWindow').call({
         'title': title,
         'dateKey': dateKey,
@@ -265,6 +279,14 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(msg),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to save attendance window: $e'),
           backgroundColor: Colors.red,
         ),
       );

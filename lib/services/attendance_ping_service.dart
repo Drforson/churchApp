@@ -21,6 +21,7 @@ class AttendancePingService {
 
   GlobalKey<NavigatorState>? _navKey;
   bool _initialized = false;
+  bool _notificationsReady = false;
   final Set<String> _handledWindowIds = <String>{};
 
   void init(GlobalKey<NavigatorState> navKey) {
@@ -28,6 +29,7 @@ class AttendancePingService {
     _initialized = true;
     _navKey = navKey;
 
+    _ensureLocalNotificationsReady();
     _wireMessaging();
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -35,6 +37,27 @@ class AttendancePingService {
       if (ctx == null) return;
       await ensureLocationReady(ctx, proactive: true);
     });
+  }
+
+  Future<void> _ensureLocalNotificationsReady() async {
+    if (_notificationsReady) return;
+    const settings = InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      iOS: DarwinInitializationSettings(),
+    );
+    await _fln.initialize(settings: settings);
+
+    final android = _fln.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await android?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _channelId,
+        _channelName,
+        description: 'General notifications',
+        importance: Importance.high,
+      ),
+    );
+    _notificationsReady = true;
   }
 
   Future<void> _wireMessaging() async {
@@ -57,6 +80,12 @@ class AttendancePingService {
 
   Future<void> _handleMessage(RemoteMessage m, {required String source}) async {
     if (!_isAttendancePing(m)) return;
+    debugPrint(
+      '[AttendancePing] received ping source=$source '
+      'windowId=${(m.data['windowId'] ?? '').toString()} '
+      'title=${m.notification?.title ?? ''} '
+      'body=${m.notification?.body ?? ''}',
+    );
     _showWelcomeNotification(
       title: (m.notification?.title ?? 'Welcome to service').toString(),
       body: (m.data['welcomeMessage'] ?? m.notification?.body ?? 'Attendance check-in is open.')
@@ -196,6 +225,7 @@ class AttendancePingService {
     required String body,
   }) async {
     try {
+      await _ensureLocalNotificationsReady();
       await _fln.show(
         id: DateTime.now().millisecondsSinceEpoch.remainder(1 << 31),
         title: title,

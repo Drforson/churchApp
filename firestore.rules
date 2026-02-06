@@ -13,6 +13,12 @@ service cloud.firestore {
       return signedIn() && (request.auth.token[name] == true);
     }
 
+    function claimRole() {
+      return (signedIn() && (request.auth.token.role is string))
+        ? request.auth.token.role
+        : '';
+    }
+
     function userSnap(uid) {
       return get(/databases/$(database)/documents/users/$(uid));
     }
@@ -182,6 +188,7 @@ service cloud.firestore {
     function isAdmin() {
       return signedIn() && (
         userHasAdminRole()
+        || claimRole() == 'admin'
         || hasClaim('admin')
         || hasClaim('isAdmin')
         || memberHasRoleFromRequester('admin')
@@ -193,6 +200,7 @@ service cloud.firestore {
     function isPastor() {
       return signedIn() && (
         userHasPastorRole()
+        || claimRole() == 'pastor'
         || hasClaim('pastor')
         || hasClaim('isPastor')
         || memberHasRoleFromRequester('pastor')
@@ -205,6 +213,7 @@ service cloud.firestore {
       let mins = userLeadershipMinistries(request.auth.uid);
       return signedIn() && (
         userHasLeaderRole()
+        || claimRole() == 'leader'
         || hasClaim('leader')
         || hasClaim('isLeader')
         || (mins is list && mins.size() > 0)
@@ -295,8 +304,11 @@ service cloud.firestore {
      * MEMBERS
      * --------------------------*/
     match /members/{memberId} {
-      // read (including email-based self lookup for signup prefill)
-      allow read: if signedIn() && (
+      // list: full collection queries (admin/pastor/leader)
+      allow list: if isAdmin() || isPastor() || isLeader();
+
+      // get: single doc reads (including email-based self lookup for signup prefill)
+      allow get: if signedIn() && (
         memberId == requesterMemberId()
         || (
           'userUid' in resource.data

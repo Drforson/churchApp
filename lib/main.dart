@@ -179,6 +179,14 @@ Future<void> _initMessaging() async {
 // ---------------------------------------------------------------------------
 
 Future<void> _activateAppCheck() async {
+  if (!kReleaseMode) {
+    final tp = defaultTargetPlatform;
+    if (tp == TargetPlatform.iOS || tp == TargetPlatform.macOS) {
+      debugPrint('[AppCheck] Skipping App Check in debug on Apple platforms.');
+      return;
+    }
+  }
+
   await FirebaseAppCheck.instance.activate(
     androidProvider: kReleaseMode ? AndroidProvider.playIntegrity : AndroidProvider.debug,
     // Use deviceCheck for stability unless App Attest is configured end-to-end

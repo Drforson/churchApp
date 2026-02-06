@@ -127,6 +127,7 @@ async function syncClaimsForUid(uid, cache) {
   try {
     const role = await getUserRole(uid, cache);
     const claims = {
+      role,
       admin: role === 'admin' || undefined,
       isAdmin: role === 'admin' || undefined,
       pastor: role === 'pastor' || undefined,
@@ -167,24 +168,30 @@ async function recomputeAndWriteUserRole(uid) {
 
   let memberRoles = [];
   let isPastorFlag = false;
+  let leadershipMins = null;
 
   if (user.memberId) {
     const m = await getMemberById(user.memberId, cache);
     if (m) {
       memberRoles = Array.isArray(m.roles) ? m.roles : [];
       isPastorFlag = !!m.isPastor;
+      leadershipMins = Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : [];
     }
   }
 
   const merged = [
     ...normalizeRoles(user.roles || []),
     ...normalizeRoles(memberRoles),
+    ...(leadershipMins && leadershipMins.length > 0 ? ['leader'] : []),
     ...(isPastorFlag ? ['pastor'] : []),
   ];
 
-  const single = highestRole(merged);
+  const rolesClean = normalizeRoles(merged);
+  const single = highestRole(rolesClean);
 
-  await db.doc(`users/${uid}`).set({ role: single, updatedAt: ts() }, { merge: true });
+  const update = { role: single, roles: rolesClean, updatedAt: ts() };
+  if (leadershipMins) update.leadershipMinistries = leadershipMins;
+  await db.doc(`users/${uid}`).set(update, { merge: true });
   await syncClaimsForUid(uid, cache);
 }
 
@@ -1068,10 +1075,17 @@ exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
   }
 
   const memberData = memberSnap?.data() || null;
+  const memberRoles = normalizeRoles(memberData?.roles || []);
+  const leadershipMins = Array.isArray(memberData?.leadershipMinistries)
+    ? memberData.leadershipMinistries
+    : null;
+  const mergedRoles = mergeRoles(user?.roles || [], [
+    ...memberRoles,
+    ...(leadershipMins && leadershipMins.length > 0 ? ['leader'] : []),
+  ]);
 
   const highest = highestRole([
-    ...(user?.roles || []),
-    ...((memberData?.roles || [])),
+    ...mergedRoles,
     ...(memberData?.isPastor ? ['pastor'] : []),
   ]);
 
@@ -1079,7 +1093,9 @@ exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
     role: highest,
     email: emailLc || user?.email || null,
     updatedAt: ts(),
+    roles: mergedRoles,
   };
+  if (leadershipMins) write.leadershipMinistries = leadershipMins;
 
   // set memberId only if not already linked
   if (memberSnap && !user?.memberId) {

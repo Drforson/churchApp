@@ -166,7 +166,12 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
                       : w.title;
                   return DropdownMenuItem(value: w.id, child: Text(label));
                 }).toList(),
-                onChanged: (v) => setState(() => _selectedWindowId = v),
+                onChanged: (v) {
+                  setState(() {
+                    _selectedWindowId = v;
+                    attendanceStatus = {};
+                  });
+                },
               ),
             ),
           // 🔍 Search bar

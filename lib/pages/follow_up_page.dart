@@ -172,8 +172,11 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
     final windowId = (data['windowId'] ?? '').toString().trim();
     if (windowId.isNotEmpty) return windowId == w.id;
     // No windowId on record (legacy/manual).
-    // Only include when we're in fallback mode (date-based).
-    return _usingWindowFallback && w.dateKey.isNotEmpty;
+    if (_usingWindowFallback) return w.dateKey.isNotEmpty;
+    // If there is only one window for the selected date, treat missing windowId as a match.
+    final sameDateCount =
+        _availableWindows.where((x) => x.dateKey == w.dateKey).length;
+    return w.dateKey.isNotEmpty && sameDateCount <= 1;
   }
 
   bool _isPresentRecord(Map<String, dynamic> data) {
@@ -219,7 +222,9 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
         centerTitle: true,
         title: const Text('Follow-Up Summary'),
       ),
-      body: _selectedWindowId == null || _selectedWindow == null
+      body: _loadingInitial
+          ? const Center(child: CircularProgressIndicator())
+          : _selectedWindowId == null || _selectedWindow == null
           ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(_statusMessage)))
           : Column(
         children: [
@@ -257,11 +262,18 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
               final data = snap.data?.data() as Map<String, dynamic>? ?? {};
               final roles = List<String>.from(data['roles'] ?? const []);
               final role = (data['role'] ?? '').toString();
+              final roleLower = role.toLowerCase().trim();
+              final isPastorFlag = data['isPastor'] == true;
+              final hasAdmin = roles.map((e) => e.toLowerCase()).contains('admin') || roleLower == 'admin';
+              final hasPastor = roles.map((e) => e.toLowerCase()).contains('pastor') || roleLower == 'pastor' || isPastorFlag;
+              final hasLeader = roles.map((e) => e.toLowerCase()).contains('leader') || roleLower == 'leader';
               final memberId = (data['memberId'] ?? '').toString();
               final uid = FirebaseAuth.instance.currentUser?.uid ?? 'unknown';
-              final roleText = roles.contains('admin')
+              final roleText = hasAdmin
                   ? 'Admin'
-                  : roles.contains('leader')
+                  : hasPastor
+                  ? 'Pastor'
+                  : hasLeader
                   ? 'Leader'
                   : 'Member';
               return Padding(
@@ -274,7 +286,7 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                       Chip(
                         label: Text('Role: $roleText'),
                         avatar: Icon(
-                          roles.contains('admin') ? Icons.security : roles.contains('leader') ? Icons.verified : Icons.person,
+                          hasAdmin ? Icons.security : hasPastor ? Icons.church : hasLeader ? Icons.verified : Icons.person,
                           size: 18,
                         ),
                       ),
@@ -412,92 +424,92 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                       final ts = m['dateOfBirth'] as Timestamp?;
                       if (ts == null || selectedDate == null || weekStart == null) return false;
                       final b = ts.toDate();
-                      // compare by month/day
-                      final inRange = !b.isBefore(weekStart) && !b.isAfter(selectedDate);
-                      return inRange && (b.month == selectedDate.month); // keep same month check (optional)
+                      final bThisYear = DateTime(selectedDate.year, b.month, b.day);
+                      return !bThisYear.isBefore(weekStart) && !bThisYear.isAfter(selectedDate);
                     }).length;
 
                     final noRecords = records.isEmpty;
 
-                    return Column(
-                      children: [
-                        if (noRecords)
-                          Padding(
-                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                            child: Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: Colors.amber.shade50,
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(color: Colors.amber.shade200),
+                    return NestedScrollView(
+                      headerSliverBuilder: (context, innerBoxIsScrolled) {
+                        return [
+                          if (noRecords)
+                            SliverToBoxAdapter(
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                                child: Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: Colors.amber.shade50,
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: Colors.amber.shade200),
+                                  ),
+                                  child: const Text(
+                                    'No attendance records found for this service yet.',
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
                               ),
-                              child: const Text(
-                                'No attendance records found for this service yet.',
-                                textAlign: TextAlign.center,
+                            ),
+                          SliverToBoxAdapter(
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                              child: _StatsGridCompact(
+                                items: [
+                                  _StatData('Total Members', totalMembers, Icons.groups, Colors.blueGrey),
+                                  _StatData('Total Visitors', totalVisitors, Icons.person_outline, Colors.teal),
+                                  _StatData('Absent Members', filteredMembers.length, Icons.group_off, Colors.red),
+                                  _StatData('Absent Visitors', filteredVisitors.length, Icons.person_off, Colors.orange),
+                                  _StatData('Male Present', malePresent, Icons.male, Colors.green),
+                                  _StatData('Female Present', femalePresent, Icons.female, Colors.pink),
+                                  _StatData('Male Absent', maleAbsent, Icons.male, Colors.redAccent),
+                                  _StatData('Female Absent', femaleAbsent, Icons.female, Colors.deepOrange),
+                                  _StatData('Unknown Present', unknownPresent, Icons.help_outline, Colors.indigo),
+                                  _StatData('Unknown Absent', unknownAbsent, Icons.help_outline, Colors.deepPurple),
+                                  _StatData('Member Rate', memberAttendanceRate, Icons.insights, Colors.green, isPercent: true),
+                                  _StatData('Visitor Rate', visitorAttendanceRate, Icons.pie_chart_outline, Colors.teal, isPercent: true),
+                                  _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
+                                  _StatData('Birthdays', birthdayCount, Icons.cake, Theme.of(context).colorScheme.secondary),
+                                ],
                               ),
                             ),
                           ),
-                        // Fancy stats
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                          child: _StatsGridCompact(
-                            items: [
-                              _StatData('Total Members', totalMembers, Icons.groups, Colors.blueGrey),
-                              _StatData('Total Visitors', totalVisitors, Icons.person_outline, Colors.teal),
-                              _StatData('Absent Members', filteredMembers.length, Icons.group_off, Colors.red),
-                              _StatData('Absent Visitors', filteredVisitors.length, Icons.person_off, Colors.orange),
-                              _StatData('Male Present', malePresent, Icons.male, Colors.green),
-                              _StatData('Female Present', femalePresent, Icons.female, Colors.pink),
-                              _StatData('Male Absent', maleAbsent, Icons.male, Colors.redAccent),
-                              _StatData('Female Absent', femaleAbsent, Icons.female, Colors.deepOrange),
-                              _StatData('Unknown Present', unknownPresent, Icons.help_outline, Colors.indigo),
-                              _StatData('Unknown Absent', unknownAbsent, Icons.help_outline, Colors.deepPurple),
-                              _StatData('Member Rate', memberAttendanceRate, Icons.insights, Colors.green, isPercent: true),
-                              _StatData('Visitor Rate', visitorAttendanceRate, Icons.pie_chart_outline, Colors.teal, isPercent: true),
-                              _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
-                              _StatData('Birthdays', birthdayCount, Icons.cake, Theme.of(context).colorScheme.secondary),
-                            ],
-                          ),
-                        ),
-
-                        // Tabs
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12.0),
-                          child: TabBar(
-                            controller: _tabController,
-                            labelColor: Theme.of(context).colorScheme.primary,
-                            unselectedLabelColor: Colors.black54,
-                            indicatorColor: Theme.of(context).colorScheme.primary,
-                            tabs: const [
-                              Tab(text: 'Members Absent'),
-                              Tab(text: 'Visitors Absent'),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-
-                        // Lists
-                        Expanded(
-                          child: TabBarView(
-                            controller: _tabController,
-                            children: [
-                              _PeopleList(
-                                people: filteredMembers,
-                                titleBuilder: (m) => '${m['firstName'] ?? ''} ${m['lastName'] ?? ''}'.trim(),
-                                subtitle: 'Member',
-                                onTap: _openContactSheet,
+                          SliverToBoxAdapter(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 12.0),
+                              child: TabBar(
+                                controller: _tabController,
+                                labelColor: Theme.of(context).colorScheme.primary,
+                                unselectedLabelColor: Colors.black54,
+                                indicatorColor: Theme.of(context).colorScheme.primary,
+                                tabs: const [
+                                  Tab(text: 'Members Absent'),
+                                  Tab(text: 'Visitors Absent'),
+                                ],
                               ),
-                              _PeopleList(
-                                people: filteredVisitors,
-                                titleBuilder: (v) => '${v['firstName'] ?? ''} ${v['lastName'] ?? ''}'.trim(),
-                                subtitle: 'Visitor',
-                                onTap: _openContactSheet,
-                              ),
-                            ],
+                            ),
                           ),
-                        ),
-                      ],
+                          const SliverToBoxAdapter(child: SizedBox(height: 6)),
+                        ];
+                      },
+                      body: TabBarView(
+                        controller: _tabController,
+                        children: [
+                          _PeopleList(
+                            people: filteredMembers,
+                            titleBuilder: (m) => '${m['firstName'] ?? ''} ${m['lastName'] ?? ''}'.trim(),
+                            subtitle: 'Member',
+                            onTap: _openContactSheet,
+                          ),
+                          _PeopleList(
+                            people: filteredVisitors,
+                            titleBuilder: (v) => '${v['firstName'] ?? ''} ${v['lastName'] ?? ''}'.trim(),
+                            subtitle: 'Visitor',
+                            onTap: _openContactSheet,
+                          ),
+                        ],
+                      ),
                     );
                   },
                 );

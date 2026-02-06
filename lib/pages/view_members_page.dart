@@ -1,4 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
@@ -14,6 +16,9 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
   late TabController _tabController;
   String _viewMode = 'list';
   String _searchQuery = '';
+  late Future<QuerySnapshot> _membersFuture;
+  final FirebaseFunctions _functions =
+      FirebaseFunctions.instanceFor(region: 'europe-west2');
 
   @override
   void initState() {
@@ -26,12 +31,63 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
         });
       }
     });
+    _membersFuture = _loadMembers();
   }
 
   @override
   void dispose() {
     _tabController.dispose();
     super.dispose();
+  }
+
+  String _genderBucket(dynamic raw) {
+    final g = raw?.toString().toLowerCase().trim() ?? '';
+    if (g.isEmpty) return 'other';
+    if (g.startsWith('f') || g.contains('female') || g.contains('woman') || g.contains('girl')) {
+      return 'female';
+    }
+    if (g.startsWith('m') || g.contains('male') || g.contains('man') || g.contains('boy')) {
+      return 'male';
+    }
+    return 'other';
+  }
+
+  Widget _genderAvatar(Map<String, dynamic> member, {double radius = 20}) {
+    final bucket = _genderBucket(member['gender']);
+    if (bucket == 'female') {
+      return CircleAvatar(
+        radius: radius,
+        backgroundImage: const AssetImage('assets/images/female_avatar.png'),
+      );
+    }
+    if (bucket == 'male') {
+      return CircleAvatar(
+        radius: radius,
+        backgroundImage: const AssetImage('assets/images/male_avatar.png'),
+      );
+    }
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: Colors.grey.shade200,
+      child: Icon(Icons.person, color: Colors.grey.shade700, size: radius),
+    );
+  }
+
+  Future<void> _ensureRoleSync() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+    try {
+      await _functions.httpsCallable('ensureUserDoc').call();
+    } catch (_) {}
+    try {
+      await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call();
+      await user.getIdToken(true);
+    } catch (_) {}
+  }
+
+  Future<QuerySnapshot> _loadMembers() async {
+    await _ensureRoleSync();
+    return FirebaseFirestore.instance.collection('members').get();
   }
 
   @override
@@ -60,13 +116,36 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
         ),
       ),
       body: FutureBuilder<QuerySnapshot>(
-        future: FirebaseFirestore.instance.collection('members').get(),
+        future: _membersFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
           if (snapshot.hasError) {
-            return Center(child: Text('Error: ${snapshot.error}'));
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Error: ${snapshot.error}',
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: () {
+                        setState(() {
+                          _membersFuture = _loadMembers();
+                        });
+                      },
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+            );
           }
 
           final currentMembers = snapshot.data?.docs
@@ -119,13 +198,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
                 padding: const EdgeInsets.all(12),
                 child: Row(
                   children: [
-                    CircleAvatar(
-                      backgroundImage: AssetImage(
-                        member['gender'] == 'Female'
-                            ? 'assets/images/female_avatar.png'
-                            : 'assets/images/male_avatar.png',
-                      ),
-                    ),
+                    _genderAvatar(member),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text('${member['firstName']} ${member['lastName']}',
@@ -165,13 +238,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
               itemBuilder: (context, index) {
                 final member = filtered[index];
                 return ListTile(
-                  leading: CircleAvatar(
-                    backgroundImage: AssetImage(
-                      member['gender'] == 'Female'
-                          ? 'assets/images/female_avatar.png'
-                          : 'assets/images/male_avatar.png',
-                    ),
-                  ),
+                  leading: _genderAvatar(member),
                   title: Text('${member['firstName']} ${member['lastName']}'),
                   onTap: () => _openMemberDetail(member),
                 );
@@ -250,14 +317,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
                   color: Colors.teal.shade100,
                   child: Column(
                     children: [
-                      CircleAvatar(
-                        radius: 40,
-                        backgroundImage: AssetImage(
-                          (member['gender'] == 'Female')
-                              ? 'assets/images/female_avatar.png'
-                              : 'assets/images/male_avatar.png',
-                        ),
-                      ),
+                      _genderAvatar(member, radius: 40),
                       const SizedBox(height: 12),
                       Text(
                         '${member['firstName'] ?? ''} ${member['lastName'] ?? ''}',
@@ -375,13 +435,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
               final age = birthdayThisYear.year - dob.year;
               final formattedDate = DateFormat('EEE, MMM d').format(dob);
               return ListTile(
-                leading: CircleAvatar(
-                  backgroundImage: AssetImage(
-                    member['gender'] == 'Female'
-                        ? 'assets/images/female_avatar.png'
-                        : 'assets/images/male_avatar.png',
-                  ),
-                ),
+                leading: _genderAvatar(member),
                 title: Text('${member['firstName']} ${member['lastName']}'),
                 subtitle: Text('Birthday: $formattedDate (Turning $age)'),
                 trailing: IconButton(
@@ -486,13 +540,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
             ),
             children: ministryMembers.map((m) {
               return ListTile(
-                leading: CircleAvatar(
-                  backgroundImage: AssetImage(
-                    m['gender'] == 'Female'
-                        ? 'assets/images/female_avatar.png'
-                        : 'assets/images/male_avatar.png',
-                  ),
-                ),
+                leading: _genderAvatar(m),
                 title: Text('${m['firstName']} ${m['lastName']}'),
                 subtitle: m['role'] != null ? Text(m['role']) : null,
                 onTap: () => _openMemberDetail(m),
@@ -531,10 +579,21 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
   }
   Widget _buildGenderPieChart(List<Map<String, dynamic>> members) {
     final genderCounts = {
-      'Male': members.where((m) => m['gender'] == 'Male').length,
-      'Female': members.where((m) => m['gender'] == 'Female').length,
-      'Other': members.where((m) => m['gender'] != 'Male' && m['gender'] != 'Female').length,
+      'Male': 0,
+      'Female': 0,
+      'Other': 0,
     };
+
+    for (final m in members) {
+      final bucket = _genderBucket(m['gender']);
+      if (bucket == 'male') {
+        genderCounts['Male'] = (genderCounts['Male'] ?? 0) + 1;
+      } else if (bucket == 'female') {
+        genderCounts['Female'] = (genderCounts['Female'] ?? 0) + 1;
+      } else {
+        genderCounts['Other'] = (genderCounts['Other'] ?? 0) + 1;
+      }
+    }
 
     return Padding(
       padding: const EdgeInsets.all(16.0),
