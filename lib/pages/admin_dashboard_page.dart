@@ -866,6 +866,7 @@ class _ActionsGrid extends StatelessWidget {
   Widget build(BuildContext context) {
     final items = <_ActionItem>[
       _ActionItem('Profile', Icons.person, '/profile'),
+      _ActionItem('Settings', Icons.settings, '/settings'),
       _ActionItem('Upload Sermons & Events', Icons.upload, '/admin-upload'),
       _ActionItem(
           'Register Member/Visitor', Icons.how_to_reg, '/register-member'),

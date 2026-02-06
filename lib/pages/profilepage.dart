@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import 'package:church_management_app/services/auth_service.dart';
+import 'package:church_management_app/widgets/notification_settings_panel.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -247,6 +248,7 @@ class _HomePageState extends State<HomePage> {
       if (mounted) setState(() => _loading = false);
     }
   }
+
 
   Future<void> _pickDOB() async {
     final now = DateTime.now();
@@ -596,6 +598,8 @@ class _HomePageState extends State<HomePage> {
                   onAppCheckToken: _showAppCheckToken,
                 ),
               _Header(percent: percent),
+              const SizedBox(height: 12),
+              const NotificationSettingsPanel(),
               const SizedBox(height: 16),
 
               Row(

@@ -468,6 +468,7 @@ class _UActionsGrid extends StatelessWidget {
   Widget build(BuildContext context) {
     final items = <_UActionItem>[
       _UActionItem('Profile', Icons.person, '/profile'),
+      _UActionItem('Settings', Icons.settings, '/settings'),
       _UActionItem('Events', Icons.event, '/events'),
       _UActionItem('Ministries', Icons.group_work, '/view-ministry'),
       _UActionItem('Attendance Check-In', Icons.check_circle_outline, '/attendance'),

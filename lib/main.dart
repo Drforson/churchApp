@@ -38,6 +38,7 @@ import 'pages/upload_excel_page.dart';
 import 'pages/debadmintestpage.dart';
 import 'pages/profilepage.dart';
 import 'pages/successpage.dart';
+import 'pages/settings_page.dart';
 
 import 'pages/pastor_home_dashboard_page.dart';
 import 'pages/usher_home_dashboard_page.dart';
@@ -630,6 +631,9 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
     case '/profile':
     // Your "My Profile" page (the HomePage we optimised earlier)
       return MaterialPageRoute(builder: (_) => HomePage());
+
+    case '/settings':
+      return MaterialPageRoute(builder: (_) => const SettingsPage());
 
     case '/success':
       return MaterialPageRoute(builder: (_) => const SuccessPage());
