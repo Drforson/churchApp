@@ -67,25 +67,43 @@ const AndroidNotificationChannel _androidChannel = AndroidNotificationChannel(
   importance: Importance.high,
 );
 
+Future<void> _ensureLocalNotificationsInitialized() async {
+  final androidImpl =
+      _fln.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  await androidImpl?.createNotificationChannel(_androidChannel);
+  const initSettings = InitializationSettings(
+    android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    iOS: DarwinInitializationSettings(),
+  );
+  await _fln.initialize(settings: initSettings);
+}
+
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await _ensureLocalNotificationsInitialized();
+  final hasSystemNotification = message.notification != null;
+  if (!hasSystemNotification) {
+    await _fln.show(
+      id: DateTime.now().millisecondsSinceEpoch.remainder(1 << 31),
+      title: message.data['title']?.toString() ?? 'Notification',
+      body: message.data['body']?.toString() ?? message.data['type']?.toString(),
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          _androidChannelId,
+          _androidChannelName,
+          channelDescription: _androidChannelDescription,
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+        iOS: DarwinNotificationDetails(),
+      ),
+    );
+  }
 }
 
 Future<void> _initLocalNotifications() async {
-  final androidImpl =
-  _fln.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-  await androidImpl?.createNotificationChannel(_androidChannel);
-
-  const initSettings = InitializationSettings(
-    android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-    iOS: DarwinInitializationSettings(
-      requestAlertPermission: false,
-      requestBadgePermission: false,
-      requestSoundPermission: false,
-    ),
-  );
-  await _fln.initialize(settings: initSettings);
+  await _ensureLocalNotificationsInitialized();
 }
 
 Future<void> _initMessaging() async {
@@ -111,7 +129,30 @@ Future<void> _initMessaging() async {
     debugPrint('[FCM] topic subscribe failed: $e');
   }
 
+  FirebaseMessaging.instance.onTokenRefresh.listen((token) async {
+    try {
+      await FirebaseMessaging.instance.subscribeToTopic('all_members');
+      if (token.isNotEmpty) {
+        final uid = FirebaseAuth.instance.currentUser?.uid;
+        if (uid != null) {
+          await FirebaseFirestore.instance.collection('users').doc(uid).set({
+            'fcmToken': token,
+            'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+        }
+      }
+    } catch (e) {
+      debugPrint('[FCM] topic resubscribe failed: $e');
+    }
+  });
+
   FirebaseMessaging.onMessage.listen((RemoteMessage m) {
+    final type = (m.data['type'] ?? '').toString().toLowerCase();
+    if (type == 'attendance_window_ping') {
+      // Attendance pings are handled by AttendancePingService for custom messaging.
+      return;
+    }
     final n = m.notification;
     _fln.show(
       id: n.hashCode,
@@ -208,6 +249,30 @@ Future<void> _postStartInit() async {
   // Notifications
   await _initLocalNotifications();
   await _initMessaging();
+
+  // Register FCM token for the signed-in user (if any)
+  await _registerFcmTokenForUser();
+
+  FirebaseAuth.instance.authStateChanges().listen((user) async {
+    if (user == null) return;
+    await _registerFcmTokenForUser();
+  });
+}
+
+Future<void> _registerFcmTokenForUser() async {
+  final uid = FirebaseAuth.instance.currentUser?.uid;
+  if (uid == null) return;
+  try {
+    final token = await FirebaseMessaging.instance.getToken();
+    if (token == null || token.isEmpty) return;
+    await FirebaseFirestore.instance.collection('users').doc(uid).set({
+      'fcmToken': token,
+      'fcmTokenUpdatedAt': FieldValue.serverTimestamp(),
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  } catch (e) {
+    debugPrint('[FCM] token save failed: $e');
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -278,7 +278,7 @@ service cloud.firestore {
     return signedIn()
       && request.auth.uid == userId
       && !changedKeys().hasAny(['roles','role','leadershipMinistries','memberId'])
-      && changedKeys().hasOnly(['email','linkedAt','createdAt','updatedAt']);
+      && changedKeys().hasOnly(['email','linkedAt','createdAt','updatedAt','fcmToken','fcmTokenUpdatedAt']);
   }
 
   function leaderMayUpdateLeadershipMinistries() {

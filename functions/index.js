@@ -25,6 +25,8 @@ const admin = require('firebase-admin');
 admin.initializeApp();
 const db = admin.firestore();
 const ts = admin.firestore.FieldValue.serverTimestamp;
+const messaging = admin.messaging();
+const _tokenCache = new Map();
 
 setGlobalOptions({ region: 'europe-west2', memory: '256MiB', concurrency: 16 });
 
@@ -241,12 +243,66 @@ async function writeInbox(uid, payload) {
   }
 
   await db.collection('inbox').doc(uid).collection('events').add(toWrite);
+
+  // Push notification for background/closed app (best-effort)
+  try {
+    if (payload?.sendPush === false) return;
+    const title = (payload?.title || 'Notification').toString();
+    const body = (payload?.body || payload?.type || 'You have a new notification').toString();
+    const token = await _getUserFcmToken(uid);
+    if (!token) return;
+
+    const data = _buildFcmData(payload);
+    await messaging.send({
+      token,
+      notification: { title, body },
+      data,
+    });
+  } catch (e) {
+    logger.warn('writeInbox FCM send failed', { uid, error: e });
+  }
 }
 
 async function writeNotification(payload) {
   const data = { ...payload };
   if (!data.createdAt) data.createdAt = ts();
   await db.collection('notifications').add(data);
+}
+
+async function _getUserFcmToken(uid) {
+  if (!uid) return null;
+  if (_tokenCache.has(uid)) return _tokenCache.get(uid);
+  try {
+    const snap = await db.doc(`users/${uid}`).get();
+    const token = S(snap.get('fcmToken'));
+    _tokenCache.set(uid, token || null);
+    return token || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _buildFcmData(payload = {}) {
+  const keep = [
+    'type',
+    'route',
+    'ministryId',
+    'ministryName',
+    'ministryDocId',
+    'joinRequestId',
+    'prayerRequestId',
+    'requestId',
+    'result',
+    'channel',
+  ];
+  const out = {};
+  for (const k of keep) {
+    if (payload[k] == null) continue;
+    const v = payload[k];
+    const s = typeof v === 'string' ? v : String(v);
+    if (s.trim().length) out[k] = s;
+  }
+  return out;
 }
 
 async function notifyMinistryCreationRequesterResult({
@@ -2598,6 +2654,9 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
       churchLocation: { lat: Number(churchLocation.lat), lng: Number(churchLocation.lng) },
       radiusMeters: Number(radiusMeters) || 500,
       pingSent: false,
+      pingSentAt: null,
+      pingAttempts: admin.firestore.FieldValue.increment(0),
+      reminderSent: false,
       closed: false,
       createdAt: ts(),
       updatedAt: ts(),
@@ -2644,7 +2703,102 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
     };
 
     await admin.messaging().sendToTopic('all_members', payload);
-    await doc.ref.set({ pingSent: true, updatedAt: ts() }, { merge: true });
+    await doc.ref.set(
+      {
+        pingSent: true,
+        pingSentAt: ts(),
+        pingAttempts: admin.firestore.FieldValue.increment(1),
+        updatedAt: ts(),
+      },
+      { merge: true }
+    );
+  }
+});
+
+exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
+  const now = new Date();
+  const qs = await db.collection('attendance_windows')
+    .where('startsAt', '<=', now)
+    .where('pingAttempts', '<', 2)
+    .limit(20)
+    .get();
+
+  if (qs.empty) return;
+
+  for (const doc of qs.docs) {
+    const w = doc.data();
+    if (!w.endsAt || w.endsAt.toDate() <= now) continue;
+    if (!w.pingSent) continue;
+
+    const last = w.pingSentAt?.toDate?.() || new Date(0);
+    if (now.getTime() - last.getTime() < 2 * 60 * 1000) continue;
+
+    const payload = {
+      notification: {
+        title: 'Attendance Check-in',
+        body: 'Reminder: please confirm your attendance.',
+      },
+      data: {
+        type: 'attendance_window_ping',
+        windowId: doc.id,
+        dateKey: String(w.dateKey),
+        startsAt: String(w.startsAt.toDate().getTime()),
+        endsAt: String(w.endsAt.toDate().getTime()),
+        lat: String(w.churchLocation.lat),
+        lng: String(w.churchLocation.lng),
+        radius: String(w.radiusMeters || 500),
+        welcomeMessage: 'Welcome! Attendance check-in is open. Tap to confirm.',
+      },
+    };
+
+    await admin.messaging().sendToTopic('all_members', payload);
+    await doc.ref.set(
+      {
+        pingSentAt: ts(),
+        pingAttempts: admin.firestore.FieldValue.increment(1),
+        updatedAt: ts(),
+      },
+      { merge: true }
+    );
+  }
+});
+
+exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () => {
+  const now = new Date();
+  const soon = new Date(now.getTime() + 10 * 60 * 1000);
+
+  const qs = await db.collection('attendance_windows')
+    .where('endsAt', '<=', soon)
+    .where('reminderSent', '==', false)
+    .limit(20)
+    .get();
+
+  if (qs.empty) return;
+
+  for (const doc of qs.docs) {
+    const w = doc.data();
+    if (!w.endsAt || w.endsAt.toDate() <= now) continue;
+
+    const payload = {
+      notification: {
+        title: 'Attendance closing soon',
+        body: 'Please confirm your attendance before the window closes.',
+      },
+      data: {
+        type: 'attendance_window_ping',
+        windowId: doc.id,
+        dateKey: String(w.dateKey),
+        startsAt: String(w.startsAt.toDate().getTime()),
+        endsAt: String(w.endsAt.toDate().getTime()),
+        lat: String(w.churchLocation.lat),
+        lng: String(w.churchLocation.lng),
+        radius: String(w.radiusMeters || 500),
+        welcomeMessage: 'Attendance closes soon. Tap to confirm.',
+      },
+    };
+
+    await admin.messaging().sendToTopic('all_members', payload);
+    await doc.ref.set({ reminderSent: true, updatedAt: ts() }, { merge: true });
   }
 });
 

@@ -14,10 +14,57 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
   Map<String, bool> attendanceStatus = {};
   String _searchQuery = "";
   bool _submitting = false;
+  List<_AttendanceWindow> _windows = [];
+  String? _selectedWindowId;
+  bool _loadingWindows = true;
 
   String get _todayKey {
     final now = DateTime.now();
     return DateFormat('yyyy-MM-dd').format(now);
+  }
+
+  _AttendanceWindow? get _selectedWindow {
+    if (_selectedWindowId == null) return null;
+    try {
+      return _windows.firstWhere((w) => w.id == _selectedWindowId);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadWindows();
+  }
+
+  Future<void> _loadWindows() async {
+    try {
+      final todaySnap = await _firestore
+          .collection('attendance_windows')
+          .where('dateKey', isEqualTo: _todayKey)
+          .get();
+      var wins = todaySnap.docs.map(_AttendanceWindow.fromDoc).toList();
+      if (wins.isEmpty) {
+        final recent = await _firestore
+            .collection('attendance_windows')
+            .orderBy('startsAt', descending: true)
+            .limit(10)
+            .get();
+        wins = recent.docs.map(_AttendanceWindow.fromDoc).toList();
+      }
+      if (mounted) {
+        setState(() {
+          _windows = wins;
+          _selectedWindowId = wins.isNotEmpty ? wins.first.id : null;
+          _loadingWindows = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _loadingWindows = false);
+      }
+    }
   }
 
   Future<void> _submitAttendance() async {
@@ -43,7 +90,9 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
     if (confirm != true) return;
 
     setState(() => _submitting = true);
-    final dateDocRef = _firestore.collection('attendance').doc(_todayKey);
+    final window = _selectedWindow;
+    final dateKey = window?.dateKey ?? _todayKey;
+    final dateDocRef = _firestore.collection('attendance').doc(dateKey);
     final batch = _firestore.batch();
 
     batch.set(dateDocRef, {
@@ -55,8 +104,11 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
       final docRef = dateDocRef.collection('records').doc(memberId);
       batch.set(docRef, {
         'memberId': memberId,
+        'windowId': window?.id,
+        'status': isPresent ? 'present' : 'absent',
         'present': isPresent,
-        'timestamp': Timestamp.now(),
+        'checkedAt': Timestamp.now(),
+        'by': 'manual',
       }, SetOptions(merge: true));
     });
 
@@ -93,6 +145,30 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
       ),
       body: Column(
         children: [
+          if (_loadingWindows)
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+          if (_windows.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+              child: DropdownButtonFormField<String>(
+                value: _selectedWindowId,
+                isExpanded: true,
+                decoration: InputDecoration(
+                  labelText: 'Service',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                items: _windows.map((w) {
+                  final label = w.startsAt != null
+                      ? '${w.title} — ${DateFormat('EEE, MMM d • h:mm a').format(w.startsAt!)}'
+                      : w.title;
+                  return DropdownMenuItem(value: w.id, child: Text(label));
+                }).toList(),
+                onChanged: (v) => setState(() => _selectedWindowId = v),
+              ),
+            ),
           // 🔍 Search bar
           Padding(
             padding: const EdgeInsets.all(12),
@@ -167,6 +243,31 @@ class _AttendanceCheckInPageState extends State<AttendanceCheckInPage> {
         icon: const Icon(Icons.check_circle_outline),
         label: Text(_submitting ? "Submitting..." : "Submit Attendance"),
       ),
+    );
+  }
+}
+
+class _AttendanceWindow {
+  final String id;
+  final String title;
+  final String dateKey;
+  final DateTime? startsAt;
+
+  const _AttendanceWindow({
+    required this.id,
+    required this.title,
+    required this.dateKey,
+    required this.startsAt,
+  });
+
+  static _AttendanceWindow fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final starts = data['startsAt'] as Timestamp?;
+    return _AttendanceWindow(
+      id: doc.id,
+      title: (data['title'] ?? 'Service').toString(),
+      dateKey: (data['dateKey'] ?? '').toString(),
+      startsAt: starts?.toDate(),
     );
   }
 }

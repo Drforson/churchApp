@@ -357,6 +357,7 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                     final totalVisitors = visitors.length;
 
                     int malePresent = 0, femalePresent = 0, maleAbsent = 0, femaleAbsent = 0;
+                    int unknownPresent = 0, unknownAbsent = 0;
                     String genderOf(Map<String, dynamic> m) =>
                         (m['gender'] ?? '').toString().toLowerCase().trim();
                     bool isMale(Map<String, dynamic> m) => genderOf(m).startsWith('m');
@@ -375,6 +376,12 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                           femalePresent++;
                         } else {
                           femaleAbsent++;
+                        }
+                      } else {
+                        if (isPresent) {
+                          unknownPresent++;
+                        } else {
+                          unknownAbsent++;
                         }
                       }
                     }
@@ -410,8 +417,27 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                       return inRange && (b.month == selectedDate.month); // keep same month check (optional)
                     }).length;
 
+                    final noRecords = records.isEmpty;
+
                     return Column(
                       children: [
+                        if (noRecords)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                            child: Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.amber.shade50,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: Colors.amber.shade200),
+                              ),
+                              child: const Text(
+                                'No attendance records found for this service yet.',
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          ),
                         // Fancy stats
                         Padding(
                           padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
@@ -425,6 +451,8 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                               _StatData('Female Present', femalePresent, Icons.female, Colors.pink),
                               _StatData('Male Absent', maleAbsent, Icons.male, Colors.redAccent),
                               _StatData('Female Absent', femaleAbsent, Icons.female, Colors.deepOrange),
+                              _StatData('Unknown Present', unknownPresent, Icons.help_outline, Colors.indigo),
+                              _StatData('Unknown Absent', unknownAbsent, Icons.help_outline, Colors.deepPurple),
                               _StatData('Member Rate', memberAttendanceRate, Icons.insights, Colors.green, isPercent: true),
                               _StatData('Visitor Rate', visitorAttendanceRate, Icons.pie_chart_outline, Colors.teal, isPercent: true),
                               _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
