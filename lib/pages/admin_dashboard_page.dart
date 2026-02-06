@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 
 import 'ministries_details_page.dart';
 import 'notification_center_page.dart'; // <-- added
+import 'follow_up_page.dart';
 
 class AdminDashboardPage extends StatefulWidget {
   const AdminDashboardPage({super.key});
@@ -878,7 +879,15 @@ class _ActionsGrid extends StatelessWidget {
       _ActionItem(
           'Attendance Setup', Icons.how_to_reg, '/attendance-setup'),
       _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
-      _ActionItem('Sunday Follow-Up', Icons.person_off, '/follow-up'),
+      _ActionItem(
+        'Sunday Follow-Up',
+        Icons.person_off,
+        '/follow-up',
+        onTap: (ctx) => Navigator.push(
+          ctx,
+          MaterialPageRoute(builder: (_) => const FollowUpPage()),
+        ),
+      ),
       _ActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),
       // FeedbackQuickButton(padding: EdgeInsets.only(left: 8)),
       //  if (role == 'admin' || role == 'leader')
@@ -918,8 +927,9 @@ class _ActionItem {
   final IconData icon;
   final String route;
   final bool requireManage;
+  final void Function(BuildContext)? onTap;
 
-  _ActionItem(this.label, this.icon, this.route, {this.requireManage = false});
+  _ActionItem(this.label, this.icon, this.route, {this.requireManage = false, this.onTap});
 }
 
 class _ActionCard extends StatelessWidget {
@@ -929,7 +939,13 @@ class _ActionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return InkWell(
-      onTap: () => Navigator.pushNamed(context, item.route),
+      onTap: () {
+        if (item.onTap != null) {
+          item.onTap!(context);
+        } else {
+          Navigator.pushNamed(context, item.route);
+        }
+      },
       borderRadius: BorderRadius.circular(16),
       child: Ink(
         decoration: BoxDecoration(

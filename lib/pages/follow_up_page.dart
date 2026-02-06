@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 
 class FollowUpPage extends StatefulWidget {
   const FollowUpPage({super.key});
@@ -21,9 +22,10 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   final bool _isLeader = false;
   final Set<String> _leadershipMinistries = {};
 
-  // Date
-  String? _selectedDateKey;
-  List<String> _availableDateKeys = [];
+  // Service windows
+  String? _selectedWindowId;
+  List<_AttendanceWindow> _availableWindows = [];
+  bool _usingWindowFallback = false;
 
   // Search
   final TextEditingController _searchCtrl = TextEditingController();
@@ -40,7 +42,7 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
-    _primeRole().then((_) => _loadAvailableDates());
+    _primeRole().then((_) => _loadAvailableWindows());
     _searchCtrl.addListener(_onSearchChanged);
   }
 
@@ -56,68 +58,69 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
 
   Future<void> _primeRole() async {
     try {
-      final uid = _db.app.options.projectId; // dummy read to ensure _db usable; actual read below
-    } catch (_) {/* no-op */}
-    // Get current user id via FirebaseAuth directly in your app; here we just read "users/self" pattern.
-    // Replace with your actual current UID retrieval if needed:
-    // final uid = FirebaseAuth.instance.currentUser?.uid;
-    // For this page we only need to know if they have admin/leader and (for leaders) their ministries.
-    try {
-      // You likely have current UID available; if not, this page should be navigated only by signed-in users.
-      // We'll fetch user doc via security rules; if not found, defaults to member view.
-      // (If you want to pass role info via constructor, you can simplify this.)
-      // Using a single fetch:
-      // NOTE: Replace `currentUid` with your real uid getter if you want stronger typing here.
-      // We keep it defensive in case of hot reload.
-      final currentUid = WidgetsBinding.instance.platformDispatcher.toString(); // placeholder to avoid lints
-      final authUid = FirebaseFirestore.instance.app.options.projectId; // placeholder
-    } catch (_) {/* ignore */}
-    try {
-      final uid = FirebaseFirestore.instance.app.options.storageBucket; // placeholder
-    } catch (_) {/* ignore */}
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) {
+        setState(() => _loadingInitial = false);
+        return;
+      }
 
-    try {
-      // Try reading a /users/{uid} doc by leveraging FirebaseAuth inside your app.
-      // Here we assume you will use FirebaseAuth.instance.currentUser!.uid
-      // To keep this file standalone, we’ll do a small try-catch and rely on rules to allow.
-      // Replace the line below with the real one in your codebase:
-      final userQuery = await _db.collection('users')
-          .where('memberId', isGreaterThanOrEqualTo: '') // cheap query to ensure collection exists
-          .limit(1)
-          .get();
+      // Ensure the user doc/role link exists so Firestore rules can validate.
+      try {
+        await FirebaseFunctions.instanceFor(region: 'europe-west2')
+            .httpsCallable('ensureUserDoc')
+            .call();
+      } catch (_) {}
 
-      // Fallback: just read any current user snapshot from Auth in your app and pass roles via constructor if you prefer.
-    } catch (_) {/* ignore */}
-    // Real role logic (works with your existing pages that already read the user):
-    try {
-      // In your app you have the UID; here, fetch via a server-side function is not possible.
-      // So instead we read the signed in user's doc by security rules using the standard path.
-      // If your app has the UID handy, pass it to this page and replace this whole block with a direct doc get.
-      // To keep it functional, we’ll try to infer role from a "me" style doc; otherwise we default to allowing leaders/admins via rules.
-    } catch (_) {/* ignore */}
+      try {
+        await FirebaseFunctions.instanceFor(region: 'europe-west2')
+            .httpsCallable('syncUserRoleFromMemberOnLogin')
+            .call();
+      } catch (_) {}
 
-    // NOTE:
-    // Practically, your Admin/Leader can access this page due to routing—so we just display accordingly.
-    // We'll still compute isAdmin/isLeader from the users collection if possible via a light stream below inside the UI.
-    setState(() {
-      _loadingInitial = false;
-    });
+      try {
+        await user.getIdToken(true);
+      } catch (_) {}
+    } finally {
+      if (mounted) setState(() => _loadingInitial = false);
+    }
   }
 
   /* ------------------------- DATES ------------------------- */
 
-  Future<void> _loadAvailableDates() async {
+  Future<void> _loadAvailableWindows() async {
     try {
-      final snap = await _db.collection('attendance').get();
-      final keys = snap.docs.map((d) => d.id).toList()
-        ..sort((a, b) => b.compareTo(a));
+      final snap = await _db
+          .collection('attendance_windows')
+          .orderBy('startsAt', descending: true)
+          .limit(200)
+          .get();
+      final windows = snap.docs.map(_AttendanceWindow.fromDoc).toList();
+
+      if (windows.isEmpty) {
+        // Fallback: build pseudo windows from attendance dates
+        final attSnap = await _db.collection('attendance').get();
+        final keys = attSnap.docs.map((d) => d.id).toList()
+          ..sort((a, b) => b.compareTo(a));
+        setState(() {
+          _availableWindows = keys
+              .map((k) => _AttendanceWindow.fallback(dateKey: k))
+              .toList();
+          _selectedWindowId =
+              _availableWindows.isNotEmpty ? _availableWindows.first.id : null;
+          _usingWindowFallback = true;
+          _statusMessage =
+              _availableWindows.isEmpty ? 'No attendance records yet.' : 'Loaded services.';
+        });
+        return;
+      }
       setState(() {
-        _availableDateKeys = keys;
-        _selectedDateKey = keys.isNotEmpty ? keys.first : null;
-        _statusMessage = keys.isEmpty ? 'No attendance records yet.' : 'Loaded dates.';
+        _availableWindows = windows;
+        _selectedWindowId = windows.isNotEmpty ? windows.first.id : null;
+        _usingWindowFallback = false;
+        _statusMessage = windows.isEmpty ? 'No attendance records yet.' : 'Loaded services.';
       });
     } catch (e) {
-      setState(() => _statusMessage = 'Error fetching dates: $e');
+      setState(() => _statusMessage = 'Error fetching services: $e');
     }
   }
 
@@ -133,6 +136,15 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   }
 
   /* ------------------------- HELPERS ------------------------- */
+
+  _AttendanceWindow? get _selectedWindow {
+    if (_selectedWindowId == null) return null;
+    try {
+      return _availableWindows.firstWhere((w) => w.id == _selectedWindowId);
+    } catch (_) {
+      return null;
+    }
+  }
 
   String _bestPhone(Map<String, dynamic> m) {
     final p1 = (m['phone'] ?? '').toString();
@@ -150,6 +162,29 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   List<String> _weekRangeLabels(DateTime selected) {
     final start = selected.subtract(const Duration(days: 6));
     return List.generate(7, (i) => DateFormat('MMM d').format(start.add(Duration(days: i))));
+  }
+
+  bool _recordMatchesWindow(
+    Map<String, dynamic> data,
+    _AttendanceWindow w,
+  ) {
+    final windowId = (data['windowId'] ?? '').toString().trim();
+    if (windowId.isNotEmpty) return windowId == w.id;
+    // No windowId on record (legacy/manual).
+    // Only include when we're in fallback mode (date-based).
+    return _usingWindowFallback && w.dateKey.isNotEmpty;
+  }
+
+  bool _isPresentRecord(Map<String, dynamic> data) {
+    final status = (data['status'] ?? '').toString().toLowerCase();
+    if (status == 'present') return true;
+    if (status == 'absent') return false;
+    if (data['present'] == true) return true;
+    if (data['present'] == false) return false;
+    final result = (data['result'] ?? '').toString().toLowerCase();
+    if (result == 'present') return true;
+    if (result == 'absent') return false;
+    return false;
   }
 
   /* ------------------------- CONTACT ------------------------- */
@@ -183,7 +218,7 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
         centerTitle: true,
         title: const Text('Follow-Up Summary'),
       ),
-      body: _selectedDateKey == null
+      body: _selectedWindowId == null || _selectedWindow == null
           ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(_statusMessage)))
           : Column(
         children: [
@@ -193,9 +228,9 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
             child: Column(
               children: [
                 _DateDropdown(
-                  keysList: _availableDateKeys,
-                  value: _selectedDateKey!,
-                  onChanged: (newKey) => setState(() => _selectedDateKey = newKey),
+                  windows: _availableWindows,
+                  value: _selectedWindowId!,
+                  onChanged: (newId) => setState(() => _selectedWindowId = newId),
                 ),
                 const SizedBox(height: 8),
                 TextField(
@@ -244,10 +279,25 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
           // Stats + Lists (realtime)
           Expanded(
             child: StreamBuilder<QuerySnapshot>(
-              stream: _db.collection('attendance').doc(_selectedDateKey).collection('records').snapshots(),
+              stream: _db
+                  .collection('attendance')
+                  .doc(_selectedWindow!.dateKey)
+                  .collection('records')
+                  .snapshots(),
               builder: (context, recordsSnap) {
                 final records = recordsSnap.data?.docs ?? const [];
-                final presentIds = records.where((r) => (r['present'] == true)).map((r) => r['memberId'] as String).toSet();
+                final Map<String, bool> presentMap = {};
+                for (final r in records) {
+                  final data = r.data() as Map<String, dynamic>;
+                  if (!_recordMatchesWindow(data, _selectedWindow!)) continue;
+                  final mid = (data['memberId'] ?? r.id).toString();
+                  if (mid.isEmpty) continue;
+                  presentMap[mid] = _isPresentRecord(data);
+                }
+                final presentIds = presentMap.entries
+                    .where((e) => e.value == true)
+                    .map((e) => e.key)
+                    .toSet();
 
                 return StreamBuilder<QuerySnapshot>(
                   stream: _db.collection('members').snapshots(),
@@ -286,6 +336,31 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                     // Stats
                     final presentMembers = confirmedMembers.where((m) => presentIds.contains(m['id'])).length;
                     final presentVisitors = visitors.where((v) => presentIds.contains(v['id'])).length;
+                    final totalMembers = confirmedMembers.length;
+                    final totalVisitors = visitors.length;
+
+                    int malePresent = 0, femalePresent = 0, maleAbsent = 0, femaleAbsent = 0;
+                    String genderOf(Map<String, dynamic> m) =>
+                        (m['gender'] ?? '').toString().toLowerCase().trim();
+                    bool isMale(Map<String, dynamic> m) => genderOf(m).startsWith('m');
+                    bool isFemale(Map<String, dynamic> m) => genderOf(m).startsWith('f');
+
+                    for (final m in confirmedMembers) {
+                      final isPresent = presentIds.contains(m['id']);
+                      if (isMale(m)) {
+                        if (isPresent) {
+                          malePresent++;
+                        } else {
+                          maleAbsent++;
+                        }
+                      } else if (isFemale(m)) {
+                        if (isPresent) {
+                          femalePresent++;
+                        } else {
+                          femaleAbsent++;
+                        }
+                      }
+                    }
 
                     final memberAttendanceRate =
                     confirmedMembers.isEmpty ? 0.0 : (presentMembers / confirmedMembers.length * 100);
@@ -295,7 +370,7 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                     // New members (on selected date)
                     DateTime? selectedDate;
                     try {
-                      final parts = _selectedDateKey!.split('-').map(int.parse).toList();
+                      final parts = _selectedWindow!.dateKey.split('-').map(int.parse).toList();
                       selectedDate = DateTime(parts[0], parts[1], parts[2]);
                     } catch (_) {}
                     final newMembersCount = confirmedMembers.where((m) {
@@ -325,12 +400,18 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                           padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
                           child: _StatsGridCompact(
                             items: [
+                              _StatData('Total Members', totalMembers, Icons.groups, Colors.blueGrey),
+                              _StatData('Total Visitors', totalVisitors, Icons.person_outline, Colors.teal),
                               _StatData('Absent Members', filteredMembers.length, Icons.group_off, Colors.red),
                               _StatData('Absent Visitors', filteredVisitors.length, Icons.person_off, Colors.orange),
-                              _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
-                              _StatData('Birthdays', birthdayCount, Icons.cake, Theme.of(context).colorScheme.secondary),
+                              _StatData('Male Present', malePresent, Icons.male, Colors.green),
+                              _StatData('Female Present', femalePresent, Icons.female, Colors.pink),
+                              _StatData('Male Absent', maleAbsent, Icons.male, Colors.redAccent),
+                              _StatData('Female Absent', femaleAbsent, Icons.female, Colors.deepOrange),
                               _StatData('Member Rate', memberAttendanceRate, Icons.insights, Colors.green, isPercent: true),
                               _StatData('Visitor Rate', visitorAttendanceRate, Icons.pie_chart_outline, Colors.teal, isPercent: true),
+                              _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
+                              _StatData('Birthdays', birthdayCount, Icons.cake, Theme.of(context).colorScheme.secondary),
                             ],
                           ),
                         ),
@@ -407,11 +488,18 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
 /* ======================= Widgets ======================= */
 
 class _DateDropdown extends StatelessWidget {
-  final List<String> keysList;
+  final List<_AttendanceWindow> windows;
   final String value;
   final ValueChanged<String> onChanged;
 
-  const _DateDropdown({required this.keysList, required this.value, required this.onChanged});
+  const _DateDropdown({required this.windows, required this.value, required this.onChanged});
+
+  String _labelFor(_AttendanceWindow w) {
+    final when = w.startsAt != null
+        ? DateFormat('EEE, MMM d • h:mm a').format(w.startsAt!)
+        : w.dateKey;
+    return w.title.isNotEmpty ? '${w.title} — $when' : when;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -419,18 +507,12 @@ class _DateDropdown extends StatelessWidget {
       value: value,
       isExpanded: true,
       decoration: InputDecoration(
-        labelText: 'Attendance Date',
+        labelText: 'Service',
         contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
       ),
-      items: keysList.map((k) {
-        String label;
-        try {
-          label = DateFormat('EEE, MMM d, yyyy').format(DateTime.parse(k));
-        } catch (_) {
-          label = k;
-        }
-        return DropdownMenuItem(value: k, child: Text(label));
+      items: windows.map((w) {
+        return DropdownMenuItem(value: w.id, child: Text(_labelFor(w)));
       }).toList(),
       onChanged: (v) {
         if (v != null) onChanged(v);
@@ -682,6 +764,49 @@ class _ContactSheetState extends State<_ContactSheet> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _AttendanceWindow {
+  final String id;
+  final String title;
+  final String dateKey;
+  final DateTime? startsAt;
+  final DateTime? endsAt;
+
+  const _AttendanceWindow({
+    required this.id,
+    required this.title,
+    required this.dateKey,
+    this.startsAt,
+    this.endsAt,
+  });
+
+  static _AttendanceWindow fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final starts = data['startsAt'] as Timestamp?;
+    final ends = data['endsAt'] as Timestamp?;
+    return _AttendanceWindow(
+      id: doc.id,
+      title: (data['title'] ?? 'Service').toString(),
+      dateKey: (data['dateKey'] ?? '').toString(),
+      startsAt: starts?.toDate(),
+      endsAt: ends?.toDate(),
+    );
+  }
+
+  static _AttendanceWindow fallback({required String dateKey}) {
+    DateTime? parsed;
+    try {
+      parsed = DateTime.parse(dateKey);
+    } catch (_) {}
+    return _AttendanceWindow(
+      id: dateKey,
+      title: 'Service',
+      dateKey: dateKey,
+      startsAt: parsed,
+      endsAt: null,
     );
   }
 }

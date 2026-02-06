@@ -10,6 +10,7 @@ import 'package:intl/intl.dart';
 import 'attendance_setup_page.dart';
 import 'notification_center_page.dart'; // <— added
 import 'pastor_ministry_approvals_page.dart';
+import 'follow_up_page.dart';
 
 class PastorHomeDashboardPage extends StatefulWidget {
   const PastorHomeDashboardPage({super.key});
@@ -565,7 +566,15 @@ class _PastorActionsGrid extends StatelessWidget {
           MaterialPageRoute(builder: (_) => const PastorMinistryApprovalsPage()),
         ),
       ),
-      _PastorActionItem('Sunday Follow-Up', Icons.calendar_month_rounded, '/follow-up'),
+      _PastorActionItem(
+        'Sunday Follow-Up',
+        Icons.calendar_month_rounded,
+        null,
+        onTap: (ctx) => Navigator.push(
+          ctx,
+          MaterialPageRoute(builder: (_) => const FollowUpPage()),
+        ),
+      ),
       _PastorActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _PastorActionItem('Ministry', Icons.church_rounded, '/view-ministry'),
       _PastorActionItem('Prayer Requests', Icons.volunteer_activism_rounded,

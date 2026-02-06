@@ -2563,11 +2563,11 @@ function haversineMeters(a, b) {
 
 exports.upsertAttendanceWindow = onCall(async (req) => {
   const uid = req.auth?.uid;
-  if (!uid) throw new Error('unauthenticated');
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
 
   const role = await getUserRole(uid);
   const allowed = (await isUserPastorOrAdmin(uid)) || role === 'leader';
-  if (!allowed) throw new Error('permission-denied');
+  if (!allowed) throw new HttpsError('permission-denied', 'Not allowed.');
 
   const {
     id,
@@ -2581,8 +2581,8 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
     radiusMeters = 500,
   } = req.data || {};
 
-  if (!dateKey || !startsAt || !endsAt || !churchPlaceId || !churchLocation?.lat || !churchLocation?.lng) {
-    throw new Error('invalid-argument');
+  if (!dateKey || !startsAt || !endsAt || !churchLocation?.lat || !churchLocation?.lng) {
+    throw new HttpsError('invalid-argument', 'Missing required fields.');
   }
 
   const ref = id ? db.collection('attendance_windows').doc(id) : db.collection('attendance_windows').doc();
@@ -2593,7 +2593,7 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
       dateKey,
       startsAt: new Date(Number(startsAt)),
       endsAt: new Date(Number(endsAt)),
-      churchPlaceId,
+      churchPlaceId: churchPlaceId || null,
       churchAddress: churchAddress || null,
       churchLocation: { lat: Number(churchLocation.lat), lng: Number(churchLocation.lng) },
       radiusMeters: Number(radiusMeters) || 500,
@@ -2625,6 +2625,10 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
   for (const doc of qs.docs) {
     const w = doc.data();
     const payload = {
+      notification: {
+        title: 'Attendance Check-in',
+        body: 'Open the app to confirm your attendance.',
+      },
       data: {
         type: 'attendance_window_ping',
         windowId: doc.id,

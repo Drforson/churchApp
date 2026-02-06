@@ -203,6 +203,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
 
     final lat = _selectedPlace!.latLng!.lat;
     final lng = _selectedPlace!.latLng!.lng;
+    final placeId = _selectedPlace?.id;
     final addr = _addrCtrl.text.trim();
     final title =
     _titleCtrl.text.trim().isEmpty ? 'Service' : _titleCtrl.text.trim();
@@ -236,6 +237,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
         'dateKey': dateKey,
         'startsAt': startsAt,
         'endsAt': endsAt,
+        'churchPlaceId': placeId,
         'radiusMeters': _radiusMeters.round(),
         'churchAddress': addr,
         'churchLocation': {'lat': lat, 'lng': lng},
@@ -254,9 +256,15 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       );
     } on FirebaseFunctionsException catch (e) {
       if (!mounted) return;
+      final parts = <String>[
+        if (e.code.isNotEmpty) e.code,
+        if ((e.message ?? '').trim().isNotEmpty) e.message!.trim(),
+        if (e.details != null) e.details.toString(),
+      ];
+      final msg = parts.isEmpty ? 'Failed to save attendance window' : parts.join(' — ');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.message ?? 'Failed to save attendance window'),
+          content: Text(msg),
           backgroundColor: Colors.red,
         ),
       );
@@ -290,9 +298,15 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       );
     } on FirebaseFunctionsException catch (e) {
       if (!mounted) return;
+      final parts = <String>[
+        if (e.code.isNotEmpty) e.code,
+        if ((e.message ?? '').trim().isNotEmpty) e.message!.trim(),
+        if (e.details != null) e.details.toString(),
+      ];
+      final msg = parts.isEmpty ? 'Override failed' : parts.join(' — ');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.message ?? 'Override failed'),
+          content: Text(msg),
           backgroundColor: Colors.red,
         ),
       );

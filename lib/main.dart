@@ -46,6 +46,7 @@ import 'pages/prayer_request_form_page.dart';
 import 'pages/baptism_interest_form_page.dart';
 
 import 'services/theme_provider.dart';
+import 'services/attendance_ping_service.dart';
 import 'firebase_options.dart';
 import 'secrets.dart';
 
@@ -102,6 +103,13 @@ Future<void> _initMessaging() async {
     badge: true,
     sound: true,
   );
+
+  // Ensure all signed-in users are subscribed to attendance pings.
+  try {
+    await FirebaseMessaging.instance.subscribeToTopic('all_members');
+  } catch (e) {
+    debugPrint('[FCM] topic subscribe failed: $e');
+  }
 
   FirebaseMessaging.onMessage.listen((RemoteMessage m) {
     final n = m.notification;
@@ -161,6 +169,8 @@ Future<void> _activateAppCheck() async {
 // main
 // ---------------------------------------------------------------------------
 
+final GlobalKey<NavigatorState> _rootNavKey = GlobalKey<NavigatorState>();
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
@@ -170,12 +180,13 @@ Future<void> main() async {
       providers: [
         ChangeNotifierProvider(create: (_) => ThemeProvider()),
       ],
-      child: const RoleLoader(),
+      child: RoleLoader(navigatorKey: _rootNavKey),
     ),
   );
 
   // Post-start initialization to avoid blocking first frame.
   unawaited(_postStartInit());
+  AttendancePingService.I.init(_rootNavKey);
 }
 
 Future<void> _postStartInit() async {
@@ -247,7 +258,9 @@ String _resolveRoleFromClaims(Map<String, dynamic> claims) {
 // ---------------------------------------------------------------------------
 
 class RoleLoader extends StatefulWidget {
-  const RoleLoader({super.key});
+  const RoleLoader({super.key, required this.navigatorKey});
+
+  final GlobalKey<NavigatorState> navigatorKey;
   @override
   State<RoleLoader> createState() => _RoleLoaderState();
 }
@@ -285,6 +298,7 @@ class _RoleLoaderState extends State<RoleLoader> {
         return MaterialApp(
           title: 'Church Management App',
           debugShowCheckedModeBanner: false,
+          navigatorKey: widget.navigatorKey,
           theme: themeProvider.themeData,
           home: const RoleGate(),
           onGenerateRoute: _generateRoute,

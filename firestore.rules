@@ -621,6 +621,11 @@ service cloud.firestore {
       }
     }
 
+    match /attendance_windows/{windowId} {
+      allow read: if isAdmin() || isLeader() || isPastor();
+      allow write: if false;
+    }
+
     match /noticeboard/{noticeId} {
       allow read: if signedIn();
       allow write: if isAdmin() || isLeader() || isPastor();
