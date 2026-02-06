@@ -8,7 +8,9 @@ import 'package:intl/intl.dart';
 /// Approve/Decline creates a doc in `ministry_approval_actions`:
 /// { decision: 'approve'|'decline', requestId, reviewerUid, reason? }
 class PastorMinistryApprovalsPage extends StatefulWidget {
-  const PastorMinistryApprovalsPage({super.key});
+  const PastorMinistryApprovalsPage({super.key, this.requestId});
+
+  final String? requestId;
 
   @override
   State<PastorMinistryApprovalsPage> createState() =>
@@ -22,11 +24,16 @@ class _PastorMinistryApprovalsPageState
 
   String? _uid;
   bool _submitting = false; // guards double taps
+  String? _focusRequestId;
+  bool _autoOpened = false;
 
   @override
   void initState() {
     super.initState();
     _uid = _auth.currentUser?.uid;
+    _focusRequestId = widget.requestId?.trim().isEmpty == false
+        ? widget.requestId!.trim()
+        : null;
   }
 
   Stream<List<QueryDocumentSnapshot<Map<String, dynamic>>>> _pendingRequests() {
@@ -260,9 +267,20 @@ class _PastorMinistryApprovalsPageState
 
   @override
   Widget build(BuildContext context) {
+    final hasFocus = _focusRequestId != null && _focusRequestId!.isNotEmpty;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Ministry Approvals'),
+        actions: [
+          if (hasFocus)
+            TextButton(
+              onPressed: () => setState(() {
+                _focusRequestId = null;
+                _autoOpened = false;
+              }),
+              child: const Text('Show all'),
+            ),
+        ],
       ),
       body: StreamBuilder<List<QueryDocumentSnapshot<Map<String, dynamic>>>>(
         stream: _pendingRequests(),
@@ -271,18 +289,33 @@ class _PastorMinistryApprovalsPageState
             return const Center(child: CircularProgressIndicator());
           }
           final docs = snap.data ?? const [];
-          if (docs.isEmpty) {
+          final viewDocs = hasFocus
+              ? docs.where((d) => d.id == _focusRequestId).toList()
+              : docs;
+
+          if (viewDocs.isEmpty) {
             return const Center(
               child: Text('No pending ministry requests.'),
             );
           }
 
+          if (hasFocus && !_autoOpened) {
+            final match = viewDocs.first;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted) return;
+              setState(() => _autoOpened = true);
+              final r = match.data();
+              r['id'] = match.id;
+              _openDetails(r);
+            });
+          }
+
           return ListView.separated(
             padding: const EdgeInsets.all(12),
-            itemCount: docs.length,
+            itemCount: viewDocs.length,
             separatorBuilder: (_, __) => const SizedBox(height: 10),
             itemBuilder: (_, i) {
-              final d = docs[i];
+              final d = viewDocs[i];
               final r = d.data();
               r['id'] = d.id; // convenience
 

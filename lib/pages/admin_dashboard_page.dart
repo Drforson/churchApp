@@ -875,6 +875,8 @@ class _ActionsGrid extends StatelessWidget {
       _ActionItem('Upload Database', Icons.table_view, '/uploadExcel'),
       _ActionItem(
           'Attendance Check-In', Icons.check_circle_outline, '/attendance'),
+      _ActionItem(
+          'Attendance Setup', Icons.how_to_reg, '/attendance-setup'),
       _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
       _ActionItem('Sunday Follow-Up', Icons.person_off, '/follow-up'),
       _ActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),

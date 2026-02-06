@@ -381,7 +381,11 @@ service cloud.firestore {
         allow create: if signedIn()
           && request.resource.data.authorId == request.auth.uid
           && (ministryNameForDoc(ministryId) != "")
-          && (ministryNameForDoc(ministryId) in memberMinistriesForUid(request.auth.uid))
+          && (
+            (ministryNameForDoc(ministryId) in memberMinistriesForUid(request.auth.uid))
+            || isPastor()
+            || isAdmin()
+          )
           && (
             ('text' in request.resource.data)
             || ('media' in request.resource.data)

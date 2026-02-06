@@ -1,4 +1,6 @@
 // lib/pages/login_page.dart
+import 'dart:async';
+
 import 'package:church_management_app/pages/signup1.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -60,10 +62,11 @@ class _LoginPageState extends State<LoginPage> {
       //  - syncUserRoleFromMemberOnLogin (callable)
       //  - refreshes ID token
       // So here we just do UI-level bootstrap.
-      await _postLoginBootstrap();
+      unawaited(_postLoginBootstrap());
 
       if (!mounted) return;
-      Navigator.pushReplacementNamed(context, '/');
+      // Return to the root; RoleGate will react to auth state and route.
+      Navigator.of(context).popUntil((route) => route.isFirst);
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

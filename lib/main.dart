@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:church_management_app/pages/feedback_page.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -135,12 +137,16 @@ Future<void> _activateAppCheck() async {
 
   // Force an App Check token now so the first callable won’t race
   try {
-    final t = await FirebaseAppCheck.instance.getToken(true);
+    final t = await FirebaseAppCheck.instance
+        .getToken(true)
+        .timeout(const Duration(seconds: 5));
     debugPrint('[AppCheck] token len=${t?.length ?? 0}');
     if (!kReleaseMode) {
       debugPrint('[AppCheck] If Firestore is denied in debug, add the "App Check debug token" from logcat to Firebase Console.');
       debugPrint('[AppCheck] current token (debug only): ${t ?? 'null'}');
     }
+  } on TimeoutException {
+    debugPrint('[AppCheck] getToken timeout; continuing startup.');
   } catch (e) {
     debugPrint('[AppCheck] getToken warn: $e');
     if (!kReleaseMode) {
@@ -159,6 +165,20 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
+  runApp(
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => ThemeProvider()),
+      ],
+      child: const RoleLoader(),
+    ),
+  );
+
+  // Post-start initialization to avoid blocking first frame.
+  unawaited(_postStartInit());
+}
+
+Future<void> _postStartInit() async {
   // 🔐 App Check
   await _activateAppCheck();
 
@@ -177,15 +197,6 @@ Future<void> main() async {
   // Notifications
   await _initLocalNotifications();
   await _initMessaging();
-
-  runApp(
-    MultiProvider(
-      providers: [
-        ChangeNotifierProvider(create: (_) => ThemeProvider()),
-      ],
-      child: const RoleLoader(),
-    ),
-  );
 }
 
 // ---------------------------------------------------------------------------

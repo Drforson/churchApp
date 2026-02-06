@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:flutter/foundation.dart';
 
 class AuthService {
   AuthService._();
@@ -30,18 +33,30 @@ class AuthService {
   ///  - recomputes role & claims from existing data
   Future<void> _callEnsureUserDoc() async {
     final callable = _functions.httpsCallable('ensureUserDoc');
-    await callable.call();
+    await callable.call().timeout(const Duration(seconds: 8));
   }
 
   /// Server-side: compute highest role, safely link to member (if unique) + sync claims.
   Future<String?> _syncRoleFromMemberOnLogin() async {
     final callable = _functions.httpsCallable('syncUserRoleFromMemberOnLogin');
-    final res = await callable.call();
+    final res = await callable.call().timeout(const Duration(seconds: 8));
     final data = res.data;
     if (data is Map && data['role'] is String) {
       return data['role'] as String;
     }
     return null;
+  }
+
+  Future<T?> _safeStep<T>(String name, Future<T> Function() step) async {
+    try {
+      return await step();
+    } on TimeoutException {
+      debugPrint('[AuthService] $name timed out; continuing.');
+      return null;
+    } catch (e) {
+      debugPrint('[AuthService] $name failed: $e');
+      return null;
+    }
   }
 
   /// Convenience: full post-auth bootstrap:
@@ -51,9 +66,9 @@ class AuthService {
   Future<void> _bootstrapAfterAuth(User user) async {
     // Best-effort: we don't crash the whole flow if one step fails,
     // but we *do* rethrow auth/network exceptions out of signIn/signUp.
-    await _callEnsureUserDoc();
-    await _syncRoleFromMemberOnLogin();
-    await user.getIdToken(true);
+    await _safeStep('ensureUserDoc', _callEnsureUserDoc);
+    await _safeStep('syncRoleFromMemberOnLogin', _syncRoleFromMemberOnLogin);
+    await _safeStep('refreshIdToken', () => user.getIdToken(true));
   }
 
   void _guardUserWriteKeys(Map<String, dynamic> data) {
@@ -71,10 +86,20 @@ class AuthService {
 
   /// Login → ensure user doc, server sync role, refresh claims.
   Future<UserCredential> signIn(String email, String password) async {
-    final cred = await _auth.signInWithEmailAndPassword(
-      email: email.trim(),
-      password: password,
-    );
+    late final UserCredential cred;
+    try {
+      cred = await _auth
+          .signInWithEmailAndPassword(
+            email: email.trim(),
+            password: password,
+          )
+          .timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      throw FirebaseAuthException(
+        code: 'timeout',
+        message: 'Login timed out. Check your network and try again.',
+      );
+    }
 
     final user = cred.user;
     if (user == null) {
@@ -84,16 +109,26 @@ class AuthService {
       );
     }
 
-    await _bootstrapAfterAuth(user);
+    unawaited(_bootstrapAfterAuth(user));
     return cred;
   }
 
   /// Signup → ensure user doc, server sync role, refresh claims.
   Future<UserCredential> signUp(String email, String password) async {
-    final cred = await _auth.createUserWithEmailAndPassword(
-      email: email.trim(),
-      password: password,
-    );
+    late final UserCredential cred;
+    try {
+      cred = await _auth
+          .createUserWithEmailAndPassword(
+            email: email.trim(),
+            password: password,
+          )
+          .timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      throw FirebaseAuthException(
+        code: 'timeout',
+        message: 'Sign up timed out. Check your network and try again.',
+      );
+    }
 
     final user = cred.user;
     if (user == null) {
@@ -103,7 +138,7 @@ class AuthService {
       );
     }
 
-    await _bootstrapAfterAuth(user);
+    unawaited(_bootstrapAfterAuth(user));
     return cred;
   }
 

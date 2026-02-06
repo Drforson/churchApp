@@ -4,11 +4,15 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
+import '../services/post_service.dart';
+
 /// Must match the form page collection name
 const String _kPrayerRequestsCol = 'prayerRequests';
 
 class PrayerRequestManagePage extends StatefulWidget {
-  const PrayerRequestManagePage({super.key});
+  const PrayerRequestManagePage({super.key, this.initialRequestId});
+
+  final String? initialRequestId;
 
   @override
   State<PrayerRequestManagePage> createState() => _PrayerRequestManagePageState();
@@ -17,17 +21,24 @@ class PrayerRequestManagePage extends StatefulWidget {
 class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
   final _db = FirebaseFirestore.instance;
   final _auth = FirebaseAuth.instance;
+  final _postService = PostService();
 
   bool _loadingRole = true;
   bool _canModerate = false; // pastor || admin
   String? _uid;
 
   // Default to "all" so nothing gets hidden by status
-  String _statusFilter = 'all'; // new | prayed | archived | all
+  String _statusFilter = 'all'; // new | acknowledged | archived | all
   String _search = '';
   final _searchCtrl = TextEditingController();
 
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _userSub;
+  String? _focusRequestId;
+  bool _autoOpened = false;
+
+  String? _prayerTowerMinistryId;
+  String? _prayerTowerMinistryName;
+  bool _resolvingPrayerTower = false;
 
   @override
   void initState() {
@@ -40,6 +51,9 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
     _searchCtrl.addListener(() {
       setState(() => _search = _searchCtrl.text.trim().toLowerCase());
     });
+
+    final rawFocus = widget.initialRequestId?.trim() ?? '';
+    _focusRequestId = rawFocus.isNotEmpty ? rawFocus : null;
   }
 
   @override
@@ -121,14 +135,17 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
     if (!_canModerate || _uid == null) return;
     try {
       await d.reference.update({
-        'status': 'prayed',
+        'status': 'acknowledged',
+        'acknowledgedAt': FieldValue.serverTimestamp(),
+        'acknowledgedByUid': _uid,
+        // Back-compat fields (older clients)
         'prayedAt': FieldValue.serverTimestamp(),
         'prayedByUid': _uid,
         'updatedAt': FieldValue.serverTimestamp(),
       });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Marked as prayed')),
+          const SnackBar(content: Text('Acknowledged')),
         );
       }
     } catch (e) {
@@ -158,6 +175,8 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
     try {
       await d.reference.update({
         'status': 'new',
+        'acknowledgedAt': null,
+        'acknowledgedByUid': null,
         'prayedAt': null,
         'prayedByUid': null,
         'updatedAt': FieldValue.serverTimestamp(),
@@ -212,6 +231,177 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('❌ $msg')));
   }
 
+  String _statusCategory(String raw) {
+    final s = raw.trim().toLowerCase();
+    if (s == 'acknowledged' || s == 'prayed') return 'acknowledged';
+    if (s == 'archived') return 'archived';
+    return 'new';
+  }
+
+  String _displayStatus(String raw) {
+    final cat = _statusCategory(raw);
+    switch (cat) {
+      case 'acknowledged':
+        return 'ACKNOWLEDGED';
+      case 'archived':
+        return 'ARCHIVED';
+      default:
+        return 'NEW';
+    }
+  }
+
+  Color _statusColor(String raw) {
+    final cat = _statusCategory(raw);
+    switch (cat) {
+      case 'acknowledged':
+        return Colors.green.shade100;
+      case 'archived':
+        return Colors.grey.shade300;
+      default:
+        return Colors.blue.shade100;
+    }
+  }
+
+  Future<bool> _resolvePrayerTowerMinistry() async {
+    if (_prayerTowerMinistryId != null) return true;
+    if (_resolvingPrayerTower) return false;
+    _resolvingPrayerTower = true;
+    try {
+      const candidates = [
+        'Prayer Tower',
+        'Prayer Tower Ministry',
+      ];
+      for (final name in candidates) {
+        final q = await _db
+            .collection('ministries')
+            .where('name', isEqualTo: name)
+            .limit(1)
+            .get();
+        if (q.docs.isNotEmpty) {
+          _prayerTowerMinistryId = q.docs.first.id;
+          _prayerTowerMinistryName = (q.docs.first.data()['name'] ?? name).toString();
+          return true;
+        }
+      }
+
+      // Fallback: find any ministry containing "prayer tower"
+      final q = await _db.collection('ministries').limit(200).get();
+      for (final d in q.docs) {
+        final name = (d.data()['name'] ?? '').toString();
+        if (name.toLowerCase().contains('prayer tower')) {
+          _prayerTowerMinistryId = d.id;
+          _prayerTowerMinistryName = name;
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      _resolvingPrayerTower = false;
+    }
+  }
+
+  Future<String?> _resolveAuthorName() async {
+    final uid = _auth.currentUser?.uid;
+    if (uid == null) return null;
+    try {
+      final uSnap = await _db.collection('users').doc(uid).get();
+      final u = uSnap.data() ?? {};
+      final display = (u['displayName'] ?? '').toString().trim();
+      if (display.isNotEmpty) return display;
+      final memberId = (u['memberId'] ?? '').toString().trim();
+      if (memberId.isNotEmpty) {
+        final mSnap = await _db.collection('members').doc(memberId).get();
+        final m = mSnap.data() ?? {};
+        final full = (m['fullName'] ?? '').toString().trim();
+        if (full.isNotEmpty) return full;
+        final first = (m['firstName'] ?? '').toString().trim();
+        final last = (m['lastName'] ?? '').toString().trim();
+        final composed = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
+        if (composed.isNotEmpty) return composed;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _forwardToPrayerTower(DocumentSnapshot<Map<String, dynamic>> d) async {
+    if (!_canModerate || _uid == null) return;
+    final data = d.data() ?? {};
+    final alreadyForwarded =
+        (data['forwardedToPrayerTowerAt'] is Timestamp) ||
+        (data['forwardedToPrayerTower'] == true);
+    if (alreadyForwarded) return;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Forward to Prayer Tower'),
+        content: const Text(
+          'This will share the request with the Prayer Tower ministry. Continue?',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Forward')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    final resolved = await _resolvePrayerTowerMinistry();
+    if (!resolved || _prayerTowerMinistryId == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Prayer Tower ministry not found.')),
+        );
+      }
+      return;
+    }
+
+    try {
+      final isAnon = data['isAnonymous'] == true;
+      final name = (data['name'] ?? '').toString().trim();
+      final email = (data['email'] ?? '').toString().trim();
+      final message = (data['message'] ?? '').toString().trim();
+      final requester = isAnon
+          ? 'Anonymous'
+          : [name, email].where((s) => s.isNotEmpty).join(' • ').trim().isNotEmpty
+              ? [name, email].where((s) => s.isNotEmpty).join(' • ')
+              : 'Member';
+
+      final authorName = await _resolveAuthorName();
+
+      final text = [
+        'Prayer Request (Forwarded)',
+        'From: $requester',
+        if (message.isNotEmpty) '',
+        message.isNotEmpty ? message : '(no message)',
+      ].join('\n');
+
+      await _postService.createPost(
+        ministryId: _prayerTowerMinistryId!,
+        authorId: _uid!,
+        authorName: authorName,
+        text: text,
+      );
+
+      await d.reference.update({
+        'forwardedToPrayerTower': true,
+        'forwardedToPrayerTowerAt': FieldValue.serverTimestamp(),
+        'forwardedToPrayerTowerByUid': _uid,
+        'forwardedToPrayerTowerMinistryId': _prayerTowerMinistryId,
+        'forwardedToPrayerTowerMinistryName': _prayerTowerMinistryName,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Forwarded to Prayer Tower')),
+        );
+      }
+    } catch (e) {
+      _toastError(e);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loadingRole) {
@@ -241,7 +431,7 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
             onSelected: (v) => setState(() => _statusFilter = v),
             itemBuilder: (context) => const [
               PopupMenuItem(value: 'new', child: Text('New')),
-              PopupMenuItem(value: 'prayed', child: Text('Prayed')),
+              PopupMenuItem(value: 'acknowledged', child: Text('Acknowledged')),
               PopupMenuItem(value: 'archived', child: Text('Archived')),
               PopupMenuItem(value: 'all', child: Text('All')),
             ],
@@ -302,20 +492,23 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
 
                 // Build counters (treat missing status as 'new')
                 int cntAll = sorted.length;
-                int cntNew = 0, cntPrayed = 0, cntArchived = 0;
+                int cntNew = 0, cntAck = 0, cntArchived = 0;
                 for (final d in sorted) {
-                  final s = (d.data()['status'] ?? 'new').toString().toLowerCase();
-                  if (s == 'prayed') {
-                    cntPrayed++;
-                  } else if (s == 'archived') cntArchived++;
-                  else cntNew++;
+                  final s = _statusCategory((d.data()['status'] ?? 'new').toString());
+                  if (s == 'acknowledged') {
+                    cntAck++;
+                  } else if (s == 'archived') {
+                    cntArchived++;
+                  } else {
+                    cntNew++;
+                  }
                 }
 
                 // Status filter in memory
                 Iterable<QueryDocumentSnapshot<Map<String, dynamic>>> list = sorted;
                 if (_statusFilter != 'all') {
                   list = list.where((d) {
-                    final s = (d.data()['status'] ?? 'new').toString().toLowerCase();
+                    final s = _statusCategory((d.data()['status'] ?? 'new').toString());
                     return s == _statusFilter;
                   });
                 }
@@ -332,8 +525,32 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                   return hay.contains(_search);
                 }).toList();
 
+                final focused = _focusRequestId != null && _focusRequestId!.isNotEmpty;
+                final visible = focused
+                    ? filtered.where((d) => d.id == _focusRequestId).toList()
+                    : filtered;
+
                 return Column(
                   children: [
+                    if (focused)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.filter_alt_outlined, size: 18),
+                            const SizedBox(width: 6),
+                            const Expanded(child: Text('Showing request from notification')),
+                            TextButton(
+                              onPressed: () => setState(() {
+                                _focusRequestId = null;
+                                _autoOpened = false;
+                              }),
+                              child: const Text('Show all'),
+                            ),
+                          ],
+                        ),
+                      ),
+
                     // Counter bar
                     Padding(
                       padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
@@ -347,8 +564,8 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                           _countChip('New', cntNew, selected: _statusFilter == 'new', onTap: () {
                             setState(() => _statusFilter = 'new');
                           }),
-                          _countChip('Prayed', cntPrayed, selected: _statusFilter == 'prayed', onTap: () {
-                            setState(() => _statusFilter = 'prayed');
+                          _countChip('Acknowledged', cntAck, selected: _statusFilter == 'acknowledged', onTap: () {
+                            setState(() => _statusFilter = 'acknowledged');
                           }),
                           _countChip('Archived', cntArchived, selected: _statusFilter == 'archived', onTap: () {
                             setState(() => _statusFilter = 'archived');
@@ -360,14 +577,14 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
 
                     // List
                     Expanded(
-                      child: filtered.isEmpty
+                      child: visible.isEmpty
                           ? const Center(child: Text('No requests.'))
                           : ListView.separated(
                         padding: const EdgeInsets.all(12),
-                        itemCount: filtered.length,
+                        itemCount: visible.length,
                         separatorBuilder: (_, __) => const SizedBox(height: 8),
                         itemBuilder: (context, i) {
-                          final doc = filtered[i];
+                          final doc = visible[i];
                           final data = doc.data();
                           final isAnon = data['isAnonymous'] == true;
 
@@ -375,10 +592,21 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                           final email = (data['email'] ?? '').toString();
                           final msg = (data['message'] ?? '').toString();
 
-                          final status = (data['status'] ?? 'new').toString();
-                          final prayedByUid = (data['prayedByUid'] ?? '').toString();
+                          final rawStatus = (data['status'] ?? 'new').toString();
+                          final status = _statusCategory(rawStatus);
+                          final prayedByUid = (data['acknowledgedByUid'] ?? data['prayedByUid'] ?? '').toString();
+                          final forwarded =
+                              (data['forwardedToPrayerTowerAt'] is Timestamp) ||
+                              (data['forwardedToPrayerTower'] == true);
                           final requestedAt = data['requestedAt'];
                           final dt = requestedAt is Timestamp ? requestedAt.toDate() : null;
+
+                          if (_focusRequestId != null && !_autoOpened && doc.id == _focusRequestId) {
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              if (!mounted) return;
+                              setState(() => _autoOpened = true);
+                            });
+                          }
 
                           return Card(
                             child: Padding(
@@ -391,12 +619,8 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                                     runSpacing: 6,
                                     children: [
                                       Chip(
-                                        label: Text(status.toUpperCase()),
-                                        backgroundColor: status == 'new'
-                                            ? Colors.blue.shade100
-                                            : status == 'prayed'
-                                            ? Colors.green.shade100
-                                            : Colors.grey.shade300,
+                                        label: Text(_displayStatus(rawStatus)),
+                                        backgroundColor: _statusColor(rawStatus),
                                       ),
                                       if (isAnon)
                                         const Chip(
@@ -411,7 +635,7 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                                         ),
                                       if (prayedByUid.isNotEmpty)
                                         Chip(
-                                          label: Text('Prayed by: $prayedByUid'),
+                                          label: Text('Acknowledged by: $prayedByUid'),
                                           avatar: const Icon(Icons.volunteer_activism, size: 16),
                                         ),
                                       if (dt != null)
@@ -443,13 +667,13 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                                         label: const Text('Notes'),
                                       ),
                                       const SizedBox(width: 6),
-                                      if (status != 'prayed')
+                                      if (status != 'acknowledged')
                                         OutlinedButton.icon(
                                           onPressed: () => _markPrayed(doc),
                                           icon: const Icon(Icons.volunteer_activism),
-                                          label: const Text('Mark prayed'),
+                                          label: const Text('Acknowledge'),
                                         ),
-                                      if (status == 'prayed' || status == 'new') ...[
+                                      if (status == 'acknowledged' || status == 'new') ...[
                                         const SizedBox(width: 6),
                                         OutlinedButton.icon(
                                           onPressed: () => _archive(doc),
@@ -465,6 +689,18 @@ class _PrayerRequestManagePageState extends State<PrayerRequestManagePage> {
                                           label: const Text('Restore'),
                                         ),
                                       ],
+                                      const SizedBox(width: 6),
+                                      if (!forwarded)
+                                        OutlinedButton.icon(
+                                          onPressed: () => _forwardToPrayerTower(doc),
+                                          icon: const Icon(Icons.forward_to_inbox),
+                                          label: const Text('Forward'),
+                                        )
+                                      else
+                                        const Chip(
+                                          label: Text('Forwarded to Prayer Tower'),
+                                          avatar: Icon(Icons.check, size: 16),
+                                        ),
                                     ],
                                   ),
                                 ],

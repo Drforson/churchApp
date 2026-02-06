@@ -249,6 +249,39 @@ async function writeNotification(payload) {
   await db.collection('notifications').add(data);
 }
 
+async function notifyMinistryCreationRequesterResult({
+  requesterUid,
+  result,
+  ministryName,
+  ministryDocId,
+  requestId,
+  reviewerUid,
+  reason,
+}) {
+  if (!requesterUid) return;
+  const approved = result === 'approved';
+  const title = approved ? 'Your ministry was approved' : 'Your ministry was declined';
+  const body = approved
+    ? (ministryName ? `Your request to create "${ministryName}" was approved.` : 'Your ministry request was approved.')
+    : (reason
+        ? `Your request to create "${ministryName}" was declined: ${reason}`
+        : `Your request to create "${ministryName}" was declined.`);
+
+  await writeInbox(requesterUid, {
+    type: 'ministry_request_result',
+    result,
+    requestId,
+    ministryName,
+    ministryDocId: ministryDocId || null,
+    moderatorUid: reviewerUid || null,
+    reason: reason || null,
+    title,
+    body,
+    route: '/view-ministry',
+    dedupeKey: `mcr_result_${requestId}_${result}_${requesterUid}`,
+  });
+}
+
 /* =========================================================
    5) Ministries / membership helpers (by NAME)
    ========================================================= */
@@ -644,16 +677,13 @@ exports.processMinistryApprovalAction = onDocumentCreated('ministry_approval_act
         }
       }
 
-      await writeInbox(reviewerUid, {
-        type: 'approval_action_processed',
-        channel: 'approvals',
-        title: 'Approved ministry request',
-        body: `"${ministryName}" approved.`,
-        ministryId: minRef.id,
+      await notifyMinistryCreationRequesterResult({
+        requesterUid: requestedByUid || null,
+        result: 'approved',
         ministryName,
-        payload: { requestId, action: 'approve' },
-        route: '/pastor-approvals',
-        dedupeKey: `mcr_action_${requestId}_approve_${reviewerUid}`,
+        ministryDocId: minRef.id,
+        requestId,
+        reviewerUid,
       });
 
       await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
@@ -677,14 +707,14 @@ exports.processMinistryApprovalAction = onDocumentCreated('ministry_approval_act
 
     await reqRef.delete();
 
-    await writeInbox(reviewerUid, {
-      type: 'approval_action_processed',
-      channel: 'approvals',
-      title: 'Declined ministry request',
-      body: `"${ministryName}" declined${declineReason ? `: ${declineReason}` : ''}`,
-      payload: { requestId, action: 'decline' },
-      route: '/pastor-approvals',
-      dedupeKey: `mcr_action_${requestId}_decline_${reviewerUid}`,
+    await notifyMinistryCreationRequesterResult({
+      requesterUid: S(r.requestedByUid) || null,
+      result: 'declined',
+      ministryName,
+      ministryDocId: null,
+      requestId,
+      reviewerUid,
+      reason: declineReason,
     });
 
     await doc.ref.update({ status: 'ok', processed: true, processedAt: new Date() });
@@ -720,6 +750,7 @@ exports.onMinistryCreationRequestCreated = onDocumentCreated('ministry_creation_
         channel: 'approvals',
         title: 'New ministry creation request',
         body: name ? `Ministry: ${name}` : 'A new request was submitted',
+        requestId: snap.id,
         payload: { requestId: snap.id, ministryName: name || null },
         route: '/pastor-approvals',
         dedupeKey: `mcr_created_${snap.id}_${uid}`,
@@ -854,6 +885,7 @@ exports.onPrayerRequestCreated = onDocumentCreated('prayerRequests/{id}', async 
         channel,
         title,
         body,
+        prayerRequestId: snap.id,
         payload: {
           prayerRequestId: snap.id,
           name: name || null,
@@ -866,6 +898,43 @@ exports.onPrayerRequestCreated = onDocumentCreated('prayerRequests/{id}', async 
       })
     )
   );
+});
+
+exports.onPrayerRequestUpdated = onDocumentUpdated('prayerRequests/{id}', async (event) => {
+  const before = event.data?.before?.data();
+  const after = event.data?.after?.data();
+  if (!before || !after) return;
+
+  const normalize = (v) => {
+    const s = toLc(S(v || 'new'));
+    if (s === 'prayed' || s === 'acknowledged') return 'acknowledged';
+    return s;
+  };
+
+  const prev = normalize(before.status);
+  const next = normalize(after.status);
+  if (prev === next) return;
+  if (next !== 'acknowledged') return;
+
+  let recipientUid = S(after.requestedByUid) || null;
+  const requesterMemberId = S(after.requesterMemberId);
+  if (!recipientUid && requesterMemberId) {
+    const u = await findUserByMemberId(requesterMemberId);
+    if (u?.id) recipientUid = u.id;
+  }
+  if (!recipientUid) return;
+
+  const title = 'Prayer request acknowledged';
+  const body = 'A pastor has acknowledged your prayer request.';
+
+  await writeInbox(recipientUid, {
+    type: 'prayer_request_acknowledged',
+    prayerRequestId: event.params.id,
+    title,
+    body,
+    requestedByUid: recipientUid,
+    dedupeKey: `pr_ack_${event.params.id}_${recipientUid}`,
+  });
 });
 
 /* =========================================================

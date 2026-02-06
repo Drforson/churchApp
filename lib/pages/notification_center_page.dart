@@ -7,6 +7,9 @@ import 'package:intl/intl.dart';
 
 import '../services/notification_center.dart';
 import 'ministries_details_page.dart';
+import 'pastor_ministry_approvals_page.dart';
+import 'prayer_request_form_page.dart';
+import 'prayer_request_manage_page.dart';
 
 class NotificationCenterPage extends StatefulWidget {
   const NotificationCenterPage({super.key});
@@ -98,6 +101,8 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
         return 'Approval action processed';
       case 'prayer_request_created':
         return 'New prayer request';
+      case 'prayer_request_acknowledged':
+        return 'Prayer request acknowledged';
       default:
         return ev.title ?? 'Notification';
     }
@@ -105,9 +110,15 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
 
   /// Builds the subtitle. For join_request_result we append "by <Name>" if known.
   Widget _subtitleWidget(InboxEvent ev) {
+    final payload = (ev.raw['payload'] is Map)
+        ? Map<String, dynamic>.from(ev.raw['payload'] as Map)
+        : <String, dynamic>{};
+
     final name = (ev.raw['ministryName'] ??
         ev.raw['ministryId'] ??
         ev.raw['ministry'] ??
+        payload['ministryName'] ??
+        payload['ministryId'] ??
         '')
         .toString();
     final when = _fmtWhen(ev.createdAt);
@@ -203,6 +214,8 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
         return const Icon(Icons.task_alt);
       case 'prayer_request_created':
         return const Icon(Icons.volunteer_activism);
+      case 'prayer_request_acknowledged':
+        return const Icon(Icons.favorite);
       default:
         return const Icon(Icons.notifications);
     }
@@ -210,9 +223,26 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
 
   Future<void> _openFrom(InboxEvent ev) async {
     final type = (ev.type ?? '').toLowerCase();
-    final ministryDocId = (ev.raw['ministryDocId'] ?? '').toString().trim();
+    final payload = (ev.raw['payload'] is Map)
+        ? Map<String, dynamic>.from(ev.raw['payload'] as Map)
+        : <String, dynamic>{};
+
+    String _str(dynamic v) => (v ?? '').toString().trim();
+    String _payloadStr(String key) => _str(payload[key]);
+
+    final requestId =
+        _str(ev.raw['requestId']).isNotEmpty ? _str(ev.raw['requestId']) : _payloadStr('requestId');
+    final prayerRequestId = _str(ev.raw['prayerRequestId']).isNotEmpty
+        ? _str(ev.raw['prayerRequestId'])
+        : _payloadStr('prayerRequestId');
+
+    final ministryDocId = (ev.raw['ministryDocId'] ?? payload['ministryDocId'] ?? '').toString().trim();
     final ministryName =
-    (ev.raw['ministryName'] ?? ev.raw['ministryId'] ?? '').toString().trim();
+    (ev.raw['ministryName'] ??
+        ev.raw['ministryId'] ??
+        payload['ministryName'] ??
+        payload['ministryId'] ??
+        '').toString().trim();
 
     var resolvedMinistryDocId = ministryDocId;
     if (resolvedMinistryDocId.isEmpty && ministryName.isNotEmpty) {
@@ -255,6 +285,44 @@ class _NotificationCenterPageState extends State<NotificationCenterPage> {
     }
 
     bool opened = false;
+
+    if (!opened && type == 'ministry_request_created') {
+      opened = true;
+      if (mounted) {
+        await Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => PastorMinistryApprovalsPage(
+              requestId: requestId.isNotEmpty ? requestId : null,
+            ),
+          ),
+        );
+      }
+    }
+
+    if (!opened && type == 'prayer_request_created') {
+      opened = true;
+      if (mounted) {
+        await Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => PrayerRequestManagePage(
+              initialRequestId: prayerRequestId.isNotEmpty ? prayerRequestId : null,
+            ),
+          ),
+        );
+      }
+    }
+
+    if (!opened && type == 'prayer_request_acknowledged') {
+      opened = true;
+      if (mounted) {
+        await Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const PrayerRequestFormPage()),
+        );
+      }
+    }
 
     if (!opened &&
         (type.startsWith('join_request') ||
