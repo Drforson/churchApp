@@ -48,6 +48,7 @@ import 'pages/baptism_interest_form_page.dart';
 
 import 'services/theme_provider.dart';
 import 'services/attendance_ping_service.dart';
+import 'services/attendance_background.dart';
 import 'firebase_options.dart';
 import 'secrets.dart';
 
@@ -83,6 +84,10 @@ Future<void> _ensureLocalNotificationsInitialized() async {
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   await _ensureLocalNotificationsInitialized();
+  if ((message.data['type'] ?? '').toString().toLowerCase() ==
+      'attendance_window_ping') {
+    await AttendanceBackground.handleBackgroundPing(message);
+  }
   final hasSystemNotification = message.notification != null;
   if (!hasSystemNotification) {
     await _fln.show(

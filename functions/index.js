@@ -712,10 +712,29 @@ exports.processMinistryApprovalAction = onDocumentCreated('ministry_approval_act
         });
       });
 
-      // make requester a leader if linked to a member
-      if (requestedByUid) {
+      // make requester a leader if linked to a member (robust fallback)
+      {
         const cache = makeCtxCache();
-        const memberId = await findMemberIdByUid(requestedByUid, cache);
+        let memberId = requestedByUid
+          ? await findMemberIdByUid(requestedByUid, cache)
+          : null;
+
+        if (!memberId) {
+          const reqMid = S(r.requesterMemberId);
+          if (reqMid) {
+            const mSnap = await db.doc(`members/${reqMid}`).get();
+            if (mSnap.exists) memberId = reqMid;
+          }
+        }
+
+        if (!memberId) {
+          const reqEmail = toLc(r.requesterEmail || '');
+          if (reqEmail) {
+            const q = await db.collection('members').where('email', '==', reqEmail).limit(2).get();
+            if (q.size === 1) memberId = q.docs[0].id;
+          }
+        }
+
         if (memberId) {
           await addMemberToMinistry(memberId, ministryName, { asLeader: true });
 
@@ -724,19 +743,39 @@ exports.processMinistryApprovalAction = onDocumentCreated('ministry_approval_act
             const mSnap = await tx.get(mRef);
             const merged = mergeRoles(mSnap.exists ? (mSnap.data().roles || []) : [], ['leader'], []);
             txSyncMemberRoles(tx, memberId, merged);
-            txSyncUserRoles(tx, requestedByUid, merged);
 
-            tx.set(
-              db.doc(`users/${requestedByUid}`),
-              {
-                leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
-                updatedAt: ts(),
-              },
-              { merge: true }
-            );
+            if (requestedByUid) {
+              txSyncUserRoles(tx, requestedByUid, merged);
+              tx.set(
+                db.doc(`users/${requestedByUid}`),
+                {
+                  leadershipMinistries: admin.firestore.FieldValue.arrayUnion(ministryName),
+                  updatedAt: ts(),
+                },
+                { merge: true }
+              );
+            }
           });
 
-          await syncClaimsForUid(requestedByUid, cache);
+          if (requestedByUid) {
+            const uRef = db.doc(`users/${requestedByUid}`);
+            const uSnap = await uRef.get();
+            const uData = uSnap.data() || {};
+            const existingMemberId = S(uData.memberId);
+            if (!existingMemberId || existingMemberId === memberId) {
+              await uRef.set({ memberId, updatedAt: ts() }, { merge: true });
+            }
+
+            const mRef = db.doc(`members/${memberId}`);
+            const mSnap = await mRef.get();
+            const mData = mSnap.data() || {};
+            const existingUid = S(mData.userUid);
+            if (!existingUid || existingUid === requestedByUid) {
+              await mRef.set({ userUid: requestedByUid, updatedAt: ts() }, { merge: true });
+            }
+
+            await syncClaimsForUid(requestedByUid, cache);
+          }
         }
       }
 
@@ -2685,20 +2724,47 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
 
 exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
   const now = new Date();
-  const startFrom = new Date(now.getTime() - 30 * 1000);
-  const startTo = new Date(now.getTime() + 30 * 1000);
-
   const qs = await db.collection('attendance_windows')
-    .where('startsAt', '>=', startFrom)
-    .where('startsAt', '<=', startTo)
+    .where('startsAt', '<=', now)
     .where('pingSent', '==', false)
+    .where('closed', '==', false)
     .limit(20)
     .get();
 
-  if (qs.empty) return;
+  if (qs.empty) {
+    logger.debug('tickAttendanceWindows: no windows', { now: now.toISOString() });
+    try {
+      const next = await db.collection('attendance_windows')
+        .where('startsAt', '>', now)
+        .orderBy('startsAt')
+        .limit(1)
+        .get();
+      if (!next.empty) {
+        const w = next.docs[0].data();
+        logger.info('tickAttendanceWindows: next window in future', {
+          id: next.docs[0].id,
+          startsAt: w.startsAt?.toDate?.()?.toISOString?.(),
+          endsAt: w.endsAt?.toDate?.()?.toISOString?.(),
+          pingSent: w.pingSent,
+          closed: w.closed,
+        });
+      }
+    } catch (e) {
+      logger.debug('tickAttendanceWindows: next window lookup failed', { error: String(e) });
+    }
+    return;
+  }
 
   for (const doc of qs.docs) {
     const w = doc.data();
+    if (!w.endsAt || !w.endsAt.toDate) {
+      logger.info('tickAttendanceWindows: missing endsAt, skip', { id: doc.id });
+      continue;
+    }
+    if (w.endsAt && w.endsAt.toDate && w.endsAt.toDate() <= now) {
+      logger.info('tickAttendanceWindows: window already ended, skip', { id: doc.id });
+      continue;
+    }
     const welcomeMessage = 'Welcome! Attendance check-in is open. Tap to confirm.';
     const payload = {
       notification: {
@@ -2728,6 +2794,7 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
       },
       { merge: true }
     );
+    logger.info('tickAttendanceWindows: ping sent', { id: doc.id });
   }
 });
 

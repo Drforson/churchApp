@@ -546,6 +546,7 @@ class _MinistriesPageState extends State<MinistriesPage>
         'requestedByUid': uid,
         'requesterEmail': email,
         'requesterFullName': fullName,
+        if (mid.isNotEmpty) 'requesterMemberId': mid,
         'status': 'pending',
         'requestedAt': FieldValue.serverTimestamp(),
       });
