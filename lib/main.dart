@@ -84,6 +84,7 @@ Future<void> _ensureLocalNotificationsInitialized() async {
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   await _ensureLocalNotificationsInitialized();
+  debugPrint('[BG FCM] data=${message.data}');
   if ((message.data['type'] ?? '').toString().toLowerCase() ==
       'attendance_window_ping') {
     await AttendanceBackground.handleBackgroundPing(message);

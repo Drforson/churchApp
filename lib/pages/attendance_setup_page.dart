@@ -1,9 +1,11 @@
 // lib/pages/attendance_setup_page.dart
 import 'dart:async';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 
 import '../secrets.dart';
@@ -34,6 +36,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
   TimeOfDay _endTime = const TimeOfDay(hour: 12, minute: 0);
   double _radiusMeters = 500;
   bool _creating = false;
+  bool _testingGps = false;
 
   // ---- Override form (by memberId)
   final _overrideMemberIdCtrl = TextEditingController();
@@ -225,11 +228,11 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
     DateTime localStart = _combineLocal(_serviceDate, _startTime);
     DateTime localEnd = _combineLocal(_serviceDate, _endTime);
 
-    // Quick “start now” test: start in ~2 minutes, 10-minute window
+    // Quick “start now” test: start in ~2 minutes, 3-minute window
     if (startNowQuick) {
       final now = DateTime.now();
       localStart = now.add(const Duration(minutes: 2));
-      localEnd = localStart.add(const Duration(minutes: 10));
+      localEnd = localStart.add(const Duration(minutes: 3));
     }
 
     if (localEnd.isBefore(localStart)) {
@@ -256,6 +259,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
         'churchAddress': addr,
         'churchLocation': {'lat': lat, 'lng': lng},
         'source': 'flutter_setup_page',
+        'startNowQuick': startNowQuick,
       });
 
       if (!mounted) return;
@@ -292,6 +296,96 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       );
     } finally {
       if (mounted) setState(() => _creating = false);
+    }
+  }
+
+  Future<String?> _resolveActiveWindowId() async {
+    final now = DateTime.now();
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('attendance_windows')
+          .where('startsAt', isLessThanOrEqualTo: Timestamp.fromDate(now))
+          .orderBy('startsAt', descending: true)
+          .limit(10)
+          .get();
+      for (final d in snap.docs) {
+        final data = d.data();
+        if (data['closed'] == true) continue;
+        final endsAt = data['endsAt'] as Timestamp?;
+        if (endsAt == null) continue;
+        if (endsAt.toDate().isAfter(now)) return d.id;
+      }
+    } catch (e) {
+      debugPrint('[AttendanceSetup] resolve active window failed: $e');
+    }
+    return null;
+  }
+
+  Future<void> _testGpsNow() async {
+    if (_testingGps) return;
+    setState(() => _testingGps = true);
+    try {
+      final enabled = await Geolocator.isLocationServiceEnabled();
+      if (!enabled) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location services are off.')),
+        );
+        return;
+      }
+
+      LocationPermission perm = await Geolocator.checkPermission();
+      debugPrint('[AttendanceSetup] GPS permission: $perm');
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+        debugPrint('[AttendanceSetup] GPS permission after request: $perm');
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location permission blocked.')),
+        );
+        return;
+      }
+
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      debugPrint(
+        '[AttendanceSetup] GPS ok lat=${pos.latitude} lng=${pos.longitude} acc=${pos.accuracy}',
+      );
+
+      final windowId = await _resolveActiveWindowId();
+      if (windowId == null || windowId.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No active attendance window found.')),
+        );
+        return;
+      }
+
+      final res = await _functions
+          .httpsCallable('processAttendanceCheckin')
+          .call({
+        'windowId': windowId,
+        'deviceLocation': {'lat': pos.latitude, 'lng': pos.longitude},
+        'accuracy': pos.accuracy,
+      });
+
+      final data = (res.data is Map)
+          ? Map<String, dynamic>.from(res.data as Map)
+          : <String, dynamic>{};
+      final status = (data['status'] ?? 'unknown').toString();
+      final dist = data['distanceMeters'];
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('GPS test result: $status${dist != null ? ' (${dist}m)' : ''}'),
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('GPS test failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _testingGps = false);
     }
   }
 
@@ -549,6 +643,15 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
                             ),
                           ),
                         ],
+                      ),
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          icon: const Icon(Icons.gps_fixed),
+                          onPressed: _testingGps ? null : _testGpsNow,
+                          label: Text(_testingGps ? 'Testing GPS...' : 'Test GPS Now'),
+                        ),
                       ),
                     ],
                   ),

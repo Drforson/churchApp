@@ -92,8 +92,10 @@ class AttendanceBackground {
     }
 
     LocationPermission perm = await Geolocator.checkPermission();
+    debugPrint('[AttendanceBG] permission status: $perm');
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
+      debugPrint('[AttendanceBG] permission after request: $perm');
     }
     if (perm == LocationPermission.denied ||
         perm == LocationPermission.deniedForever) {
@@ -112,6 +114,9 @@ class AttendanceBackground {
     try {
       pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
+      );
+      debugPrint(
+        '[AttendanceBG] GPS ok lat=${pos.latitude} lng=${pos.longitude} acc=${pos.accuracy}',
       );
     } catch (e) {
       debugPrint('[AttendanceBG] GPS error: $e');

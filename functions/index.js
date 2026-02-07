@@ -2690,20 +2690,35 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
     churchAddress,
     churchLocation,
     radiusMeters = 500,
+    startNowQuick = false,
   } = req.data || {};
 
-  if (!dateKey || !startsAt || !endsAt || !churchLocation?.lat || !churchLocation?.lng) {
+  if ((!dateKey || !startsAt || !endsAt) && !startNowQuick) {
+    throw new HttpsError('invalid-argument', 'Missing date/time fields.');
+  }
+  if (!churchLocation?.lat || !churchLocation?.lng) {
     throw new HttpsError('invalid-argument', 'Missing required fields.');
   }
 
   const ref = id ? db.collection('attendance_windows').doc(id) : db.collection('attendance_windows').doc();
 
+  let startsAtMs = Number(startsAt);
+  let endsAtMs = Number(endsAt);
+  let finalDateKey = String(dateKey || '');
+
+  if (startNowQuick) {
+    const now = Date.now();
+    startsAtMs = now + 2 * 60 * 1000;
+    endsAtMs = startsAtMs + 3 * 60 * 1000;
+    finalDateKey = new Date(startsAtMs).toISOString().slice(0, 10);
+  }
+
   await ref.set(
     {
       title: title || 'Service',
-      dateKey,
-      startsAt: new Date(Number(startsAt)),
-      endsAt: new Date(Number(endsAt)),
+      dateKey: finalDateKey,
+      startsAt: new Date(startsAtMs),
+      endsAt: new Date(endsAtMs),
       churchPlaceId: churchPlaceId || null,
       churchAddress: churchAddress || null,
       churchLocation: { lat: Number(churchLocation.lat), lng: Number(churchLocation.lng) },
@@ -2726,9 +2741,7 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
   const now = new Date();
   const qs = await db.collection('attendance_windows')
     .where('startsAt', '<=', now)
-    .where('pingSent', '==', false)
-    .where('closed', '==', false)
-    .limit(20)
+    .limit(50)
     .get();
 
   if (qs.empty) {
@@ -2755,24 +2768,35 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
     return;
   }
 
+  let sent = 0;
+  let skippedClosed = 0;
+  let skippedPinged = 0;
+  let skippedEnded = 0;
+
   for (const doc of qs.docs) {
     const w = doc.data();
+    if (w.closed === true) {
+      skippedClosed++;
+      continue;
+    }
+    if (w.pingSent === true) {
+      skippedPinged++;
+      continue;
+    }
     if (!w.endsAt || !w.endsAt.toDate) {
       logger.info('tickAttendanceWindows: missing endsAt, skip', { id: doc.id });
       continue;
     }
     if (w.endsAt && w.endsAt.toDate && w.endsAt.toDate() <= now) {
-      logger.info('tickAttendanceWindows: window already ended, skip', { id: doc.id });
+      skippedEnded++;
       continue;
     }
     const welcomeMessage = 'Welcome! Attendance check-in is open. Tap to confirm.';
     const payload = {
-      notification: {
-        title: 'Welcome to service',
-        body: welcomeMessage,
-      },
       data: {
         type: 'attendance_window_ping',
+        title: 'Welcome to service',
+        body: welcomeMessage,
         windowId: doc.id,
         dateKey: String(w.dateKey),
         startsAt: String(w.startsAt.toDate().getTime()),
@@ -2782,9 +2806,21 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
         radius: String(w.radiusMeters || 500),
         welcomeMessage,
       },
+      android: { priority: 'high' },
+      apns: {
+        headers: {
+          'apns-push-type': 'background',
+          'apns-priority': '5',
+        },
+        payload: {
+          aps: {
+            'content-available': 1,
+          },
+        },
+      },
     };
 
-    await admin.messaging().sendToTopic('all_members', payload);
+    const resp = await admin.messaging().sendToTopic('all_members', payload);
     await doc.ref.set(
       {
         pingSent: true,
@@ -2794,16 +2830,24 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
       },
       { merge: true }
     );
-    logger.info('tickAttendanceWindows: ping sent', { id: doc.id });
+    sent++;
+    logger.info('tickAttendanceWindows: ping sent', { id: doc.id, resp });
   }
+
+  logger.info('tickAttendanceWindows: summary', {
+    checked: qs.size,
+    sent,
+    skippedClosed,
+    skippedPinged,
+    skippedEnded,
+  });
 });
 
 exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
   const now = new Date();
   const qs = await db.collection('attendance_windows')
     .where('startsAt', '<=', now)
-    .where('pingAttempts', '<', 2)
-    .limit(20)
+    .limit(50)
     .get();
 
   if (qs.empty) return;
@@ -2811,18 +2855,17 @@ exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
   for (const doc of qs.docs) {
     const w = doc.data();
     if (!w.endsAt || w.endsAt.toDate() <= now) continue;
-    if (!w.pingSent) continue;
+    if (w.pingSent !== true) continue;
+    if (w.pingAttempts != null && Number(w.pingAttempts) >= 2) continue;
 
     const last = w.pingSentAt?.toDate?.() || new Date(0);
     if (now.getTime() - last.getTime() < 2 * 60 * 1000) continue;
 
     const payload = {
-      notification: {
-        title: 'Attendance Check-in',
-        body: 'Reminder: please confirm your attendance.',
-      },
       data: {
         type: 'attendance_window_ping',
+        title: 'Attendance Check-in',
+        body: 'Reminder: please confirm your attendance.',
         windowId: doc.id,
         dateKey: String(w.dateKey),
         startsAt: String(w.startsAt.toDate().getTime()),
@@ -2832,9 +2875,21 @@ exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
         radius: String(w.radiusMeters || 500),
         welcomeMessage: 'Welcome! Attendance check-in is open. Tap to confirm.',
       },
+      android: { priority: 'high' },
+      apns: {
+        headers: {
+          'apns-push-type': 'background',
+          'apns-priority': '5',
+        },
+        payload: {
+          aps: {
+            'content-available': 1,
+          },
+        },
+      },
     };
 
-    await admin.messaging().sendToTopic('all_members', payload);
+    const resp = await admin.messaging().sendToTopic('all_members', payload);
     await doc.ref.set(
       {
         pingSentAt: ts(),
@@ -2843,6 +2898,7 @@ exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
       },
       { merge: true }
     );
+    logger.info('retryAttendanceWindowPing: ping sent', { id: doc.id, resp });
   }
 });
 
@@ -2852,8 +2908,7 @@ exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () =
 
   const qs = await db.collection('attendance_windows')
     .where('endsAt', '<=', soon)
-    .where('reminderSent', '==', false)
-    .limit(20)
+    .limit(50)
     .get();
 
   if (qs.empty) return;
@@ -2861,14 +2916,13 @@ exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () =
   for (const doc of qs.docs) {
     const w = doc.data();
     if (!w.endsAt || w.endsAt.toDate() <= now) continue;
+    if (w.reminderSent === true) continue;
 
     const payload = {
-      notification: {
-        title: 'Attendance closing soon',
-        body: 'Please confirm your attendance before the window closes.',
-      },
       data: {
         type: 'attendance_window_ping',
+        title: 'Attendance closing soon',
+        body: 'Please confirm your attendance before the window closes.',
         windowId: doc.id,
         dateKey: String(w.dateKey),
         startsAt: String(w.startsAt.toDate().getTime()),
@@ -2878,10 +2932,23 @@ exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () =
         radius: String(w.radiusMeters || 500),
         welcomeMessage: 'Attendance closes soon. Tap to confirm.',
       },
+      android: { priority: 'high' },
+      apns: {
+        headers: {
+          'apns-push-type': 'background',
+          'apns-priority': '5',
+        },
+        payload: {
+          aps: {
+            'content-available': 1,
+          },
+        },
+      },
     };
 
-    await admin.messaging().sendToTopic('all_members', payload);
+    const resp = await admin.messaging().sendToTopic('all_members', payload);
     await doc.ref.set({ reminderSent: true, updatedAt: ts() }, { merge: true });
+    logger.info('attendanceClosingSoonReminder: ping sent', { id: doc.id, resp });
   }
 });
 
@@ -2939,18 +3006,18 @@ exports.processAttendanceCheckin = onCall(async (req) => {
  * NOTE: This can get expensive as you scale.
  * Kept to match your current behaviour.
  */
-exports.closeAttendanceWindow = onSchedule('every 5 minutes', async () => {
+exports.closeAttendanceWindow = onSchedule('every 1 minutes', async () => {
   const now = new Date();
   const qs = await db.collection('attendance_windows')
     .where('endsAt', '<=', now)
-    .where('closed', '==', false)
-    .limit(5)
+    .limit(20)
     .get();
 
   if (qs.empty) return;
 
   for (const doc of qs.docs) {
     const w = doc.data();
+    if (w.closed === true) continue;
 
     const users = await db.collection('users').where('memberId', '!=', null).select('memberId').get();
     const presentRecs = await db.collection('attendance').doc(w.dateKey).collection('records').get();
