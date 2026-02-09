@@ -175,6 +175,9 @@ class MemberModel {
   final String email; // stored lowercase for searches
   final String? phoneNumber;
   final String? address;
+  final String? addressPlaceId;
+  final double? addressLat;
+  final double? addressLng;
   final String? preferredContactMethod;
   final DateTime? dob;
   final bool isVisitor;
@@ -208,6 +211,9 @@ class MemberModel {
     required this.email,
     this.phoneNumber,
     this.address,
+    this.addressPlaceId,
+    this.addressLat,
+    this.addressLng,
     this.preferredContactMethod,
     this.dob,
     required this.isVisitor,
@@ -240,6 +246,9 @@ class MemberModel {
       email: _safeLower(data['email'] as String?),
       phoneNumber: (data['phoneNumber'] as String?)?.trim(),
       address: (data['address'] as String?)?.trim(),
+      addressPlaceId: (data['addressPlaceId'] as String?)?.trim(),
+      addressLat: (data['addressLat'] as num?)?.toDouble(),
+      addressLng: (data['addressLng'] as num?)?.toDouble(),
       preferredContactMethod: (data['preferredContactMethod'] as String?)?.trim(),
       dob: data['dateOfBirth'] is Timestamp
           ? (data['dateOfBirth'] as Timestamp).toDate()
@@ -273,6 +282,9 @@ class MemberModel {
       'email': email.trim().toLowerCase(),
       'phoneNumber': phoneNumber,
       'address': address,
+      'addressPlaceId': addressPlaceId,
+      'addressLat': addressLat,
+      'addressLng': addressLng,
       'preferredContactMethod': preferredContactMethod,
       'dateOfBirth': dob != null ? Timestamp.fromDate(dob!) : null,
       'isVisitor': isVisitor,
@@ -298,6 +310,9 @@ class MemberModel {
     String? email,
     String? phoneNumber,
     String? address,
+    String? addressPlaceId,
+    double? addressLat,
+    double? addressLng,
     String? preferredContactMethod,
     DateTime? dob,
     bool? isVisitor,
@@ -320,6 +335,9 @@ class MemberModel {
       email: email ?? this.email,
       phoneNumber: phoneNumber ?? this.phoneNumber,
       address: address ?? this.address,
+      addressPlaceId: addressPlaceId ?? this.addressPlaceId,
+      addressLat: addressLat ?? this.addressLat,
+      addressLng: addressLng ?? this.addressLng,
       preferredContactMethod: preferredContactMethod ?? this.preferredContactMethod,
       dob: dob ?? this.dob,
       isVisitor: isVisitor ?? this.isVisitor,

@@ -199,6 +199,9 @@ class AuthService {
     required String gender,
     required DateTime dateOfBirth,
     String? address,
+    String? addressPlaceId,
+    double? addressLat,
+    double? addressLng,
   }) async {
     final user = _auth.currentUser;
     if (user == null || user.uid != uid) {
@@ -260,6 +263,9 @@ class AuthService {
       'phoneNumber': phoneNumber,
       'gender': gender,
       'address': address ?? '',
+      if (addressPlaceId != null) 'addressPlaceId': addressPlaceId,
+      if (addressLat != null) 'addressLat': addressLat,
+      if (addressLng != null) 'addressLng': addressLng,
       'dateOfBirth': Timestamp.fromDate(dateOfBirth),
       'updatedAt': now,
     };

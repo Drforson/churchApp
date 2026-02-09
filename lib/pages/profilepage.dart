@@ -7,10 +7,12 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:intl/intl.dart';
 
 import 'package:church_management_app/services/auth_service.dart';
 import 'package:church_management_app/widgets/notification_settings_panel.dart';
+import '../secrets.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -49,6 +51,15 @@ class _HomePageState extends State<HomePage> {
   final _preferredContactCtrl = TextEditingController();
   final _emergencyRelationCtrl = TextEditingController();
 
+  FlutterGooglePlacesSdk? _places;
+  final List<AutocompletePrediction> _addressPredictions = [];
+  Place? _selectedAddressPlace;
+  String? _selectedAddressPlaceId;
+  double? _selectedAddressLat;
+  double? _selectedAddressLng;
+  Timer? _addrDebounce;
+  bool _settingAddressText = false;
+
   final List<String> _maritalOptions = const ['single', 'married', 'divorced', 'widowed'];
   String? _maritalStatus;
 
@@ -63,6 +74,10 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
+    if (kGooglePlacesApiKey.isNotEmpty) {
+      _places = FlutterGooglePlacesSdk(kGooglePlacesApiKey);
+      _addressCtrl.addListener(_onAddressChanged);
+    }
     _loadProfile();
   }
 
@@ -72,6 +87,8 @@ class _HomePageState extends State<HomePage> {
     _lastNameCtrl.dispose();
     _emailCtrl.dispose();
     _phoneCtrl.dispose();
+    _addressCtrl.removeListener(_onAddressChanged);
+    _addrDebounce?.cancel();
     _addressCtrl.dispose();
     _emergencyNameCtrl.dispose();
     _emergencyPhoneCtrl.dispose();
@@ -217,7 +234,15 @@ class _HomePageState extends State<HomePage> {
       _lastNameCtrl.text = (md['lastName'] ?? '').toString();
       _emailCtrl.text = (md['email'] ?? user.email ?? '').toString();
       _phoneCtrl.text = (md['phoneNumber'] ?? md['phone'] ?? '').toString();
+      _settingAddressText = true;
       _addressCtrl.text = (md['address'] ?? '').toString();
+      _settingAddressText = false;
+      _selectedAddressPlaceId = (md['addressPlaceId'] ?? '').toString().trim();
+      if (_selectedAddressPlaceId != null && _selectedAddressPlaceId!.isEmpty) {
+        _selectedAddressPlaceId = null;
+      }
+      _selectedAddressLat = (md['addressLat'] is num) ? (md['addressLat'] as num).toDouble() : null;
+      _selectedAddressLng = (md['addressLng'] is num) ? (md['addressLng'] as num).toDouble() : null;
       _emergencyNameCtrl.text = (md['emergencyContactName'] ?? '').toString();
       _emergencyPhoneCtrl.text = (md['emergencyContactNumber'] ?? '').toString();
       _preferredContactCtrl.text = (md['preferredContactMethod'] ?? '').toString();
@@ -246,6 +271,88 @@ class _HomePageState extends State<HomePage> {
       }
     } finally {
       if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  void _onAddressChanged() {
+    if (_settingAddressText || _places == null) return;
+    final q = _addressCtrl.text.trim();
+    if (q.isEmpty) {
+      setState(() {
+        _addressPredictions.clear();
+        _selectedAddressPlace = null;
+        _selectedAddressPlaceId = null;
+        _selectedAddressLat = null;
+        _selectedAddressLng = null;
+      });
+      return;
+    }
+
+    if (_selectedAddressPlace != null || _selectedAddressPlaceId != null) {
+      setState(() {
+        _selectedAddressPlace = null;
+        _selectedAddressPlaceId = null;
+        _selectedAddressLat = null;
+        _selectedAddressLng = null;
+      });
+    }
+
+    _debouncedFindAddressPredictions(q);
+  }
+
+  void _debouncedFindAddressPredictions(String query) {
+    if (_places == null) return;
+    _addrDebounce?.cancel();
+    _addrDebounce = Timer(const Duration(milliseconds: 250), () async {
+      try {
+        final res = await _places!.findAutocompletePredictions(
+          query,
+          countries: const ['GB', 'US', 'NG', 'ZA', 'KE'],
+          newSessionToken: true,
+        );
+        if (!mounted) return;
+        setState(() {
+          _addressPredictions
+            ..clear()
+            ..addAll(res.predictions);
+        });
+      } catch (_) {
+        if (!mounted) return;
+        setState(() => _addressPredictions.clear());
+      }
+    });
+  }
+
+  Future<void> _selectAddressPrediction(AutocompletePrediction p) async {
+    if (_places == null) return;
+    try {
+      final det = await _places!.fetchPlace(
+        p.placeId,
+        fields: const [
+          PlaceField.Address,
+          PlaceField.Id,
+          PlaceField.Location,
+          PlaceField.Name,
+        ],
+      );
+      if (!mounted) return;
+      final place = det.place;
+      final display = place?.address ?? place?.name ?? _addressCtrl.text;
+      _settingAddressText = true;
+      _addressCtrl.text = display;
+      _settingAddressText = false;
+      setState(() {
+        _selectedAddressPlace = place;
+        _selectedAddressPlaceId = p.placeId;
+        _selectedAddressLat = place?.latLng?.lat;
+        _selectedAddressLng = place?.latLng?.lng;
+        _addressPredictions.clear();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to get address: $e')),
+      );
     }
   }
 
@@ -353,6 +460,19 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    final addressText = _addressCtrl.text.trim();
+    final selectedPlaceId = _selectedAddressPlaceId ?? _selectedAddressPlace?.id;
+    final selectedLat = _selectedAddressLat ?? _selectedAddressPlace?.latLng?.lat;
+    final selectedLng = _selectedAddressLng ?? _selectedAddressPlace?.latLng?.lng;
+    if (kGooglePlacesApiKey.isNotEmpty &&
+        addressText.isNotEmpty &&
+        (selectedPlaceId == null || selectedPlaceId.isEmpty)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select the address from the suggestions.')),
+      );
+      return;
+    }
+
     final first = _firstNameCtrl.text.trim();
     final last = _lastNameCtrl.text.trim();
     final fullName =
@@ -366,7 +486,7 @@ class _HomePageState extends State<HomePage> {
       'email': emailLc,
       'phoneNumber': _phoneCtrl.text.trim(),
       'gender': (_genderStatus ?? '').trim(),
-      'address': _addressCtrl.text.trim(),
+      'address': addressText,
       'preferredContactMethod': _preferredContactCtrl.text.trim(),
       'emergencyContactName': _emergencyNameCtrl.text.trim(),
       'emergencyContactNumber': _emergencyPhoneCtrl.text.trim(),
@@ -378,6 +498,19 @@ class _HomePageState extends State<HomePage> {
       if (_dob != null) 'dateOfBirth': Timestamp.fromDate(_dob!),
       if (_dob == null) 'dateOfBirth': FieldValue.delete(),
     };
+
+    if (addressText.isEmpty) {
+      profilePayload['address'] = FieldValue.delete();
+      profilePayload['addressPlaceId'] = FieldValue.delete();
+      profilePayload['addressLat'] = FieldValue.delete();
+      profilePayload['addressLng'] = FieldValue.delete();
+    } else {
+      if (selectedPlaceId != null && selectedPlaceId.isNotEmpty) {
+        profilePayload['addressPlaceId'] = selectedPlaceId;
+      }
+      if (selectedLat != null) profilePayload['addressLat'] = selectedLat;
+      if (selectedLng != null) profilePayload['addressLng'] = selectedLng;
+    }
 
     // Don’t send empty strings to Firestore
     profilePayload.removeWhere((k, v) => v is String && v.trim().isEmpty);
@@ -692,6 +825,14 @@ class _HomePageState extends State<HomePage> {
               ),
               const SizedBox(height: 12),
 
+              if (kGooglePlacesApiKey.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    'Google Places API key is missing. Address search will be manual.',
+                    style: TextStyle(fontSize: 12, color: Colors.redAccent),
+                  ),
+                ),
               TextFormField(
                 controller: _addressCtrl,
                 textInputAction: TextInputAction.next,
@@ -700,6 +841,48 @@ class _HomePageState extends State<HomePage> {
                   prefixIcon: Icon(Icons.home_outlined),
                 ),
               ),
+              if (_addressPredictions.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.black12),
+                    borderRadius: BorderRadius.circular(8),
+                    color: Colors.white,
+                  ),
+                  constraints: const BoxConstraints(maxHeight: 220),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: _addressPredictions.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, i) {
+                      final p = _addressPredictions[i];
+                      return ListTile(
+                        leading: const Icon(Icons.location_on),
+                        title: Text(p.primaryText),
+                        subtitle: p.secondaryText != null ? Text(p.secondaryText!) : null,
+                        onTap: () => _selectAddressPrediction(p),
+                      );
+                    },
+                  ),
+                ),
+              ],
+              if (_selectedAddressLat != null && _selectedAddressLng != null) ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(Icons.check_circle, color: Colors.green),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Selected: ${_addressCtrl.text.trim()}\n'
+                        'Lat: ${_selectedAddressLat!.toStringAsFixed(6)}, '
+                        'Lng: ${_selectedAddressLng!.toStringAsFixed(6)}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
               const SizedBox(height: 12),
               TextFormField(
                 controller: _preferredContactCtrl,

@@ -7,6 +7,9 @@ class MemberModel {
   final String email;
   final String? phoneNumber;
   final String? address;
+  final String? addressPlaceId;
+  final double? addressLat;
+  final double? addressLng;
   final String? preferredContactMethod;
   final DateTime? dob;
   final bool isVisitor;
@@ -25,6 +28,9 @@ class MemberModel {
     required this.email,
     this.phoneNumber,
     this.address,
+    this.addressPlaceId,
+    this.addressLat,
+    this.addressLng,
     this.preferredContactMethod,
     this.dob,
     required this.isVisitor,
@@ -46,6 +52,9 @@ class MemberModel {
       email: data['email'] ?? '',
       phoneNumber: data['phoneNumber'],
       address: data['address'],
+      addressPlaceId: data['addressPlaceId'],
+      addressLat: (data['addressLat'] as num?)?.toDouble(),
+      addressLng: (data['addressLng'] as num?)?.toDouble(),
       preferredContactMethod: data['preferredContactMethod'],
       dob: data['dateOfBirth'] is Timestamp
           ? (data['dateOfBirth'] as Timestamp).toDate()
@@ -68,6 +77,9 @@ class MemberModel {
       'email': email,
       'phoneNumber': phoneNumber,
       'address': address,
+      'addressPlaceId': addressPlaceId,
+      'addressLat': addressLat,
+      'addressLng': addressLng,
       'preferredContactMethod': preferredContactMethod,
       'dateOfBirth': dob != null ? Timestamp.fromDate(dob!) : null,
       'isVisitor': isVisitor,

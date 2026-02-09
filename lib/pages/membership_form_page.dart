@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:intl/intl.dart';
 
 import 'package:church_management_app/services/auth_service.dart';
+import 'package:church_management_app/secrets.dart';
 
 class MembershipFormPage extends StatefulWidget {
   final bool selfSignup;
@@ -32,6 +36,15 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
   final _ecPhoneCtrl = TextEditingController();
   final _preferredContactCtrl = TextEditingController();
 
+  FlutterGooglePlacesSdk? _places;
+  final List<AutocompletePrediction> _addressPredictions = [];
+  Place? _selectedAddressPlace;
+  String? _selectedAddressPlaceId;
+  double? _selectedAddressLat;
+  double? _selectedAddressLng;
+  Timer? _addrDebounce;
+  bool _settingAddressText = false;
+
   DateTime? _dob;
   String? _gender;
   bool _consent = false;
@@ -46,6 +59,10 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
   @override
   void initState() {
     super.initState();
+    if (kGooglePlacesApiKey.isNotEmpty) {
+      _places = FlutterGooglePlacesSdk(kGooglePlacesApiKey);
+      _addressCtrl.addListener(_onAddressChanged);
+    }
     if (widget.selfSignup) {
       final authEmail = FirebaseAuth.instance.currentUser?.email;
       final prefill = widget.prefillEmail ?? authEmail ?? '';
@@ -63,8 +80,93 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
     });
   }
 
+  void _onAddressChanged() {
+    if (_settingAddressText || _places == null) return;
+    final q = _addressCtrl.text.trim();
+    if (q.isEmpty) {
+      setState(() {
+        _addressPredictions.clear();
+        _selectedAddressPlace = null;
+        _selectedAddressPlaceId = null;
+        _selectedAddressLat = null;
+        _selectedAddressLng = null;
+      });
+      return;
+    }
+
+    // User typed; reset selection
+    if (_selectedAddressPlace != null || _selectedAddressPlaceId != null) {
+      setState(() {
+        _selectedAddressPlace = null;
+        _selectedAddressPlaceId = null;
+        _selectedAddressLat = null;
+        _selectedAddressLng = null;
+      });
+    }
+
+    _debouncedFindAddressPredictions(q);
+  }
+
+  void _debouncedFindAddressPredictions(String query) {
+    if (_places == null) return;
+    _addrDebounce?.cancel();
+    _addrDebounce = Timer(const Duration(milliseconds: 250), () async {
+      try {
+        final res = await _places!.findAutocompletePredictions(
+          query,
+          countries: const ['GB', 'US', 'NG', 'ZA', 'KE'],
+          newSessionToken: true,
+        );
+        if (!mounted) return;
+        setState(() {
+          _addressPredictions
+            ..clear()
+            ..addAll(res.predictions);
+        });
+      } catch (_) {
+        if (!mounted) return;
+        setState(() => _addressPredictions.clear());
+      }
+    });
+  }
+
+  Future<void> _selectAddressPrediction(AutocompletePrediction p) async {
+    if (_places == null) return;
+    try {
+      final det = await _places!.fetchPlace(
+        p.placeId,
+        fields: const [
+          PlaceField.Address,
+          PlaceField.Id,
+          PlaceField.Location,
+          PlaceField.Name,
+        ],
+      );
+      if (!mounted) return;
+      final place = det.place;
+      final display = place?.address ?? place?.name ?? _addressCtrl.text;
+      _settingAddressText = true;
+      _addressCtrl.text = display;
+      _settingAddressText = false;
+      setState(() {
+        _selectedAddressPlace = place;
+        _selectedAddressPlaceId = p.placeId;
+        _selectedAddressLat = place?.latLng?.lat;
+        _selectedAddressLng = place?.latLng?.lng;
+        _addressPredictions.clear();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to get address: $e')),
+      );
+    }
+  }
+
   @override
   void dispose() {
+    _addressCtrl.removeListener(_onAddressChanged);
+    _addrDebounce?.cancel();
     _firstNameCtrl.dispose();
     _lastNameCtrl.dispose();
     _phoneCtrl.dispose();
@@ -115,6 +217,19 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
         );
         return;
       }
+    }
+
+    final addressText = _addressCtrl.text.trim();
+    final selectedPlaceId = _selectedAddressPlaceId ?? _selectedAddressPlace?.id;
+    final selectedLat = _selectedAddressLat ?? _selectedAddressPlace?.latLng?.lat;
+    final selectedLng = _selectedAddressLng ?? _selectedAddressPlace?.latLng?.lng;
+    if (kGooglePlacesApiKey.isNotEmpty &&
+        addressText.isNotEmpty &&
+        (selectedPlaceId == null || selectedPlaceId.isEmpty)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select the address from the suggestions.')),
+      );
+      return;
     }
 
     final first = _firstNameCtrl.text.trim();
@@ -196,7 +311,10 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
 
       await FirebaseFirestore.instance.collection('members').doc(memberId).update({
         'email': authEmail,
-        'address': _addressCtrl.text.trim(),
+        'address': addressText,
+        if (selectedPlaceId != null && selectedPlaceId.isNotEmpty) 'addressPlaceId': selectedPlaceId,
+        if (selectedLat != null) 'addressLat': selectedLat,
+        if (selectedLng != null) 'addressLng': selectedLng,
         'preferredContactMethod': _preferredContactCtrl.text.trim(),
         'ministries': _selectedMinistries,
         'emergencyContactName': _ecNameCtrl.text.trim(),
@@ -217,7 +335,10 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
         'fullNameLower': fullName.toLowerCase(),
         'phoneNumber': _phoneCtrl.text.trim(),
         'email': emailLc,
-        'address': _addressCtrl.text.trim(),
+        'address': addressText,
+        if (selectedPlaceId != null && selectedPlaceId.isNotEmpty) 'addressPlaceId': selectedPlaceId,
+        if (selectedLat != null) 'addressLat': selectedLat,
+        if (selectedLng != null) 'addressLng': selectedLng,
         'preferredContactMethod': _preferredContactCtrl.text.trim(),
         'ministries': _selectedMinistries,
         'emergencyContactName': _ecNameCtrl.text.trim(),
@@ -340,6 +461,14 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
                       },
                     ),
                     const SizedBox(height: 12),
+                    if (kGooglePlacesApiKey.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.only(bottom: 8),
+                        child: Text(
+                          'Google Places API key is missing. Address search will be manual.',
+                          style: TextStyle(fontSize: 12, color: Colors.redAccent),
+                        ),
+                      ),
                     TextFormField(
                       controller: _addressCtrl,
                       decoration: const InputDecoration(
@@ -349,6 +478,48 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
                       maxLines: 2,
                       textInputAction: TextInputAction.next,
                     ),
+                    if (_addressPredictions.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.black12),
+                          borderRadius: BorderRadius.circular(8),
+                          color: Colors.white,
+                        ),
+                        constraints: const BoxConstraints(maxHeight: 220),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: _addressPredictions.length,
+                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          itemBuilder: (context, i) {
+                            final p = _addressPredictions[i];
+                            return ListTile(
+                              leading: const Icon(Icons.location_on),
+                              title: Text(p.primaryText),
+                              subtitle: p.secondaryText != null ? Text(p.secondaryText!) : null,
+                              onTap: () => _selectAddressPrediction(p),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                    if (_selectedAddressLat != null && _selectedAddressLng != null) ...[
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          const Icon(Icons.check_circle, color: Colors.green),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Selected: ${_addressCtrl.text.trim()}\n'
+                              'Lat: ${_selectedAddressLat!.toStringAsFixed(6)}, '
+                              'Lng: ${_selectedAddressLng!.toStringAsFixed(6)}',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                     const SizedBox(height: 12),
                     TextFormField(
                       controller: _preferredContactCtrl,

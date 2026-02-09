@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:church_management_app/services/auth_service.dart';
+import 'package:church_management_app/secrets.dart';
 
 class EditProfilePage extends StatefulWidget {
   final String memberId;
@@ -20,6 +24,15 @@ class _EditProfilePageState extends State<EditProfilePage> {
   final _phoneController = TextEditingController();
   final _addressController = TextEditingController();
 
+  FlutterGooglePlacesSdk? _places;
+  final List<AutocompletePrediction> _addressPredictions = [];
+  Place? _selectedAddressPlace;
+  String? _selectedAddressPlaceId;
+  double? _selectedAddressLat;
+  double? _selectedAddressLng;
+  Timer? _addrDebounce;
+  bool _settingAddressText = false;
+
   DateTime? _dob;
 
   bool _initialLoading = true;
@@ -32,11 +45,17 @@ class _EditProfilePageState extends State<EditProfilePage> {
   @override
   void initState() {
     super.initState();
+    if (kGooglePlacesApiKey.isNotEmpty) {
+      _places = FlutterGooglePlacesSdk(kGooglePlacesApiKey);
+      _addressController.addListener(_onAddressChanged);
+    }
     _loadProfile();
   }
 
   @override
   void dispose() {
+    _addressController.removeListener(_onAddressChanged);
+    _addrDebounce?.cancel();
     _firstNameController.dispose();
     _lastNameController.dispose();
     _phoneController.dispose();
@@ -56,7 +75,15 @@ class _EditProfilePageState extends State<EditProfilePage> {
         _firstNameController.text = (data['firstName'] ?? '').toString();
         _lastNameController.text = (data['lastName'] ?? '').toString();
         _phoneController.text = (data['phoneNumber'] ?? '').toString();
+        _settingAddressText = true;
         _addressController.text = (data['address'] ?? '').toString();
+        _settingAddressText = false;
+        _selectedAddressPlaceId = (data['addressPlaceId'] ?? '').toString().trim();
+        if (_selectedAddressPlaceId != null && _selectedAddressPlaceId!.isEmpty) {
+          _selectedAddressPlaceId = null;
+        }
+        _selectedAddressLat = (data['addressLat'] is num) ? (data['addressLat'] as num).toDouble() : null;
+        _selectedAddressLng = (data['addressLng'] is num) ? (data['addressLng'] as num).toDouble() : null;
 
         _originalPhone = _phoneController.text.trim();
 
@@ -78,6 +105,92 @@ class _EditProfilePageState extends State<EditProfilePage> {
     } finally {
       if (!mounted) return;
       setState(() => _initialLoading = false);
+    }
+  }
+
+  void _onAddressChanged() {
+    if (_settingAddressText || _places == null) return;
+    final q = _addressController.text.trim();
+    if (q.isEmpty) {
+      setState(() {
+        _addressPredictions.clear();
+        _selectedAddressPlace = null;
+        _selectedAddressPlaceId = null;
+        _selectedAddressLat = null;
+        _selectedAddressLng = null;
+      });
+      return;
+    }
+
+    if (_selectedAddressPlace != null || _selectedAddressPlaceId != null) {
+      setState(() {
+        _selectedAddressPlace = null;
+        _selectedAddressPlaceId = null;
+        _selectedAddressLat = null;
+        _selectedAddressLng = null;
+      });
+    }
+
+    _debouncedFindAddressPredictions(q);
+  }
+
+  void _debouncedFindAddressPredictions(String query) {
+    if (_places == null) return;
+    _addrDebounce?.cancel();
+    _addrDebounce = Timer(const Duration(milliseconds: 250), () async {
+      try {
+        final res = await _places!.findAutocompletePredictions(
+          query,
+          countries: const ['GB', 'US', 'NG', 'ZA', 'KE'],
+          newSessionToken: true,
+        );
+        if (!mounted) return;
+        setState(() {
+          _addressPredictions
+            ..clear()
+            ..addAll(res.predictions);
+        });
+      } catch (_) {
+        if (!mounted) return;
+        setState(() => _addressPredictions.clear());
+      }
+    });
+  }
+
+  Future<void> _selectAddressPrediction(AutocompletePrediction p) async {
+    if (_places == null) return;
+    try {
+      final det = await _places!.fetchPlace(
+        p.placeId,
+        fields: const [
+          PlaceField.Address,
+          PlaceField.Id,
+          PlaceField.Location,
+          PlaceField.Name,
+        ],
+      );
+      if (!mounted) return;
+      final place = det.place;
+      final display = place?.address ?? place?.name ?? _addressController.text;
+      _settingAddressText = true;
+      _addressController.text = display;
+      _settingAddressText = false;
+      setState(() {
+        _selectedAddressPlace = place;
+        _selectedAddressPlaceId = p.placeId;
+        _selectedAddressLat = place?.latLng?.lat;
+        _selectedAddressLng = place?.latLng?.lng;
+        _addressPredictions.clear();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      Fluttertoast.showToast(
+        msg: "Failed to get address: $e",
+        toastLength: Toast.LENGTH_LONG,
+        gravity: ToastGravity.TOP,
+        backgroundColor: Colors.redAccent,
+        textColor: Colors.white,
+      );
     }
   }
 
@@ -151,6 +264,24 @@ class _EditProfilePageState extends State<EditProfilePage> {
     setState(() => _saving = true);
 
     try {
+      final addressText = _addressController.text.trim();
+      final selectedPlaceId = _selectedAddressPlaceId ?? _selectedAddressPlace?.id;
+      final selectedLat = _selectedAddressLat ?? _selectedAddressPlace?.latLng?.lat;
+      final selectedLng = _selectedAddressLng ?? _selectedAddressPlace?.latLng?.lng;
+      if (kGooglePlacesApiKey.isNotEmpty &&
+          addressText.isNotEmpty &&
+          (selectedPlaceId == null || selectedPlaceId.isEmpty)) {
+        Fluttertoast.showToast(
+          msg: "Please select the address from the suggestions.",
+          toastLength: Toast.LENGTH_LONG,
+          gravity: ToastGravity.TOP,
+          backgroundColor: Colors.redAccent,
+          textColor: Colors.white,
+        );
+        setState(() => _saving = false);
+        return;
+      }
+
       final first = _firstNameController.text.trim();
       final last = _lastNameController.text.trim();
       final fullName =
@@ -161,9 +292,21 @@ class _EditProfilePageState extends State<EditProfilePage> {
         'lastName': last,
         'fullName': fullName,
         'phoneNumber': _phoneController.text.trim(),
-        'address': _addressController.text.trim(),
+        'address': addressText,
         'updatedAt': FieldValue.serverTimestamp(),
       };
+
+      if (addressText.isEmpty) {
+        payload['addressPlaceId'] = FieldValue.delete();
+        payload['addressLat'] = FieldValue.delete();
+        payload['addressLng'] = FieldValue.delete();
+      } else {
+        if (selectedPlaceId != null && selectedPlaceId.isNotEmpty) {
+          payload['addressPlaceId'] = selectedPlaceId;
+        }
+        if (selectedLat != null) payload['addressLat'] = selectedLat;
+        if (selectedLng != null) payload['addressLng'] = selectedLng;
+      }
 
       if (_dob != null) {
         payload['dateOfBirth'] = Timestamp.fromDate(_dob!);
@@ -259,10 +402,60 @@ class _EditProfilePageState extends State<EditProfilePage> {
                 },
               ),
               const SizedBox(height: 12),
+              if (kGooglePlacesApiKey.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    'Google Places API key is missing. Address search will be manual.',
+                    style: TextStyle(fontSize: 12, color: Colors.redAccent),
+                  ),
+                ),
               TextFormField(
                 controller: _addressController,
                 decoration: const InputDecoration(labelText: "Address"),
               ),
+              if (_addressPredictions.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.black12),
+                    borderRadius: BorderRadius.circular(8),
+                    color: Colors.white,
+                  ),
+                  constraints: const BoxConstraints(maxHeight: 220),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: _addressPredictions.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, i) {
+                      final p = _addressPredictions[i];
+                      return ListTile(
+                        leading: const Icon(Icons.location_on),
+                        title: Text(p.primaryText),
+                        subtitle: p.secondaryText != null ? Text(p.secondaryText!) : null,
+                        onTap: () => _selectAddressPrediction(p),
+                      );
+                    },
+                  ),
+                ),
+              ],
+              if (_selectedAddressLat != null && _selectedAddressLng != null) ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(Icons.check_circle, color: Colors.green),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Selected: ${_addressController.text.trim()}\n'
+                        'Lat: ${_selectedAddressLat!.toStringAsFixed(6)}, '
+                        'Lng: ${_selectedAddressLng!.toStringAsFixed(6)}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
               const SizedBox(height: 12),
               InkWell(
                 onTap: _pickDateOfBirth,
