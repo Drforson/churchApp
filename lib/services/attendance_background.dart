@@ -78,7 +78,7 @@ class AttendanceBackground {
   }) async {
     await _ensureInitialized();
 
-    final user = FirebaseAuth.instance.currentUser;
+    final user = await _ensureUser();
     if (user == null) {
       debugPrint('[AttendanceBG] no user; skip ($source)');
       return;
@@ -160,5 +160,15 @@ class AttendanceBackground {
       debugPrint('[AttendanceBG] resolve window failed: $e');
     }
     return null;
+  }
+
+  static Future<User?> _ensureUser() async {
+    final auth = FirebaseAuth.instance;
+    User? user = auth.currentUser;
+    if (user != null) return user;
+    try {
+      await auth.authStateChanges().first.timeout(const Duration(seconds: 3));
+    } catch (_) {}
+    return auth.currentUser;
   }
 }

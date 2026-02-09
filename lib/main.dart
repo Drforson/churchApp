@@ -114,8 +114,6 @@ Future<void> _initLocalNotifications() async {
 }
 
 Future<void> _initMessaging() async {
-  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-
   await FirebaseMessaging.instance.requestPermission(
     alert: true,
     badge: true,
@@ -230,6 +228,7 @@ final GlobalKey<NavigatorState> _rootNavKey = GlobalKey<NavigatorState>();
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
   runApp(
     MultiProvider(

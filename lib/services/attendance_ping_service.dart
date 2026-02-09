@@ -35,7 +35,7 @@ class AttendancePingService {
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final ctx = _navKey?.currentContext;
       if (ctx == null) return;
-      await ensureLocationReady(ctx, proactive: true);
+      await ensureLocationReady(ctx, proactive: true, requireBackground: true);
     });
   }
 
@@ -157,7 +157,11 @@ class AttendancePingService {
     }
   }
 
-  Future<bool> ensureLocationReady(BuildContext context, {required bool proactive}) async {
+  Future<bool> ensureLocationReady(
+    BuildContext context, {
+    required bool proactive,
+    bool requireBackground = false,
+  }) async {
     final enabled = await Geolocator.isLocationServiceEnabled();
     if (!enabled) {
       debugPrint('[AttendancePing] location services disabled');
@@ -194,6 +198,15 @@ class AttendancePingService {
         action: Geolocator.openAppSettings,
       );
       return false;
+    }
+    if (requireBackground && perm == LocationPermission.whileInUse) {
+      _showLocationDialog(
+        context,
+        title: 'Allow all the time',
+        message:
+            'To auto-check attendance in the background, set location access to "Allow all the time".',
+        action: Geolocator.openAppSettings,
+      );
     }
     return true;
   }
