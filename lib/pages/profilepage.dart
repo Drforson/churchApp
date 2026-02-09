@@ -11,7 +11,6 @@ import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:intl/intl.dart';
 
 import 'package:church_management_app/services/auth_service.dart';
-import 'package:church_management_app/widgets/notification_settings_panel.dart';
 import '../secrets.dart';
 
 class HomePage extends StatefulWidget {
@@ -741,8 +740,6 @@ class _HomePageState extends State<HomePage> {
                 ),
               _Header(percent: percent),
               const SizedBox(height: 12),
-              const NotificationSettingsPanel(),
-              const SizedBox(height: 16),
 
               Row(
                 children: [

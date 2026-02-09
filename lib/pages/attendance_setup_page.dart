@@ -20,6 +20,7 @@ class AttendanceSetupPage extends StatefulWidget {
 class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
   final _functions = FirebaseFunctions.instanceFor(region: 'europe-west2');
   final _auth = FirebaseAuth.instance;
+  final _db = FirebaseFirestore.instance;
 
   // ---- Place search
   late final FlutterGooglePlacesSdk _places;
@@ -49,6 +50,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
   bool _checkingAuth = true;
 
   Timer? _debounce;
+  bool _loadedDefaults = false;
 
   @override
   void initState() {
@@ -57,6 +59,7 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
     _places = FlutterGooglePlacesSdk(kGooglePlacesApiKey);
 
     _checkRoleClaims();
+    _loadDefaults();
     _addrCtrl.addListener(_onAddressChanged);
   }
 
@@ -73,6 +76,20 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
 
   static String _yyyyMmDd(DateTime d) =>
       DateFormat('yyyy-MM-dd').format(DateTime(d.year, d.month, d.day));
+
+  Future<void> _loadDefaults() async {
+    if (_loadedDefaults) return;
+    _loadedDefaults = true;
+    try {
+      final snap = await _db.doc('church_config/attendance').get();
+      if (!snap.exists) return;
+      final data = snap.data() ?? <String, dynamic>{};
+      final radius = data['defaultRadiusMeters'];
+      if (radius is num && radius > 0) {
+        if (mounted) setState(() => _radiusMeters = radius.toDouble());
+      }
+    } catch (_) {}
+  }
 
   Future<void> _checkRoleClaims() async {
     try {

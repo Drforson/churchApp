@@ -72,6 +72,17 @@ function ministryRoleTagFromName(name) {
   return null;
 }
 
+async function getChurchConfig(docId, defaults = {}) {
+  try {
+    const snap = await db.collection('church_config').doc(docId).get();
+    if (!snap.exists) return { ...defaults };
+    const data = snap.data() || {};
+    return { ...defaults, ...data };
+  } catch (_) {
+    return { ...defaults };
+  }
+}
+
 async function getMinistryRoleTag(ministryName) {
   if (!ministryName) return null;
   try {
@@ -362,6 +373,13 @@ async function writeInbox(uid, payload) {
   // Push notification for background/closed app (best-effort)
   try {
     if (payload?.sendPush === false) return;
+    const prefs = await getNotificationPrefs(uid);
+    if (!prefs.enabled) return;
+    const category = notificationCategory(payload);
+    if (category === 'attendance' && !prefs.attendancePing) return;
+    if (category === 'prayer' && !prefs.prayerUpdates) return;
+    if (category === 'ministry' && !prefs.ministryFeed) return;
+
     const title = (payload?.title || 'Notification').toString();
     const body = (payload?.body || payload?.type || 'You have a new notification').toString();
     const token = await _getUserFcmToken(uid);
@@ -418,6 +436,38 @@ function _buildFcmData(payload = {}) {
     if (s.trim().length) out[k] = s;
   }
   return out;
+}
+
+async function getNotificationPrefs(uid) {
+  const defaults = {
+    enabled: true,
+    attendancePing: true,
+    prayerUpdates: true,
+    ministryFeed: true,
+  };
+  if (!uid) return defaults;
+  try {
+    const snap = await db.doc(`users/${uid}`).get();
+    if (!snap.exists) return defaults;
+    const prefs = snap.get('notificationPrefs') || {};
+    return {
+      enabled: prefs.enabled !== false,
+      attendancePing: prefs.attendancePing !== false,
+      prayerUpdates: prefs.prayerUpdates !== false,
+      ministryFeed: prefs.ministryFeed !== false,
+    };
+  } catch (_) {
+    return defaults;
+  }
+}
+
+function notificationCategory(payload = {}) {
+  const type = toLc(payload.type || '');
+  if (type.startsWith('attendance_') || type === 'attendance_window_ping') return 'attendance';
+  if (type.startsWith('prayer_request')) return 'prayer';
+  if (type.startsWith('join_request')) return 'ministry';
+  if (type.startsWith('ministry_')) return 'ministry';
+  return 'general';
 }
 
 async function notifyMinistryCreationRequesterResult({
@@ -1352,6 +1402,88 @@ exports.syncUserRoleFromMemberOnLogin = onCall(async (req) => {
   await syncClaimsForUid(uid, cache);
 
   return { ok: true, role: highest, linkedMemberId: write.memberId || user?.memberId || null };
+});
+
+exports.revokeMySessions = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+  await admin.auth().revokeRefreshTokens(uid);
+  await db.doc(`users/${uid}`).set({ sessionsRevokedAt: ts(), updatedAt: ts() }, { merge: true });
+  const user = await admin.auth().getUser(uid);
+  return { ok: true, tokensValidAfterTime: user.tokensValidAfterTime || null };
+});
+
+exports.exportAttendanceReport = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+
+  const role = await getUserRole(uid);
+  const privileged = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!privileged) throw new HttpsError('permission-denied', 'Not authorized.');
+
+  const dateKey = S(req.data?.dateKey);
+  if (!dateKey) throw new HttpsError('invalid-argument', 'Missing dateKey.');
+
+  const recordsSnap = await db.collection('attendance').doc(dateKey).collection('records').get();
+  if (recordsSnap.empty) return { ok: true, dateKey, csv: 'memberId,fullName,status,checkedAt\n', count: 0 };
+
+  const rows = [];
+  const missing = [];
+  recordsSnap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    const fullName = S(data.memberFullName);
+    if (!fullName) missing.push(doc.id);
+    rows.push({
+      memberId: doc.id,
+      fullName,
+      status: S(data.status),
+      checkedAt: data.checkedAt?.toDate?.()?.toISOString?.() || '',
+      distanceMeters: data.distanceMeters ?? '',
+      isVisitor: data.memberIsVisitor ?? '',
+      gender: data.memberGenderBucket ?? '',
+      windowId: data.windowId ?? '',
+    });
+  });
+
+  const memberNameMap = new Map();
+  for (let i = 0; i < missing.length; i += 10) {
+    const chunk = missing.slice(i, i + 10);
+    try {
+      const snap = await db.collection('members').where(admin.firestore.FieldPath.documentId(), 'in', chunk).get();
+      snap.docs.forEach((d) => {
+        const m = d.data() || {};
+        memberNameMap.set(d.id, normalizeFullName(m));
+      });
+    } catch (_) {}
+  }
+
+  const header = [
+    'memberId',
+    'fullName',
+    'status',
+    'checkedAt',
+    'distanceMeters',
+    'isVisitor',
+    'gender',
+    'windowId',
+  ];
+  const lines = [header.join(',')];
+  rows.forEach((r) => {
+    const fullName = r.fullName || memberNameMap.get(r.memberId) || '';
+    const line = [
+      r.memberId,
+      `"${String(fullName).replace(/"/g, '""')}"`,
+      r.status,
+      r.checkedAt,
+      r.distanceMeters,
+      r.isVisitor,
+      r.gender,
+      r.windowId,
+    ];
+    lines.push(line.join(','));
+  });
+
+  return { ok: true, dateKey, csv: lines.join('\n'), count: rows.length };
 });
 
 /**
@@ -3543,6 +3675,19 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
 
 exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
   const now = new Date();
+  const templates = await getChurchConfig('notifications', {
+    attendanceWelcomeTitle: 'Welcome to service',
+    attendanceWelcomeBody: 'Welcome! Attendance check-in is open. Tap to confirm.',
+    attendanceWelcomeMessage: 'Welcome! Attendance check-in is open. Tap to confirm.',
+    attendanceReminderTitle: 'Attendance Check-in',
+    attendanceReminderBody: 'Reminder: please confirm your attendance.',
+    attendanceClosingTitle: 'Attendance closing soon',
+    attendanceClosingBody: 'Please confirm your attendance before the window closes.',
+    attendanceClosingMessage: 'Attendance closes soon. Tap to confirm.',
+  });
+  const welcomeTitle = S(templates.attendanceWelcomeTitle) || 'Welcome to service';
+  const welcomeBody = S(templates.attendanceWelcomeBody) || 'Welcome! Attendance check-in is open. Tap to confirm.';
+  const welcomeMessage = S(templates.attendanceWelcomeMessage) || welcomeBody;
   const qs = await db.collection('attendance_windows')
     .where('startsAt', '<=', now)
     .limit(50)
@@ -3595,12 +3740,11 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
       skippedEnded++;
       continue;
     }
-    const welcomeMessage = 'Welcome! Attendance check-in is open. Tap to confirm.';
     const payload = {
       data: {
         type: 'attendance_window_ping',
-        title: 'Welcome to service',
-        body: welcomeMessage,
+        title: welcomeTitle,
+        body: welcomeBody,
         windowId: doc.id,
         dateKey: String(w.dateKey),
         startsAt: String(w.startsAt.toDate().getTime()),
@@ -3649,6 +3793,14 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
 
 exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
   const now = new Date();
+  const templates = await getChurchConfig('notifications', {
+    attendanceWelcomeMessage: 'Welcome! Attendance check-in is open. Tap to confirm.',
+    attendanceReminderTitle: 'Attendance Check-in',
+    attendanceReminderBody: 'Reminder: please confirm your attendance.',
+  });
+  const reminderTitle = S(templates.attendanceReminderTitle) || 'Attendance Check-in';
+  const reminderBody = S(templates.attendanceReminderBody) || 'Reminder: please confirm your attendance.';
+  const reminderWelcome = S(templates.attendanceWelcomeMessage) || 'Welcome! Attendance check-in is open. Tap to confirm.';
   const qs = await db.collection('attendance_windows')
     .where('startsAt', '<=', now)
     .limit(50)
@@ -3668,8 +3820,8 @@ exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
     const payload = {
       data: {
         type: 'attendance_window_ping',
-        title: 'Attendance Check-in',
-        body: 'Reminder: please confirm your attendance.',
+        title: reminderTitle,
+        body: reminderBody,
         windowId: doc.id,
         dateKey: String(w.dateKey),
         startsAt: String(w.startsAt.toDate().getTime()),
@@ -3677,7 +3829,7 @@ exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
         lat: String(w.churchLocation.lat),
         lng: String(w.churchLocation.lng),
         radius: String(w.radiusMeters || 500),
-        welcomeMessage: 'Welcome! Attendance check-in is open. Tap to confirm.',
+        welcomeMessage: reminderWelcome,
       },
       android: { priority: 'high' },
       apns: {
@@ -3709,6 +3861,14 @@ exports.retryAttendanceWindowPing = onSchedule('every 5 minutes', async () => {
 exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () => {
   const now = new Date();
   const soon = new Date(now.getTime() + 10 * 60 * 1000);
+  const templates = await getChurchConfig('notifications', {
+    attendanceClosingTitle: 'Attendance closing soon',
+    attendanceClosingBody: 'Please confirm your attendance before the window closes.',
+    attendanceClosingMessage: 'Attendance closes soon. Tap to confirm.',
+  });
+  const closingTitle = S(templates.attendanceClosingTitle) || 'Attendance closing soon';
+  const closingBody = S(templates.attendanceClosingBody) || 'Please confirm your attendance before the window closes.';
+  const closingMessage = S(templates.attendanceClosingMessage) || 'Attendance closes soon. Tap to confirm.';
 
   const qs = await db.collection('attendance_windows')
     .where('endsAt', '<=', soon)
@@ -3725,8 +3885,8 @@ exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () =
     const payload = {
       data: {
         type: 'attendance_window_ping',
-        title: 'Attendance closing soon',
-        body: 'Please confirm your attendance before the window closes.',
+        title: closingTitle,
+        body: closingBody,
         windowId: doc.id,
         dateKey: String(w.dateKey),
         startsAt: String(w.startsAt.toDate().getTime()),
@@ -3734,7 +3894,7 @@ exports.attendanceClosingSoonReminder = onSchedule('every 5 minutes', async () =
         lat: String(w.churchLocation.lat),
         lng: String(w.churchLocation.lng),
         radius: String(w.radiusMeters || 500),
-        welcomeMessage: 'Attendance closes soon. Tap to confirm.',
+        welcomeMessage: closingMessage,
       },
       android: { priority: 'high' },
       apns: {

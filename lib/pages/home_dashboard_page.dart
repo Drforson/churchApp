@@ -779,7 +779,6 @@ class _QuickActions extends StatelessWidget {
       _ActionItem('Ministries', Icons.group, route: '/view-ministry'),
       _ActionItem('Giving', Icons.card_giftcard, route: '/giving'),
       _ActionItem('Events', Icons.event, route: '/events'),
-      _ActionItem('Profile', Icons.person, route: '/profile'),
       _ActionItem('Settings', Icons.settings, route: '/settings'),
       _ActionItem('My Requests', Icons.volunteer_activism_rounded, route: '/forms'),
       // Extra: Sermons / Media – safe "coming soon" tile (no crash)

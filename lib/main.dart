@@ -38,6 +38,7 @@ import 'pages/upload_excel_page.dart';
 import 'pages/debadmintestpage.dart';
 import 'pages/profilepage.dart';
 import 'pages/successpage.dart';
+import 'pages/role_management_page.dart';
 import 'pages/settings_page.dart';
 
 import 'pages/pastor_home_dashboard_page.dart';
@@ -127,16 +128,11 @@ Future<void> _initMessaging() async {
     sound: true,
   );
 
-  // Ensure all signed-in users are subscribed to attendance pings.
-  try {
-    await FirebaseMessaging.instance.subscribeToTopic('all_members');
-  } catch (e) {
-    debugPrint('[FCM] topic subscribe failed: $e');
-  }
+  await _syncAttendanceTopicSubscription();
 
   FirebaseMessaging.instance.onTokenRefresh.listen((token) async {
     try {
-      await FirebaseMessaging.instance.subscribeToTopic('all_members');
+      await _syncAttendanceTopicSubscription();
       if (token.isNotEmpty) {
         final uid = FirebaseAuth.instance.currentUser?.uid;
         if (uid != null) {
@@ -176,6 +172,24 @@ Future<void> _initMessaging() async {
       payload: m.data.isNotEmpty ? m.data.toString() : null,
     );
   });
+}
+
+Future<void> _syncAttendanceTopicSubscription() async {
+  try {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    final snap = await FirebaseFirestore.instance.collection('users').doc(uid).get();
+    final prefs = (snap.data()?['notificationPrefs'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+    final enabled = prefs['enabled'] != false;
+    final attendancePing = prefs['attendancePing'] != false;
+    if (enabled && attendancePing) {
+      await FirebaseMessaging.instance.subscribeToTopic('all_members');
+    } else {
+      await FirebaseMessaging.instance.unsubscribeFromTopic('all_members');
+    }
+  } catch (e) {
+    debugPrint('[FCM] attendance topic sync failed: $e');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +643,9 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
         );
       }
       return MaterialPageRoute(builder: (_) => const ExcelDatabaseUploader());
+
+    case '/manage-roles':
+      return MaterialPageRoute(builder: (_) => const RoleManagementPage());
 
     case '/testadmin':
       if (kReleaseMode) {

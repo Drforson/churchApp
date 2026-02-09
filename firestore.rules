@@ -287,7 +287,17 @@ service cloud.firestore {
     return signedIn()
       && request.auth.uid == userId
       && !changedKeys().hasAny(['roles','role','leadershipMinistries','memberId'])
-      && changedKeys().hasOnly(['email','linkedAt','createdAt','updatedAt','fcmToken','fcmTokenUpdatedAt']);
+      && changedKeys().hasOnly([
+        'email',
+        'linkedAt',
+        'createdAt',
+        'updatedAt',
+        'fcmToken',
+        'fcmTokenUpdatedAt',
+        'notificationPrefs',
+        'notificationPrefsUpdatedAt',
+        'sessionsRevokedAt'
+      ]);
   }
 
   function leaderMayUpdateLeadershipMinistries() {
@@ -396,6 +406,14 @@ service cloud.firestore {
       match /events/{eventId} {
         allow read, write: if signedIn() && request.auth.uid == uid;
       }
+    }
+
+    /* ---------------------------
+     * CHURCH CONFIG
+     * --------------------------*/
+    match /church_config/{docId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin() || isPastor();
     }
 
     /* ---------------------------

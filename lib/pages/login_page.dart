@@ -3,6 +3,7 @@ import 'dart:async';
 
 import 'package:church_management_app/pages/signup1.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 
@@ -41,7 +42,19 @@ class _LoginPageState extends State<LoginPage> {
     }
 
     try {
-      await FirebaseMessaging.instance.subscribeToTopic('all_members');
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        final snap = await FirebaseFirestore.instance.collection('users').doc(uid).get();
+        final prefs =
+            (snap.data()?['notificationPrefs'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+        final enabled = prefs['enabled'] != false;
+        final attendancePing = prefs['attendancePing'] != false;
+        if (enabled && attendancePing) {
+          await FirebaseMessaging.instance.subscribeToTopic('all_members');
+        } else {
+          await FirebaseMessaging.instance.unsubscribeFromTopic('all_members');
+        }
+      }
     } catch (e) {
       debugPrint('Subscribe to all_members failed (non-fatal): $e');
     }

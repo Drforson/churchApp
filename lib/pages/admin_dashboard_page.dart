@@ -10,7 +10,6 @@ import 'package:flutter/services.dart';
 
 import 'ministries_details_page.dart';
 import 'notification_center_page.dart'; // <-- added
-import 'follow_up_page.dart';
 
 class AdminDashboardPage extends StatefulWidget {
   const AdminDashboardPage({super.key});
@@ -311,7 +310,6 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
                 const SizedBox(height: 8),
                 _ActionsGrid(
                   canManage: canManage,
-                  isPastor: _isPastor, // show “My Follow-Up”
                 ),
                 const SizedBox(height: 8),
               ],
@@ -859,43 +857,20 @@ class _SectionTitle extends StatelessWidget {
 
 class _ActionsGrid extends StatelessWidget {
   final bool canManage;
-  final bool isPastor;
-  const _ActionsGrid({required this.canManage, required this.isPastor});
+  const _ActionsGrid({required this.canManage});
 
   @override
   Widget build(BuildContext context) {
     final items = <_ActionItem>[
-      _ActionItem('Profile', Icons.person, '/profile'),
       _ActionItem('Settings', Icons.settings, '/settings'),
       _ActionItem('Upload Sermons & Events', Icons.upload, '/admin-upload'),
-      _ActionItem(
-          'Register Member/Visitor', Icons.how_to_reg, '/register-member'),
-      _ActionItem('View Members', Icons.group, '/view-members'),
-      _ActionItem('Manage Ministries', Icons.group_work, '/view-ministry'),
       _ActionItem('Post Announcements', Icons.campaign, '/post-announcements'),
       _ActionItem('Events', Icons.event, '/events'),
-      _ActionItem('Upload Database', Icons.table_view, '/uploadExcel'),
-      _ActionItem(
-          'Attendance Check-In', Icons.check_circle_outline, '/attendance'),
-      _ActionItem(
-          'Attendance Setup', Icons.how_to_reg, '/attendance-setup'),
       _ActionItem('My Requests', Icons.volunteer_activism_rounded, '/forms'),
-      _ActionItem(
-        'Sunday Follow-Up',
-        Icons.person_off,
-        '/follow-up',
-        onTap: (ctx) => Navigator.push(
-          ctx,
-          MaterialPageRoute(builder: (_) => const FollowUpPage()),
-        ),
-      ),
-      _ActionItem('Send Feedback', Icons.feedback_outlined, '/feedback'),
       // FeedbackQuickButton(padding: EdgeInsets.only(left: 8)),
       //  if (role == 'admin' || role == 'leader')
       // _ActionItem('Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin'),
 
-      if (isPastor)
-        _ActionItem('My Follow-Up', Icons.assignment_ind, '/my-follow-up'),
       _ActionItem(
           'Admin/Leader Tools', Icons.admin_panel_settings, '/testadmin',
           requireManage: true),
