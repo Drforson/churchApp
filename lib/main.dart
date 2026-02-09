@@ -576,6 +576,9 @@ Route<dynamic> _generateRoute(RouteSettings settings) {
       return MaterialPageRoute(
           builder: (_) => const HomeDashboardPage());
 
+    case '/role-gate':
+      return MaterialPageRoute(builder: (_) => const RoleGate());
+
     case '/giving':
       return MaterialPageRoute(builder: (_) => const GivingPage());
 

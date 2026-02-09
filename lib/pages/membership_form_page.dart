@@ -175,30 +175,10 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
       }
 
       if (memberId == null || memberId.isEmpty) {
-        // Fallback: create the member doc directly (allowed when userUid == uid)
-        final fullName = [first, last].where((s) => s.isNotEmpty).join(' ').trim();
-        final memberRef = await FirebaseFirestore.instance.collection('members').add({
-          'firstName': first,
-          'lastName': last,
-          'fullName': fullName,
-          'fullNameLower': fullName.toLowerCase(),
-          'phoneNumber': _phoneCtrl.text.trim(),
-          'email': authEmail,
-          'address': _addressCtrl.text.trim(),
-          'preferredContactMethod': _preferredContactCtrl.text.trim(),
-          'ministries': _selectedMinistries,
-          'emergencyContactName': _ecNameCtrl.text.trim(),
-          'emergencyContactRelationship': _ecRelationCtrl.text.trim(),
-          'emergencyContactNumber': _ecPhoneCtrl.text.trim(),
-          'dateOfBirth': Timestamp.fromDate(_dob!),
-          'gender': genderLc,
-          'consentToDataUse': _consent,
-          'isVisitor': _isVisitor,
-          'userUid': currentUser.uid,
-          'createdAt': FieldValue.serverTimestamp(),
-          'updatedAt': FieldValue.serverTimestamp(),
-        });
-        memberId = memberRef.id;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Profile saved, but link is still syncing. Please try again shortly.')),
+        );
+        return;
       }
 
       // Ensure users.memberId is set on the server
@@ -226,6 +206,9 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
         'isVisitor': _isVisitor,
         'updatedAt': FieldValue.serverTimestamp(),
       });
+
+      if (!mounted) return;
+      Navigator.pushNamedAndRemoveUntil(context, '/role-gate', (_) => false);
     } else {
       await FirebaseFirestore.instance.collection('members').add({
         'firstName': first,
@@ -250,20 +233,21 @@ class _MembershipFormPageState extends State<MembershipFormPage> {
       });
     }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(widget.selfSignup ? 'Profile saved!' : 'Member registered!'),
-      ),
-    );
-
-    _formKey.currentState!.reset();
-    setState(() {
-      _dob = null;
-      _gender = null;
-      _consent = false;
-      _isVisitor = false;
-      _selectedMinistries = [];
-    });
+    if (!widget.selfSignup) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Member registered!'),
+        ),
+      );
+      _formKey.currentState!.reset();
+      setState(() {
+        _dob = null;
+        _gender = null;
+        _consent = false;
+        _isVisitor = false;
+        _selectedMinistries = [];
+      });
+    }
   }
 
   @override

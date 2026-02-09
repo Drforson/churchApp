@@ -220,24 +220,64 @@ class AuthService {
     final now = FieldValue.serverTimestamp();
     final emailLc = (user.email ?? email).trim().toLowerCase();
 
-    // Create member
-    final memberRef = await _firestore.collection('members').add({
+    final members = _firestore.collection('members');
+    DocumentReference<Map<String, dynamic>>? targetRef;
+    bool exists = false;
+
+    // Prefer existing member by userUid.
+    final byUid = await members.where('userUid', isEqualTo: uid).limit(1).get();
+    if (byUid.docs.isNotEmpty) {
+      targetRef = byUid.docs.first.reference;
+      exists = true;
+    }
+
+    // Fallback: unique email match (avoid duplicates).
+    if (targetRef == null) {
+      final byEmail = await members.where('email', isEqualTo: emailLc).limit(2).get();
+      if (byEmail.docs.length == 1) {
+        targetRef = byEmail.docs.first.reference;
+        exists = true;
+      } else if (byEmail.docs.length > 1) {
+        throw FirebaseAuthException(
+          code: 'duplicate-member',
+          message: 'Multiple member records exist for this email. Please contact admin.',
+        );
+      }
+    }
+
+    // If still nothing, create a deterministic doc by uid (idempotent for retries).
+    if (targetRef == null) {
+      targetRef = members.doc(uid);
+      final snap = await targetRef.get();
+      exists = snap.exists;
+    }
+
+    final payload = <String, dynamic>{
       'firstName': firstName,
       'lastName': lastName,
-      'fullName': '$firstName $lastName',
+      'fullName': '$firstName $lastName'.trim(),
       'email': emailLc,
       'phoneNumber': phoneNumber,
       'gender': gender,
       'address': address ?? '',
       'dateOfBirth': Timestamp.fromDate(dateOfBirth),
-      'ministries': <String>[],
-      'leadershipMinistries': <String>[],
-      'roles': <String>[],
-      'isPastor': false,
-      'userUid': uid, // 🔑 explicit ownership link
-      'createdAt': now,
       'updatedAt': now,
-    });
+    };
+
+    if (exists) {
+      // Update only safe fields (rules allow self update on these)
+      await targetRef.update(payload);
+    } else {
+      await targetRef.set({
+        ...payload,
+        'ministries': <String>[],
+        'leadershipMinistries': <String>[],
+        'roles': <String>[],
+        'isPastor': false,
+        'userUid': uid, // explicit ownership link (allowed on create)
+        'createdAt': now,
+      });
+    }
 
     await _syncRoleFromMemberOnLogin();
     await _auth.currentUser?.getIdToken(true);

@@ -195,7 +195,7 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
       }
 
       if (!mounted) return;
-      Navigator.pushReplacementNamed(context, '/success');
+      Navigator.pushNamedAndRemoveUntil(context, '/role-gate', (_) => false);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

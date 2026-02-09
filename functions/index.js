@@ -63,6 +63,92 @@ function genderBucket(raw) {
   return 'other';
 }
 
+// Map ministry names to role tags when they imply a role.
+function ministryRoleTagFromName(name) {
+  const n = toLc(name);
+  if (!n) return null;
+  if (n.includes('usher')) return 'usher';
+  if (n.includes('media')) return 'media';
+  return null;
+}
+
+async function getMinistryRoleTag(ministryName) {
+  if (!ministryName) return null;
+  try {
+    const snap = await db.collection('ministries').where('name', '==', ministryName).limit(1).get();
+    if (!snap.empty) {
+      const data = snap.docs[0].data() || {};
+      const roleTag = toLc(data.roleTag || '');
+      if (roleTag) return roleTag;
+    }
+  } catch (_) {}
+  return ministryRoleTagFromName(ministryName);
+}
+
+async function getRoleTagsForMinistryNames(names) {
+  const tags = new Set();
+  const clean = names.map(S).filter(Boolean);
+  if (clean.length === 0) return tags;
+
+  // Chunk 'in' queries to 10.
+  for (let i = 0; i < clean.length; i += 10) {
+    const chunk = clean.slice(i, i + 10);
+    try {
+      const snap = await db.collection('ministries').where('name', 'in', chunk).get();
+      snap.docs.forEach((d) => {
+        const data = d.data() || {};
+        const roleTag = toLc(data.roleTag || '');
+        if (roleTag) tags.add(roleTag);
+      });
+    } catch (_) {}
+  }
+
+  // Fallback to name-based tags where not explicitly set.
+  clean.forEach((name) => {
+    const roleTag = ministryRoleTagFromName(name);
+    if (roleTag) tags.add(roleTag);
+  });
+
+  return tags;
+}
+
+async function getRoleTagMapForMinistryNames(names) {
+  const map = new Map();
+  const clean = uniq(names.map(S).filter(Boolean));
+  if (clean.length === 0) return map;
+
+  for (let i = 0; i < clean.length; i += 10) {
+    const chunk = clean.slice(i, i + 10);
+    try {
+      const snap = await db.collection('ministries').where('name', 'in', chunk).get();
+      snap.docs.forEach((d) => {
+        const data = d.data() || {};
+        const name = S(data.name);
+        const roleTag = toLc(data.roleTag || '');
+        if (name && roleTag) map.set(name, roleTag);
+      });
+    } catch (_) {}
+  }
+
+  clean.forEach((name) => {
+    if (map.has(name)) return;
+    const roleTag = ministryRoleTagFromName(name);
+    if (roleTag) map.set(name, roleTag);
+  });
+
+  return map;
+}
+
+function hasRoleTagForMinistries(ministryNames, roleTag, roleTagByMinistry) {
+  if (!roleTag) return false;
+  for (const name of ministryNames) {
+    if (!name) continue;
+    const tag = roleTagByMinistry?.get(name) || ministryRoleTagFromName(name);
+    if (tag === roleTag) return true;
+  }
+  return false;
+}
+
 function normalizeRoles(input) {
   const norm = uniq(asArray(input).map(toLc).filter(Boolean));
   // store only granted roles above member (member implied)
@@ -372,26 +458,119 @@ async function notifyMinistryCreationRequesterResult({
    ========================================================= */
 async function addMemberToMinistry(memberId, ministryName, { asLeader = false } = {}) {
   if (!memberId || !ministryName) return;
-  const updates = {
-    ministries: admin.firestore.FieldValue.arrayUnion(ministryName),
-    updatedAt: ts(),
-  };
-  if (asLeader) {
-    updates.leadershipMinistries = admin.firestore.FieldValue.arrayUnion(ministryName);
-  }
-  await db.doc(`members/${memberId}`).set(updates, { merge: true });
+  const roleTag = await getMinistryRoleTag(ministryName);
+
+  await db.runTransaction(async (tx) => {
+    const mRef = db.doc(`members/${memberId}`);
+    const mSnap = await tx.get(mRef);
+    if (!mSnap.exists) return;
+    const m = mSnap.data() || {};
+
+    const curMins = new Set(Array.isArray(m.ministries) ? m.ministries : []);
+    const curLeads = new Set(Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : []);
+    let roles = Array.isArray(m.roles) ? m.roles : [];
+
+    curMins.add(ministryName);
+    if (asLeader) {
+      curLeads.add(ministryName);
+      roles = mergeRoles(roles, ['leader'], []);
+    }
+    if (roleTag) roles = mergeRoles(roles, [roleTag], []);
+
+    tx.update(mRef, {
+      ministries: Array.from(curMins),
+      leadershipMinistries: Array.from(curLeads),
+      roles: normalizeRoles(roles),
+      updatedAt: ts(),
+    });
+
+    const linked = await findUserByMemberId(memberId);
+    if (linked?.id) {
+      const uRef = db.doc(`users/${linked.id}`);
+      const uSnap = await tx.get(uRef);
+      const u = uSnap.exists ? uSnap.data() || {} : {};
+
+      const uLead = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+      let uRoles = Array.isArray(u.roles) ? u.roles : [];
+      const single = toLc(u.role);
+      uRoles = uniq([single, ...uRoles]).filter(Boolean);
+
+      if (asLeader) {
+        uLead.add(ministryName);
+        uRoles = mergeRoles(uRoles, ['leader'], []);
+      }
+      if (roleTag) uRoles = mergeRoles(uRoles, [roleTag], []);
+
+      txSyncUserRoles(tx, linked.id, uRoles);
+      tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
+    }
+  });
+
+  const linked = await findUserByMemberId(memberId);
+  if (linked?.id) await syncClaimsForUid(linked.id);
 }
 
 async function removeMemberFromMinistryByName(memberId, ministryName) {
   if (!memberId || !ministryName) return;
-  await db.doc(`members/${memberId}`).set(
-    {
-      ministries: admin.firestore.FieldValue.arrayRemove(ministryName),
-      leadershipMinistries: admin.firestore.FieldValue.arrayRemove(ministryName),
+  const m = await getMemberById(memberId);
+  if (!m) return;
+
+  const currentMins = Array.isArray(m.ministries) ? m.ministries.map(S).filter(Boolean) : [];
+  const hadMinistry = currentMins.includes(ministryName);
+  const remainingMins = currentMins.filter((n) => n !== ministryName);
+  const roleTag = await getMinistryRoleTag(ministryName);
+  const remainingRoleTags = roleTag && hadMinistry ? await getRoleTagsForMinistryNames(remainingMins) : new Set();
+  const shouldRemoveRoleTag = roleTag && hadMinistry && !remainingRoleTags.has(roleTag);
+
+  await db.runTransaction(async (tx) => {
+    const mRef = db.doc(`members/${memberId}`);
+    const mSnap = await tx.get(mRef);
+    if (!mSnap.exists) return;
+    const data = mSnap.data() || {};
+
+    const curMins = new Set(Array.isArray(data.ministries) ? data.ministries : []);
+    const curLeads = new Set(Array.isArray(data.leadershipMinistries) ? data.leadershipMinistries : []);
+    let roles = Array.isArray(data.roles) ? data.roles : [];
+
+    curMins.delete(ministryName);
+    if (curLeads.has(ministryName)) {
+      curLeads.delete(ministryName);
+      if (curLeads.size === 0) roles = mergeRoles(roles, [], ['leader']);
+    }
+
+    if (shouldRemoveRoleTag) {
+      roles = mergeRoles(roles, [], [roleTag]);
+    }
+
+    tx.update(mRef, {
+      ministries: Array.from(curMins),
+      leadershipMinistries: Array.from(curLeads),
+      roles: normalizeRoles(roles),
       updatedAt: ts(),
-    },
-    { merge: true }
-  );
+    });
+
+    const linked = await findUserByMemberId(memberId);
+    if (linked?.id) {
+      const uRef = db.doc(`users/${linked.id}`);
+      const uSnap = await tx.get(uRef);
+      const u = uSnap.exists ? uSnap.data() || {} : {};
+
+      const uLead = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+      let uRoles = Array.isArray(u.roles) ? u.roles : [];
+      const single = toLc(u.role);
+      uRoles = uniq([single, ...uRoles]).filter(Boolean);
+
+      uLead.delete(ministryName);
+      if (uLead.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
+      if (shouldRemoveRoleTag) uRoles = mergeRoles(uRoles, [], [roleTag]);
+
+      txSyncUserRoles(tx, linked.id, uRoles);
+      tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
+    }
+  });
+
+  const linked = await findUserByMemberId(memberId);
+  if (linked?.id) await syncClaimsForUid(linked.id);
 }
 
 /**
@@ -2639,6 +2818,20 @@ exports.adminDeleteMinistry = onCall(async (req) => {
     if (uSnap.exists) userDocsById.set(uidValue, uSnap);
   }
 
+  const removedRoleTag = ministryName ? await getMinistryRoleTag(ministryName) : null;
+  const otherMinistryNames = new Set();
+  if (removedRoleTag) {
+    for (const mSnap of memberDocsById.values()) {
+      const m = mSnap.data() || {};
+      const mins = Array.isArray(m.ministries) ? m.ministries : [];
+      mins.map(S).filter(Boolean).forEach((n) => {
+        if (n && n !== ministryName) otherMinistryNames.add(n);
+      });
+    }
+  }
+  const roleTagByMinistry = removedRoleTag ? await getRoleTagMapForMinistryNames(Array.from(otherMinistryNames)) : new Map();
+  const removeRoleTagByUid = new Map();
+
   let batch = db.batch();
   let ops = 0;
   const commitBatch = async () => {
@@ -2661,6 +2854,12 @@ exports.adminDeleteMinistry = onCall(async (req) => {
     let roles = Array.isArray(m.roles) ? m.roles : [];
     if (leadershipMinistries.size === 0) roles = mergeRoles(roles, [], ['leader']);
 
+    if (removedRoleTag && !hasRoleTagForMinistries(Array.from(ministries), removedRoleTag, roleTagByMinistry)) {
+      roles = mergeRoles(roles, [], [removedRoleTag]);
+      const linkedUid = linkedUidByMemberId.get(mSnap.id);
+      if (linkedUid) removeRoleTagByUid.set(linkedUid, true);
+    }
+
     batch.update(mSnap.ref, {
       ministries: Array.from(ministries),
       leadershipMinistries: Array.from(leadershipMinistries),
@@ -2679,6 +2878,10 @@ exports.adminDeleteMinistry = onCall(async (req) => {
 
     let uRoles = uniq([toLc(u.role), ...(Array.isArray(u.roles) ? u.roles : [])].filter(Boolean));
     if (uLeadership.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
+
+    if (removedRoleTag && removeRoleTagByUid.get(uSnap.id)) {
+      uRoles = mergeRoles(uRoles, [], [removedRoleTag]);
+    }
 
     batch.set(
       uSnap.ref,
@@ -2779,6 +2982,8 @@ exports.setMinistryLeadership = onCall(async (req) => {
     }
   }
 
+  const roleTag = await getMinistryRoleTag(ministryName);
+
   await db.runTransaction(async (tx) => {
     const mRef = db.doc(`members/${memberId}`);
     const mSnap = await tx.get(mRef);
@@ -2797,6 +3002,7 @@ exports.setMinistryLeadership = onCall(async (req) => {
       curLeads.delete(ministryName);
       if (curLeads.size === 0) roles = mergeRoles(roles, [], ['leader']);
     }
+    if (roleTag) roles = mergeRoles(roles, [roleTag], []);
 
     tx.update(mRef, {
       ministries: Array.from(curMins),
@@ -2824,6 +3030,7 @@ exports.setMinistryLeadership = onCall(async (req) => {
         uLead.delete(ministryName);
         if (uLead.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
       }
+      if (roleTag) uRoles = mergeRoles(uRoles, [roleTag], []);
 
       txSyncUserRoles(tx, linked.id, uRoles);
       tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
@@ -2864,6 +3071,13 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
     }
   }
 
+  const currentMins = Array.isArray(m?.ministries) ? m.ministries.map(S).filter(Boolean) : [];
+  const hadMinistry = currentMins.includes(ministryName);
+  const remainingMins = currentMins.filter((n) => n !== ministryName);
+  const roleTag = await getMinistryRoleTag(ministryName);
+  const remainingRoleTags = roleTag && hadMinistry ? await getRoleTagsForMinistryNames(remainingMins) : new Set();
+  const shouldRemoveRoleTag = roleTag && hadMinistry && !remainingRoleTags.has(roleTag);
+
   await db.runTransaction(async (tx) => {
     const mRef = db.doc(`members/${memberId}`);
     const mSnap = await tx.get(mRef);
@@ -2878,6 +3092,10 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
     if (curLeads.has(ministryName)) {
       curLeads.delete(ministryName);
       if (curLeads.size === 0) roles = mergeRoles(roles, [], ['leader']);
+    }
+
+    if (shouldRemoveRoleTag) {
+      roles = mergeRoles(roles, [], [roleTag]);
     }
 
     tx.update(mRef, {
@@ -2900,6 +3118,8 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
 
       uLead.delete(ministryName);
       if (uLead.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
+
+      if (shouldRemoveRoleTag) uRoles = mergeRoles(uRoles, [], [roleTag]);
 
       txSyncUserRoles(tx, linked.id, uRoles);
       tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
