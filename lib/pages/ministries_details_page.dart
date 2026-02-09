@@ -46,11 +46,21 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
   // Resolve a user's display name from comment.authorId (uid) → users → members.fullName
   final Map<String, String> _uidToNameCache = {};
 
+  // Members list (server-side)
+  final List<MemberModel> _members = [];
+  bool _membersLoading = true;
+  bool _membersLoadingMore = false;
+  bool _membersHasMore = true;
+  String? _membersCursor;
+  String? _membersError;
+  static const int _membersPageSize = 200;
+
   @override
   void initState() {
     super.initState();
     _tabs = TabController(length: 2, vsync: this);
     _bootstrap();
+    _loadInitialMembers();
   }
 
   @override
@@ -104,25 +114,55 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
 
   /* ================= Members Tab ================= */
 
-  // Strongly-typed stream of members in this ministry using MemberModel
-  Stream<List<MemberModel>> _membersStream() {
-    return _db
-        .collection('members')
-        .where('ministries', arrayContains: widget.ministryName)
-        .snapshots()
-        .map((qs) {
-      final list = qs.docs.map((d) => MemberModel.fromDocument(d)).toList();
-      // Sort client-side by lastName, then firstName (case-insensitive)
-      list.sort((a, b) {
-        final la = (a.lastName).toLowerCase();
-        final lb = (b.lastName).toLowerCase();
-        final fa = (a.firstName).toLowerCase();
-        final fb = (b.firstName).toLowerCase();
-        final cmp = la.compareTo(lb);
-        return cmp != 0 ? cmp : fa.compareTo(fb);
-      });
-      return list;
+  Future<void> _loadInitialMembers() async {
+    setState(() {
+      _membersLoading = true;
+      _membersLoadingMore = false;
+      _membersHasMore = true;
+      _membersCursor = null;
+      _members.clear();
+      _membersError = null;
     });
+    await _loadMoreMembers();
+    if (mounted) setState(() => _membersLoading = false);
+  }
+
+  Future<void> _loadMoreMembers() async {
+    if (_membersLoadingMore || !_membersHasMore) return;
+    setState(() => _membersLoadingMore = true);
+    try {
+      final res = await _functions.httpsCallable('listMembers').call(<String, dynamic>{
+        'limit': _membersPageSize,
+        'cursor': _membersCursor ?? '',
+        'ministryName': widget.ministryName,
+      });
+      final data = res.data;
+      final results = (data is Map && data['results'] is List)
+          ? (data['results'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+          : <Map<String, dynamic>>[];
+      final nextCursor = (data is Map && data['nextCursor'] is String) ? data['nextCursor'] as String : null;
+
+      if (results.isNotEmpty) {
+        _members.addAll(results.map((m) => MemberModel.fromMap(m['id']?.toString() ?? '', m)));
+        _members.sort((a, b) {
+          final la = (a.lastName).toLowerCase();
+          final lb = (b.lastName).toLowerCase();
+          final fa = (a.firstName).toLowerCase();
+          final fb = (b.firstName).toLowerCase();
+          final cmp = la.compareTo(lb);
+          return cmp != 0 ? cmp : fa.compareTo(fb);
+        });
+      }
+      _membersCursor = nextCursor;
+      if (results.length < _membersPageSize || nextCursor == null) {
+        _membersHasMore = false;
+      }
+      _membersError = null;
+    } catch (e) {
+      _membersError = 'Failed to load members: $e';
+    } finally {
+      if (mounted) setState(() => _membersLoadingMore = false);
+    }
   }
 
   Future<void> _promoteDemote(
@@ -713,22 +753,51 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
             children: [
               if (_isLeaderHere) _pendingRequestsSection(),
               Expanded(
-                child: StreamBuilder<List<MemberModel>>(
-                  stream: _membersStream(),
-                  builder: (context, snap) {
-                    if (snap.connectionState == ConnectionState.waiting) {
-                      return const Center(child: CircularProgressIndicator());
-                    }
-                    final members = snap.data ?? const <MemberModel>[];
-                    if (members.isEmpty)
-                      return const Center(child: Text('No members yet.'));
-                    return ListView.separated(
-                      itemCount: members.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (context, i) =>
-                          _memberTileFromModel(members[i]),
-                    );
-                  },
+                child: Column(
+                  children: [
+                    if (_membersLoading)
+                      const LinearProgressIndicator(minHeight: 2),
+                    if (_membersError != null)
+                      Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          children: [
+                            Text(_membersError!, textAlign: TextAlign.center),
+                            const SizedBox(height: 8),
+                            FilledButton(
+                              onPressed: _loadInitialMembers,
+                              child: const Text('Retry'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    Expanded(
+                      child: _members.isEmpty && !_membersLoading
+                          ? const Center(child: Text('No members yet.'))
+                          : RefreshIndicator(
+                              onRefresh: _loadInitialMembers,
+                              child: ListView.separated(
+                                itemCount: _members.length + (_membersHasMore ? 1 : 0),
+                                separatorBuilder: (_, __) => const Divider(height: 1),
+                                itemBuilder: (context, i) {
+                                  if (i >= _members.length) {
+                                    return Padding(
+                                      padding: const EdgeInsets.all(12),
+                                      child: Center(
+                                        child: TextButton.icon(
+                                          onPressed: _membersLoadingMore ? null : _loadMoreMembers,
+                                          icon: const Icon(Icons.add),
+                                          label: Text(_membersLoadingMore ? 'Loading...' : 'Load more'),
+                                        ),
+                                      ),
+                                    );
+                                  }
+                                  return _memberTileFromModel(_members[i]);
+                                },
+                              ),
+                            ),
+                    ),
+                  ],
                 ),
               ),
             ],

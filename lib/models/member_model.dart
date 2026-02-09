@@ -70,6 +70,40 @@ class MemberModel {
     );
   }
 
+  factory MemberModel.fromMap(String id, Map<String, dynamic> data) {
+    return MemberModel(
+      id: id,
+      firstName: (data['firstName'] ?? '').toString(),
+      lastName: (data['lastName'] ?? '').toString(),
+      email: (data['email'] ?? '').toString(),
+      phoneNumber: (data['phoneNumber'] as String?) ?? data['phoneNumber']?.toString(),
+      address: (data['address'] as String?) ?? data['address']?.toString(),
+      addressPlaceId: (data['addressPlaceId'] as String?) ?? data['addressPlaceId']?.toString(),
+      addressLat: (data['addressLat'] as num?)?.toDouble(),
+      addressLng: (data['addressLng'] as num?)?.toDouble(),
+      preferredContactMethod:
+          (data['preferredContactMethod'] as String?) ?? data['preferredContactMethod']?.toString(),
+      dob: data['dateOfBirth'] is Timestamp
+          ? (data['dateOfBirth'] as Timestamp).toDate()
+          : (data['dob'] is Timestamp ? (data['dob'] as Timestamp).toDate() : null),
+      isVisitor: data['isVisitor'] == true,
+      emergencyContactRelationship:
+          (data['emergencyContactRelationship'] as String?) ?? data['emergencyContactRelationship']?.toString(),
+      consentToDataUse: (data['consentToDataUse'] as bool?),
+      ministries: (data['ministries'] is List)
+          ? List<String>.from((data['ministries'] as List).map((e) => e.toString()))
+          : <String>[],
+      leadershipMinistries: (data['leadershipMinistries'] is List)
+          ? List<String>.from((data['leadershipMinistries'] as List).map((e) => e.toString()))
+          : <String>[],
+      roles: (data['roles'] is List)
+          ? List<String>.from((data['roles'] as List).map((e) => e.toString()))
+          : <String>['member'],
+      userId: (data['userUid'] as String?) ?? (data['userId'] as String?) ?? data['userUid']?.toString(),
+      createdAt: data['createdAt'] is Timestamp ? data['createdAt'] as Timestamp : Timestamp.now(),
+    );
+  }
+
   Map<String, dynamic> toMap() {
     return {
       'firstName': firstName,
