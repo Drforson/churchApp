@@ -91,16 +91,18 @@ class AttendanceBackground {
       return;
     }
 
-    LocationPermission perm = await Geolocator.checkPermission();
+    final perm = await Geolocator.checkPermission();
     debugPrint('[AttendanceBG] permission status: $perm');
+    // Background isolates cannot prompt for permission.
     if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-      debugPrint('[AttendanceBG] permission after request: $perm');
-    }
-    if (perm == LocationPermission.denied ||
-        perm == LocationPermission.deniedForever) {
-      debugPrint('[AttendanceBG] location permission blocked: $perm');
+      debugPrint('[AttendanceBG] permission denied (cannot request in background)');
       await _notify('Attendance check-in', 'Allow location permission to check in.');
+      return;
+    }
+    if (perm == LocationPermission.deniedForever ||
+        perm == LocationPermission.unableToDetermine) {
+      debugPrint('[AttendanceBG] location permission blocked: $perm');
+      await _notify('Attendance check-in', 'Enable location permission in Settings to check in.');
       return;
     }
 

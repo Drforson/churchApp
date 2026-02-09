@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
+import '../services/member_search_service.dart';
 
 class ViewMembersPage extends StatefulWidget {
   const ViewMembersPage({super.key});
@@ -16,7 +19,20 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
   late TabController _tabController;
   String _viewMode = 'list';
   String _searchQuery = '';
-  late Future<QuerySnapshot> _membersFuture;
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final List<Map<String, dynamic>> _members = [];
+  QueryDocumentSnapshot? _lastMemberDoc;
+  bool _loadingMembers = true;
+  bool _loadingMore = false;
+  bool _hasMore = true;
+  static const int _pageSize = 200;
+  final List<Map<String, dynamic>> _searchResults = [];
+  bool _searchLoading = false;
+  Timer? _searchDebounce;
+  List<String> _ministryOptions = const ['All'];
+  String _selectedMinistry = 'All';
+  String _selectedGender = 'all';
+  String _selectedVisitor = 'all';
   final FirebaseFunctions _functions =
       FirebaseFunctions.instanceFor(region: 'europe-west2');
 
@@ -29,15 +45,38 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
         setState(() {
           _viewMode = _tabController.index == 4 ? 'chart' : 'list';
         });
+        if (_tabController.index != 0 && _searchQuery.isNotEmpty) {
+          setState(() {
+            _searchResults.clear();
+            _searchLoading = false;
+          });
+        } else if (_tabController.index == 0 && _searchQuery.isNotEmpty) {
+          _runMemberSearch(_searchQuery);
+        }
       }
     });
-    _membersFuture = _loadMembers();
+    _loadInitialMembers();
+    _loadMinistryOptions();
   }
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _tabController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadMinistryOptions() async {
+    try {
+      final snap = await _db.collection('ministries').orderBy('name').limit(300).get();
+      final names = snap.docs
+          .map((d) => (d.data()['name'] ?? '').toString().trim())
+          .where((n) => n.isNotEmpty)
+          .toList();
+      if (mounted) setState(() => _ministryOptions = ['All', ...names]);
+    } catch (_) {
+      if (mounted) setState(() => _ministryOptions = const ['All']);
+    }
   }
 
   String _genderBucket(dynamic raw) {
@@ -85,9 +124,119 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
     } catch (_) {}
   }
 
-  Future<QuerySnapshot> _loadMembers() async {
-    await _ensureRoleSync();
-    return FirebaseFirestore.instance.collection('members').get();
+  Future<void> _loadInitialMembers() async {
+    setState(() {
+      _loadingMembers = true;
+      _members.clear();
+      _lastMemberDoc = null;
+      _hasMore = true;
+    });
+    await _loadMoreMembers();
+    if (mounted) {
+      setState(() => _loadingMembers = false);
+    }
+  }
+
+  Future<void> _loadMoreMembers() async {
+    if (_loadingMore || !_hasMore) return;
+    setState(() => _loadingMore = true);
+    try {
+      await _ensureRoleSync();
+      Query q = _db.collection('members');
+      if (_selectedMinistry != 'All') {
+        q = q.where('ministries', arrayContains: _selectedMinistry);
+      }
+      if (_selectedGender != 'all') {
+        q = q.where('genderBucket', isEqualTo: _selectedGender);
+      }
+      if (_selectedVisitor == 'visitor') {
+        q = q.where('isVisitor', isEqualTo: true);
+      } else if (_selectedVisitor == 'member') {
+        q = q.where('isVisitor', isEqualTo: false);
+      }
+      q = q.orderBy('fullNameLower').limit(_pageSize);
+      if (_lastMemberDoc != null) {
+        q = q.startAfterDocument(_lastMemberDoc!);
+      }
+      final snap = await q.get();
+      if (snap.docs.isNotEmpty) {
+        _lastMemberDoc = snap.docs.last;
+        _members.addAll(
+          snap.docs.map((d) => {'id': d.id, ...(d.data() as Map<String, dynamic>)}),
+        );
+      }
+      if (snap.docs.length < _pageSize) {
+        _hasMore = false;
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to load members: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loadingMore = false);
+    }
+  }
+
+  void _onSearchInput(String value) {
+    final q = value.trim();
+    setState(() => _searchQuery = q);
+    if (_tabController.index != 0) return;
+    _searchDebounce?.cancel();
+    if (q.length < 2) {
+      setState(() {
+        _searchResults.clear();
+        _searchLoading = false;
+      });
+      return;
+    }
+    _searchDebounce = Timer(const Duration(milliseconds: 300), () async {
+      await _runMemberSearch(q);
+    });
+  }
+
+  void _applyFilters({
+    String? ministry,
+    String? gender,
+    String? visitor,
+  }) {
+    if (ministry != null) _selectedMinistry = ministry;
+    if (gender != null) _selectedGender = gender;
+    if (visitor != null) _selectedVisitor = visitor;
+    _searchResults.clear();
+    _loadInitialMembers();
+    if (_searchQuery.isNotEmpty) {
+      _runMemberSearch(_searchQuery);
+    }
+  }
+
+  Future<void> _runMemberSearch(String q) async {
+    if (!mounted) return;
+    setState(() => _searchLoading = true);
+    try {
+      final res = await MemberSearchService.searchMembers(
+        q,
+        limit: 80,
+        ministryName: _selectedMinistry == 'All' ? null : _selectedMinistry,
+        gender: _selectedGender,
+        visitor: _selectedVisitor,
+      );
+      if (!mounted) return;
+      setState(() {
+        _searchResults
+          ..clear()
+          ..addAll(res);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _searchResults.clear());
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Search failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _searchLoading = false);
+    }
   }
 
   @override
@@ -115,65 +264,71 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
           ],
         ),
       ),
-      body: FutureBuilder<QuerySnapshot>(
-        future: _membersFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (snapshot.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      'Error: ${snapshot.error}',
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 12),
-                    OutlinedButton.icon(
-                      onPressed: () {
-                        setState(() {
-                          _membersFuture = _loadMembers();
-                        });
-                      },
-                      icon: const Icon(Icons.refresh),
-                      label: const Text('Retry'),
-                    ),
-                  ],
+      body: Column(
+        children: [
+          if (_loadingMembers)
+            const LinearProgressIndicator(minHeight: 2),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Loaded ${_members.length} members',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
                 ),
-              ),
-            );
-          }
-
-          final currentMembers = snapshot.data?.docs
-              .map((e) => e.data() as Map<String, dynamic>)
-              .toList() ??
-              [];
-
-          return TabBarView(
-            controller: _tabController,
-            children: [
-              _buildMemberList(currentMembers),
-              _buildMinistryList(currentMembers),
-              _buildBirthdayList(_filterBirthdays(currentMembers)),
-              _buildMemberList(_filterInactive(currentMembers)),
-              _buildGenderPieChart(currentMembers),
-              _buildMemberList(_filterNewMembers(currentMembers)),
-            ],
-          );
-        },
+                if (_hasMore)
+                  TextButton.icon(
+                    onPressed: _loadingMore ? null : _loadMoreMembers,
+                    icon: const Icon(Icons.add),
+                    label: Text(_loadingMore ? 'Loading...' : 'Load more'),
+                  )
+                else
+                  const Text('All loaded'),
+              ],
+            ),
+          ),
+          if (_loadingMore)
+            const Padding(
+              padding: EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+          Expanded(
+            child: _members.isEmpty && _loadingMembers
+                ? const Center(child: CircularProgressIndicator())
+                : TabBarView(
+                    controller: _tabController,
+                    children: [
+                      _buildMemberList(_members, useServerSearch: true, showFilters: true),
+                      _buildMinistryList(_members),
+                      _buildBirthdayList(_filterBirthdays(_members)),
+                      _buildMemberList(_filterInactive(_members), useServerSearch: false, showFilters: false),
+                      _buildGenderPieChart(_members),
+                      _buildMemberList(_filterNewMembers(_members), useServerSearch: false, showFilters: false),
+                    ],
+                  ),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _buildMemberList(List<Map<String, dynamic>> members) {
-    List<Map<String, dynamic>> filtered = members.where((m) {
-      final name = '${m['firstName'] ?? ''} ${m['lastName'] ?? ''}';
-      return name.toLowerCase().contains(_searchQuery.toLowerCase());
-    }).toList();
+  Widget _buildMemberList(
+    List<Map<String, dynamic>> members, {
+    required bool useServerSearch,
+    required bool showFilters,
+  }) {
+    final q = _searchQuery.toLowerCase();
+    List<Map<String, dynamic>> filtered;
+    if (useServerSearch && q.isNotEmpty) {
+      filtered = List<Map<String, dynamic>>.from(_searchResults);
+    } else {
+      filtered = members.where((m) {
+        final name = '${m['firstName'] ?? ''} ${m['lastName'] ?? ''}';
+        return name.toLowerCase().contains(q);
+      }).toList();
+    }
 
     filtered.sort((a, b) => ('${a['firstName'] ?? ''}${a['lastName'] ?? ''}')
         .compareTo('${b['firstName'] ?? ''}${b['lastName'] ?? ''}'));
@@ -227,8 +382,70 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
                     prefixIcon: Icon(Icons.search),
                     hintText: 'Search members...',
                   ),
-                  onChanged: (value) => setState(() => _searchQuery = value),
+                  onChanged: _onSearchInput,
                 ),
+                if (showFilters) ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          value: _selectedMinistry,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Ministry',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                          items: _ministryOptions
+                              .map((m) => DropdownMenuItem(value: m, child: Text(m)))
+                              .toList(),
+                          onChanged: (v) => _applyFilters(ministry: v ?? 'All'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          value: _selectedGender,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Gender',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                          items: const [
+                            DropdownMenuItem(value: 'all', child: Text('All')),
+                            DropdownMenuItem(value: 'male', child: Text('Male')),
+                            DropdownMenuItem(value: 'female', child: Text('Female')),
+                            DropdownMenuItem(value: 'other', child: Text('Other')),
+                          ],
+                          onChanged: (v) => _applyFilters(gender: v ?? 'all'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<String>(
+                    value: _selectedVisitor,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Visitor Filter',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    items: const [
+                      DropdownMenuItem(value: 'all', child: Text('All')),
+                      DropdownMenuItem(value: 'member', child: Text('Members')),
+                      DropdownMenuItem(value: 'visitor', child: Text('Visitors')),
+                    ],
+                    onChanged: (v) => _applyFilters(visitor: v ?? 'all'),
+                  ),
+                ],
+                if (useServerSearch && _searchQuery.isNotEmpty && _searchLoading)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: LinearProgressIndicator(minHeight: 2),
+                  ),
               ],
             ),
           ),

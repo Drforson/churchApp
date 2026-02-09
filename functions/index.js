@@ -16,7 +16,12 @@
  * - Optimised leader notifications: NO N+1 queries; uses chunked `in` queries (10)
  */
 
-const { onDocumentCreated, onDocumentUpdated, onDocumentDeleted } = require('firebase-functions/v2/firestore');
+const {
+  onDocumentCreated,
+  onDocumentUpdated,
+  onDocumentDeleted,
+  onDocumentWritten,
+} = require('firebase-functions/v2/firestore');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
 const { setGlobalOptions, logger } = require('firebase-functions/v2');
@@ -40,6 +45,23 @@ const toLc = (s) => String(s ?? '').toLowerCase().trim();
 const S = (v) => (v ?? '').toString().trim();
 const uniq = (arr) => Array.from(new Set(arr));
 const asArray = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
+const digitsOnly = (s) => String(s ?? '').replace(/\D/g, '');
+
+function normalizeFullName(data) {
+  const full = S(data.fullName);
+  if (full) return full;
+  const first = S(data.firstName);
+  const last = S(data.lastName);
+  return `${first} ${last}`.trim();
+}
+
+function genderBucket(raw) {
+  const g = toLc(raw);
+  if (!g) return 'other';
+  if (g.startsWith('m') || g.includes('male') || g.includes('man') || g.includes('boy')) return 'male';
+  if (g.startsWith('f') || g.includes('female') || g.includes('woman') || g.includes('girl')) return 'female';
+  return 'other';
+}
 
 function normalizeRoles(input) {
   const norm = uniq(asArray(input).map(toLc).filter(Boolean));
@@ -1511,6 +1533,30 @@ exports.onMemberRolesChanged = onDocumentUpdated('members/{memberId}', async (ev
 });
 
 /* =========================================================
+   12b) Member search fields (server-side normalization)
+   ========================================================= */
+exports.onMemberSearchFields = onDocumentWritten('members/{memberId}', async (event) => {
+  const after = event.data?.after;
+  if (!after || !after.exists) return;
+  const data = after.data() || {};
+
+  const fullName = normalizeFullName(data);
+  const fullNameLower = toLc(fullName);
+  const phoneRaw = data.phoneNumber || data.phone || data.phoneNo || data.phone_number;
+  const phoneDigits = digitsOnly(phoneRaw);
+  const genderNorm = genderBucket(data.gender);
+
+  const updates = {};
+  if (!S(data.fullName) && fullName) updates.fullName = fullName;
+  if (fullNameLower && data.fullNameLower !== fullNameLower) updates.fullNameLower = fullNameLower;
+  if (phoneDigits && data.phoneDigits !== phoneDigits) updates.phoneDigits = phoneDigits;
+  if (genderNorm && data.genderBucket !== genderNorm) updates.genderBucket = genderNorm;
+
+  if (Object.keys(updates).length === 0) return;
+  await after.ref.set(updates, { merge: true });
+});
+
+/* =========================================================
    13) Ministry moderation helpers & callables
    ========================================================= */
 async function isLeaderOfMinistry(uid, ministryName) {
@@ -1647,6 +1693,453 @@ exports.getAdminDashboardStats = onCall(async (req) => {
     leaderMinistries,
     membersCount: membersTotal,
     pendingJoinRequestsCount: pendingJoinRequestIds.size,
+  };
+});
+
+/* =========================================================
+   12c) Server-side member search
+   ========================================================= */
+exports.searchMembers = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const role = await getUserRole(uid);
+  const allowed = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const query = toLc(req.data?.query);
+  const gender = toLc(req.data?.gender || 'all');
+  const ministryName = S(req.data?.ministryName);
+  const visitor = toLc(req.data?.visitor || 'all'); // all | member | visitor
+  const limit = Math.max(1, Math.min(Number(req.data?.limit) || 50, 100));
+  if (!query || query.length < 2) {
+    return { ok: true, results: [] };
+  }
+
+  const applyFilters = (q) => {
+    let out = q;
+    if (gender && gender !== 'all') {
+      out = out.where('genderBucket', '==', gender);
+    }
+    if (ministryName) {
+      out = out.where('ministries', 'array-contains', ministryName);
+    }
+    if (visitor === 'visitor') {
+      out = out.where('isVisitor', '==', true);
+    } else if (visitor === 'member') {
+      out = out.where('isVisitor', '==', false);
+    }
+    return out;
+  };
+
+  const results = new Map();
+  const nameEnd = `${query}\uf8ff`;
+  const nameQs = await applyFilters(
+    db.collection('members')
+    .where('fullNameLower', '>=', query)
+    .where('fullNameLower', '<=', nameEnd)
+    .orderBy('fullNameLower')
+  )
+    .limit(limit)
+    .get();
+  nameQs.docs.forEach((d) => results.set(d.id, d));
+
+  const digits = digitsOnly(query);
+  if (digits.length >= 4) {
+    const phoneEnd = `${digits}\uf8ff`;
+    const phoneQs = await applyFilters(
+      db.collection('members')
+      .where('phoneDigits', '>=', digits)
+      .where('phoneDigits', '<=', phoneEnd)
+      .orderBy('phoneDigits')
+    )
+      .limit(limit)
+      .get();
+    phoneQs.docs.forEach((d) => results.set(d.id, d));
+  }
+
+  const payload = Array.from(results.values()).slice(0, limit).map((d) => {
+    const m = d.data() || {};
+    const fullName = normalizeFullName(m);
+    return {
+      id: d.id,
+      firstName: m.firstName || '',
+      lastName: m.lastName || '',
+      fullName,
+      gender: m.gender || '',
+      isVisitor: m.isVisitor === true,
+      phoneNumber: m.phoneNumber || m.phone || '',
+      ministries: Array.isArray(m.ministries) ? m.ministries : [],
+      roles: Array.isArray(m.roles) ? m.roles : [],
+    };
+  });
+
+  return { ok: true, results: payload };
+});
+
+/**
+ * backfillMemberSearchFields
+ * - Admin/Pastor only
+ * - Runs in small batches to populate fullNameLower/phoneDigits/genderBucket
+ */
+exports.backfillMemberSearchFields = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+  if (!(await isUserPastorOrAdmin(uid))) {
+    throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+  }
+
+  const limit = Math.max(1, Math.min(Number(req.data?.limit) || 200, 500));
+  const startAfterId = S(req.data?.startAfterId);
+
+  let q = db.collection('members').orderBy(admin.firestore.FieldPath.documentId()).limit(limit);
+  if (startAfterId) {
+    const startDoc = await db.doc(`members/${startAfterId}`).get();
+    if (startDoc.exists) q = q.startAfter(startDoc);
+  }
+
+  const snap = await q.get();
+  if (snap.empty) return { ok: true, processed: 0, updated: 0, done: true };
+
+  let updated = 0;
+  let processed = 0;
+  let batch = db.batch();
+  let writes = 0;
+
+  for (const doc of snap.docs) {
+    processed++;
+    const data = doc.data() || {};
+    const fullName = normalizeFullName(data);
+    const fullNameLower = toLc(fullName);
+    const phoneRaw = data.phoneNumber || data.phone || data.phoneNo || data.phone_number;
+    const phoneDigits = digitsOnly(phoneRaw);
+    const genderNorm = genderBucket(data.gender);
+
+    const updates = {};
+    if (!S(data.fullName) && fullName) updates.fullName = fullName;
+    if (fullNameLower && data.fullNameLower !== fullNameLower) updates.fullNameLower = fullNameLower;
+    if (phoneDigits && data.phoneDigits !== phoneDigits) updates.phoneDigits = phoneDigits;
+    if (genderNorm && data.genderBucket !== genderNorm) updates.genderBucket = genderNorm;
+
+    if (Object.keys(updates).length > 0) {
+      updates.updatedAt = ts();
+      batch.set(doc.ref, updates, { merge: true });
+      updated++;
+      writes++;
+      if (writes % 400 === 0) {
+        await batch.commit();
+        batch = db.batch();
+      }
+    }
+  }
+
+  if (writes % 400 !== 0) await batch.commit();
+  const lastId = snap.docs[snap.docs.length - 1].id;
+  return { ok: true, processed, updated, done: snap.docs.length < limit, nextStartAfterId: lastId };
+});
+
+/* =========================================================
+   12d) Follow-up summary (server-side aggregates)
+   ========================================================= */
+exports.getFollowUpSummary = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const role = await getUserRole(uid);
+  const allowed = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const dateKey = S(req.data?.dateKey);
+  const windowId = S(req.data?.windowId);
+  if (!dateKey) throw Object.assign(new Error('invalid-argument'), { code: 'invalid-argument' });
+
+  const [allAgg, visitorsAgg] = await Promise.all([
+    db.collection('members').count().get(),
+    db.collection('members').where('isVisitor', '==', true).count().get(),
+  ]);
+  const totalAll = Number(allAgg.data().count || 0);
+  const totalVisitors = Number(visitorsAgg.data().count || 0);
+  const totalMembers = Math.max(totalAll - totalVisitors, 0);
+
+  let windowCount = 0;
+  try {
+    const winSnap = await db.collection('attendance_windows').where('dateKey', '==', dateKey).limit(2).get();
+    windowCount = winSnap.size;
+  } catch (_) {}
+
+  const recordsSnap = await db.collection('attendance').doc(dateKey).collection('records').get();
+  const records = [];
+
+  for (const d of recordsSnap.docs) {
+    const data = d.data() || {};
+    const recWindowId = S(data.windowId);
+    if (windowId) {
+      if (recWindowId) {
+        if (recWindowId !== windowId) continue;
+      } else if (windowCount > 1) {
+        continue;
+      }
+    }
+    records.push({ id: d.id, ...data });
+  }
+
+  // Fill missing member metadata for accurate gender/visitor stats
+  const missingIds = new Set();
+  for (const r of records) {
+    if (r.memberGenderBucket == null || r.memberIsVisitor == null) {
+      missingIds.add(r.memberId || r.id);
+    }
+  }
+
+  if (missingIds.size > 0) {
+    const ids = Array.from(missingIds);
+    for (let i = 0; i < ids.length; i += 400) {
+      const chunk = ids.slice(i, i + 400);
+      const refs = chunk.map((id) => db.doc(`members/${id}`));
+      const snaps = await db.getAll(...refs);
+      const map = new Map();
+      snaps.forEach((s) => {
+        if (s.exists) map.set(s.id, s.data() || {});
+      });
+      records.forEach((r) => {
+        const mid = r.memberId || r.id;
+        if (!mid || !map.has(mid)) return;
+        const m = map.get(mid);
+        if (r.memberGenderBucket == null) r.memberGenderBucket = genderBucket(m.gender);
+        if (r.memberIsVisitor == null) r.memberIsVisitor = Boolean(m.isVisitor);
+      });
+    }
+  }
+
+  const counts = {
+    presentMembers: 0,
+    absentMembers: 0,
+    presentVisitors: 0,
+    absentVisitors: 0,
+    malePresent: 0,
+    femalePresent: 0,
+    unknownPresent: 0,
+    maleAbsent: 0,
+    femaleAbsent: 0,
+    unknownAbsent: 0,
+  };
+
+  for (const r of records) {
+    const statusRaw = toLc(r.status || r.result || (r.present === true ? 'present' : r.present === false ? 'absent' : ''));
+    const isPresent = statusRaw === 'present';
+    const isAbsent = statusRaw === 'absent';
+    const isVisitor = Boolean(r.memberIsVisitor);
+    const g = r.memberGenderBucket || genderBucket(r.gender);
+
+    if (isVisitor) {
+      if (isPresent) counts.presentVisitors++;
+      if (isAbsent) counts.absentVisitors++;
+    } else {
+      if (isPresent) counts.presentMembers++;
+      if (isAbsent) counts.absentMembers++;
+    }
+
+    if (isPresent) {
+      if (g === 'male') counts.malePresent++;
+      else if (g === 'female') counts.femalePresent++;
+      else counts.unknownPresent++;
+    } else if (isAbsent) {
+      if (g === 'male') counts.maleAbsent++;
+      else if (g === 'female') counts.femaleAbsent++;
+      else counts.unknownAbsent++;
+    }
+  }
+
+  const absentMembers = counts.absentMembers || Math.max(totalMembers - counts.presentMembers, 0);
+  const absentVisitors = counts.absentVisitors || Math.max(totalVisitors - counts.presentVisitors, 0);
+
+  return {
+    ok: true,
+    totalMembers,
+    totalVisitors,
+    presentMembers: counts.presentMembers,
+    presentVisitors: counts.presentVisitors,
+    absentMembers,
+    absentVisitors,
+    malePresent: counts.malePresent,
+    femalePresent: counts.femalePresent,
+    unknownPresent: counts.unknownPresent,
+    maleAbsent: counts.maleAbsent,
+    femaleAbsent: counts.femaleAbsent,
+    unknownAbsent: counts.unknownAbsent,
+  };
+});
+
+/* =========================================================
+   12e) Follow-up absentees list (server-side, paged)
+   ========================================================= */
+exports.listFollowUpAbsentees = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const role = await getUserRole(uid);
+  const allowed = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const dateKey = S(req.data?.dateKey);
+  const windowId = S(req.data?.windowId);
+  const type = toLc(req.data?.type || 'member'); // member | visitor
+  const gender = toLc(req.data?.gender || 'all');
+  const ministryName = S(req.data?.ministryName);
+  const query = toLc(req.data?.query);
+  const matchMode = toLc(req.data?.matchMode || 'prefix'); // prefix | exact
+  const limit = Math.max(1, Math.min(Number(req.data?.limit) || 50, 100));
+  const cursor = req.data?.cursor || null;
+
+  if (!dateKey) throw Object.assign(new Error('invalid-argument'), { code: 'invalid-argument' });
+
+  let windowCount = 0;
+  try {
+    const winSnap = await db.collection('attendance_windows').where('dateKey', '==', dateKey).limit(2).get();
+    windowCount = winSnap.size;
+  } catch (_) {}
+
+  const presentSet = new Set();
+  let recordsSnap;
+  if (windowId && windowCount > 1) {
+    recordsSnap = await db
+      .collection('attendance')
+      .doc(dateKey)
+      .collection('records')
+      .where('windowId', '==', windowId)
+      .get();
+  } else {
+    recordsSnap = await db.collection('attendance').doc(dateKey).collection('records').get();
+  }
+
+  const isPresentRecord = (r) => {
+    const status = toLc(r.status || r.result || '');
+    if (status === 'present') return true;
+    if (status === 'absent') return false;
+    if (r.present === true) return true;
+    if (r.present === false) return false;
+    return false;
+  };
+
+  recordsSnap.docs.forEach((d) => {
+    const data = d.data() || {};
+    const recWindowId = S(data.windowId);
+    if (windowId && windowCount > 1 && recWindowId && recWindowId !== windowId) return;
+    if (windowId && windowCount > 1 && !recWindowId) return;
+    if (!isPresentRecord(data)) return;
+    const mid = S(data.memberId) || d.id;
+    if (mid) presentSet.add(mid);
+  });
+
+  const digits = query ? digitsOnly(query) : '';
+  const queryCompact = query ? query.replace(/\s/g, '') : '';
+  const isPhoneQuery = digits.length >= 4 && digits.length === queryCompact.length;
+  const orderField = isPhoneQuery ? 'phoneDigits' : 'fullNameLower';
+  const rangeQuery = query && query.length >= 2 ? (isPhoneQuery ? digits : query) : '';
+  const rangeEnd = rangeQuery ? `${rangeQuery}\uf8ff` : '';
+
+  let hasMore = true;
+  let nextCursor = null;
+  const results = [];
+
+  const applyFilters = (q) => {
+    let out = q;
+    if (gender && gender !== 'all') out = out.where('genderBucket', '==', gender);
+    if (ministryName) out = out.where('ministries', 'array-contains', ministryName);
+    if (type === 'visitor') out = out.where('isVisitor', '==', true);
+    else if (type === 'member') out = out.where('isVisitor', '==', false);
+    return out;
+  };
+
+  // Exact match mode (no prefix range)
+  if (matchMode === 'exact' && rangeQuery) {
+    let q = db.collection('members');
+    q = applyFilters(q);
+    if (isPhoneQuery) q = q.where('phoneDigits', '==', digits);
+    else q = q.where('fullNameLower', '==', query);
+    q = q.orderBy(admin.firestore.FieldPath.documentId()).limit(limit + 1);
+    if (cursor?.id) {
+      q = q.startAfter(cursor.id);
+    }
+
+    const snap = await q.get();
+    const docs = snap.docs;
+    hasMore = docs.length > limit;
+    const sliced = docs.slice(0, limit);
+    sliced.forEach((d) => {
+      const m = d.data() || {};
+      if (presentSet.has(d.id)) return;
+      results.push({
+        id: d.id,
+        firstName: m.firstName || '',
+        lastName: m.lastName || '',
+        fullName: normalizeFullName(m),
+        gender: m.gender || '',
+        isVisitor: m.isVisitor === true,
+        phoneNumber: m.phoneNumber || m.phone || '',
+        ministries: Array.isArray(m.ministries) ? m.ministries : [],
+      });
+    });
+
+    const lastDoc = sliced[sliced.length - 1];
+    nextCursor = lastDoc ? { id: lastDoc.id } : null;
+
+    return {
+      ok: true,
+      results,
+      hasMore,
+      cursor: nextCursor,
+    };
+  }
+
+  let lastFieldVal = cursor?.fieldValue ?? null;
+  let lastId = cursor?.id ?? null;
+
+  while (results.length < limit && hasMore) {
+    let q = db.collection('members');
+    q = applyFilters(q);
+    if (rangeQuery) {
+      q = q.where(orderField, '>=', rangeQuery).where(orderField, '<=', rangeEnd);
+    }
+    q = q.orderBy(orderField).orderBy(admin.firestore.FieldPath.documentId()).limit(200);
+    if (lastFieldVal != null && lastId) {
+      q = q.startAfter(lastFieldVal, lastId);
+    }
+
+    const snap = await q.get();
+    if (snap.empty) {
+      hasMore = false;
+      break;
+    }
+
+    for (const d of snap.docs) {
+      const m = d.data() || {};
+      if (presentSet.has(d.id)) continue;
+      results.push({
+        id: d.id,
+        firstName: m.firstName || '',
+        lastName: m.lastName || '',
+        fullName: normalizeFullName(m),
+        gender: m.gender || '',
+        isVisitor: m.isVisitor === true,
+        phoneNumber: m.phoneNumber || m.phone || '',
+        ministries: Array.isArray(m.ministries) ? m.ministries : [],
+      });
+      if (results.length >= limit) break;
+    }
+
+    const lastDoc = snap.docs[snap.docs.length - 1];
+    lastFieldVal = lastDoc.get(orderField) ?? '';
+    lastId = lastDoc.id;
+    nextCursor = { field: orderField, fieldValue: lastFieldVal, id: lastId };
+    if (snap.docs.length < 200) hasMore = false;
+  }
+
+  return {
+    ok: true,
+    results,
+    hasMore,
+    cursor: nextCursor,
   };
 });
 
@@ -2691,6 +3184,7 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
     churchLocation,
     radiusMeters = 500,
     startNowQuick = false,
+    resetPing = false,
   } = req.data || {};
 
   if ((!dateKey || !startsAt || !endsAt) && !startNowQuick) {
@@ -2701,6 +3195,11 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
   }
 
   const ref = id ? db.collection('attendance_windows').doc(id) : db.collection('attendance_windows').doc();
+  let isNew = !id;
+  if (id) {
+    const existing = await ref.get();
+    isNew = !existing.exists;
+  }
 
   let startsAtMs = Number(startsAt);
   let endsAtMs = Number(endsAt);
@@ -2713,6 +3212,7 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
     finalDateKey = new Date(startsAtMs).toISOString().slice(0, 10);
   }
 
+  const shouldResetPing = Boolean(resetPing) || Boolean(startNowQuick) || isNew;
   await ref.set(
     {
       title: title || 'Service',
@@ -2723,12 +3223,16 @@ exports.upsertAttendanceWindow = onCall(async (req) => {
       churchAddress: churchAddress || null,
       churchLocation: { lat: Number(churchLocation.lat), lng: Number(churchLocation.lng) },
       radiusMeters: Number(radiusMeters) || 500,
-      pingSent: false,
-      pingSentAt: null,
-      pingAttempts: admin.firestore.FieldValue.increment(0),
-      reminderSent: false,
-      closed: false,
-      createdAt: ts(),
+      ...(isNew ? { createdAt: ts() } : {}),
+      ...(shouldResetPing
+        ? {
+            pingSent: false,
+            pingSentAt: null,
+            pingAttempts: 0,
+            reminderSent: false,
+            closed: false,
+          }
+        : {}),
       updatedAt: ts(),
     },
     { merge: true }
@@ -2967,7 +3471,32 @@ exports.processAttendanceCheckin = onCall(async (req) => {
   if (now < w.startsAt.toDate() || now > w.endsAt.toDate()) throw new Error('outside-window');
 
   const uSnap = await db.doc(`users/${uid}`).get();
-  const memberId = uSnap.exists ? (uSnap.data().memberId || null) : null;
+  let memberId = uSnap.exists ? (uSnap.data().memberId || null) : null;
+  if (!memberId) {
+    try {
+      const byUid = await db.collection('members').where('userUid', '==', uid).limit(2).get();
+      if (byUid.docs.length === 1) {
+        memberId = byUid.docs[0].id;
+      }
+    } catch (_) {}
+  }
+  if (!memberId) {
+    try {
+      const email = uSnap.exists ? (uSnap.data().email || null) : null;
+      if (email) {
+        const emailLc = String(email).trim().toLowerCase();
+        const byEmail = await db.collection('members').where('email', '==', emailLc).limit(2).get();
+        if (byEmail.docs.length === 1) {
+          memberId = byEmail.docs[0].id;
+        }
+      }
+    } catch (_) {}
+  }
+  if (memberId) {
+    try {
+      await db.doc(`users/${uid}`).set({ memberId, updatedAt: ts() }, { merge: true });
+    } catch (_) {}
+  }
   if (!memberId) throw new Error('member-not-linked');
 
   const dist = Math.round(
@@ -3019,32 +3548,46 @@ exports.closeAttendanceWindow = onSchedule('every 1 minutes', async () => {
     const w = doc.data();
     if (w.closed === true) continue;
 
-    const users = await db.collection('users').where('memberId', '!=', null).select('memberId').get();
     const presentRecs = await db.collection('attendance').doc(w.dateKey).collection('records').get();
     const presentSet = new Set(presentRecs.docs.map((d) => d.id));
 
     let batch = db.batch();
     let count = 0;
+    let lastDoc = null;
 
-    for (const u of users.docs) {
-      const mid = u.data().memberId;
-      if (!mid || presentSet.has(mid)) continue;
+    while (true) {
+      let q = db
+        .collection('users')
+        .where('memberId', '!=', null)
+        .orderBy('memberId')
+        .limit(500)
+        .select('memberId');
+      if (lastDoc) q = q.startAfter(lastDoc);
+      const usersSnap = await q.get();
+      if (usersSnap.empty) break;
 
-      batch.set(
-        db.collection('attendance').doc(w.dateKey).collection('records').doc(mid),
-        { windowId: doc.id, status: 'absent', by: 'auto', closedAt: ts() },
-        { merge: true }
-      );
+      for (const u of usersSnap.docs) {
+        const mid = u.data().memberId;
+        if (!mid || presentSet.has(mid)) continue;
 
-      count++;
-      if (count % 400 === 0) {
-        await batch.commit();
-        batch = db.batch();
+        batch.set(
+          db.collection('attendance').doc(w.dateKey).collection('records').doc(mid),
+          { windowId: doc.id, status: 'absent', by: 'auto', closedAt: ts() },
+          { merge: true }
+        );
+
+        count++;
+        if (count % 400 === 0) {
+          await batch.commit();
+          batch = db.batch();
+        }
       }
+
+      lastDoc = usersSnap.docs[usersSnap.docs.length - 1];
     }
 
     await batch.commit();
-    await doc.ref.set({ closed: true, updatedAt: ts() }, { merge: true });
+    await doc.ref.set({ closed: true, closedAt: ts(), updatedAt: ts() }, { merge: true });
   }
 });
 
@@ -3071,6 +3614,50 @@ exports.overrideAttendanceStatus = onCall(async (req) => {
   );
 
   return { ok: true };
+});
+
+/* =========================================================
+   14b) Attendance record enrichment (gender/visitor/window)
+   ========================================================= */
+exports.onAttendanceRecordWrite = onDocumentWritten('attendance/{dateKey}/records/{memberId}', async (event) => {
+  const after = event.data?.after;
+  if (!after || !after.exists) return;
+
+  const { dateKey, memberId } = event.params;
+  const data = after.data() || {};
+  const updates = {};
+
+  if (!data.dateKey && dateKey) updates.dateKey = dateKey;
+  if (!data.memberId && memberId) updates.memberId = memberId;
+
+  if (!data.windowId && dateKey) {
+    try {
+      const qs = await db.collection('attendance_windows').where('dateKey', '==', dateKey).limit(2).get();
+      if (qs.docs.length === 1) {
+        updates.windowId = qs.docs[0].id;
+      }
+    } catch (_) {}
+  }
+
+  const needsMember =
+    data.memberGenderBucket == null ||
+    data.memberIsVisitor == null ||
+    data.memberFullName == null;
+
+  if (needsMember && memberId) {
+    try {
+      const mSnap = await db.doc(`members/${memberId}`).get();
+      if (mSnap.exists) {
+        const m = mSnap.data() || {};
+        if (data.memberGenderBucket == null) updates.memberGenderBucket = genderBucket(m.gender);
+        if (data.memberIsVisitor == null) updates.memberIsVisitor = Boolean(m.isVisitor);
+        if (data.memberFullName == null) updates.memberFullName = normalizeFullName(m);
+      }
+    } catch (_) {}
+  }
+
+  if (Object.keys(updates).length === 0) return;
+  await after.ref.set(updates, { merge: true });
 });
 
 /* ========================= END OF FILE ========================= */

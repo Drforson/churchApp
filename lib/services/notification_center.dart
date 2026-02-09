@@ -188,23 +188,34 @@ class NotificationCenter {
 // Lightweight switchMap so we don't need rx_dart or streams_extensions.
 // -----------------------------------------------------------------------------
 extension _SwitchMap<T> on Stream<T> {
-  Stream<R> switchMap<R>(Stream<R> Function(T value) project) async* {
+  Stream<R> switchMap<R>(Stream<R> Function(T value) project) {
+    StreamSubscription<T>? outerSub;
     StreamSubscription<R>? innerSub;
-    final controller = StreamController<R>();
-    late final StreamSubscription<T> outerSub;
 
-    outerSub = listen((outerValue) {
-      innerSub?.cancel();
-      innerSub = project(outerValue).listen(
-        controller.add,
-        onError: controller.addError,
-      );
-    }, onError: controller.addError, onDone: () async {
-      await innerSub?.cancel();
-      await controller.close();
-    });
+    late final StreamController<R> controller;
+    controller = StreamController<R>(
+      onListen: () {
+        outerSub = listen(
+          (outerValue) {
+            innerSub?.cancel();
+            innerSub = project(outerValue).listen(
+              controller.add,
+              onError: controller.addError,
+            );
+          },
+          onError: controller.addError,
+          onDone: () async {
+            await innerSub?.cancel();
+            await controller.close();
+          },
+        );
+      },
+      onCancel: () async {
+        await innerSub?.cancel();
+        await outerSub?.cancel();
+      },
+    );
 
-    yield* controller.stream;
-    await outerSub.cancel();
+    return controller.stream;
   }
 }

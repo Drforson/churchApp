@@ -26,11 +26,40 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   // Service windows
   String? _selectedWindowId;
   List<_AttendanceWindow> _availableWindows = [];
-  bool _usingWindowFallback = false;
 
   // Search
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _searchDebounce;
+  String _searchMode = 'prefix'; // prefix | exact
+
+  // Filters
+  List<String> _ministryOptions = const ['All'];
+  String _selectedMinistry = 'All';
+  String _selectedGender = 'all';
+
+  // Absentees (server-side list)
+  final Map<String, List<Map<String, dynamic>>> _absentLists = {
+    'member': [],
+    'visitor': [],
+  };
+  final Map<String, Map<String, dynamic>?> _absentCursor = {
+    'member': null,
+    'visitor': null,
+  };
+  final Map<String, bool> _absentHasMore = {
+    'member': true,
+    'visitor': true,
+  };
+  final Map<String, bool> _absentLoading = {
+    'member': false,
+    'visitor': false,
+  };
+  static const int _absentPageSize = 50;
+
+  // Summary (server-side aggregates)
+  Map<String, dynamic>? _summary;
+  bool _summaryLoading = false;
+  String? _summaryError;
 
   // Tabs
   late TabController _tabController;
@@ -43,7 +72,14 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
-    _primeRole().then((_) => _loadAvailableWindows());
+    _tabController.addListener(() {
+      if (_tabController.indexIsChanging) return;
+      _loadAbsenteesForCurrentTab(reset: false);
+    });
+    _primeRole().then((_) {
+      _loadMinistryOptions();
+      _loadAvailableWindows();
+    });
     _searchCtrl.addListener(_onSearchChanged);
   }
 
@@ -108,20 +144,68 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
               .toList();
           _selectedWindowId =
               _availableWindows.isNotEmpty ? _availableWindows.first.id : null;
-          _usingWindowFallback = true;
           _statusMessage =
               _availableWindows.isEmpty ? 'No attendance records yet.' : 'Loaded services.';
         });
+        if (_selectedWindowId != null) {
+          await _loadSummary();
+          _resetAbsentees();
+          _loadAbsenteesForCurrentTab(reset: true);
+        }
         return;
       }
       setState(() {
         _availableWindows = windows;
         _selectedWindowId = windows.isNotEmpty ? windows.first.id : null;
-        _usingWindowFallback = false;
         _statusMessage = windows.isEmpty ? 'No attendance records yet.' : 'Loaded services.';
       });
+      if (_selectedWindowId != null) {
+        await _loadSummary();
+        _resetAbsentees();
+        _loadAbsenteesForCurrentTab(reset: true);
+      }
     } catch (e) {
       setState(() => _statusMessage = 'Error fetching services: $e');
+    }
+  }
+
+  Future<void> _loadMinistryOptions() async {
+    try {
+      final snap = await _db.collection('ministries').orderBy('name').limit(300).get();
+      final names = snap.docs
+          .map((d) => (d.data()['name'] ?? '').toString().trim())
+          .where((n) => n.isNotEmpty)
+          .toList();
+      setState(() => _ministryOptions = ['All', ...names]);
+    } catch (_) {
+      setState(() => _ministryOptions = const ['All']);
+    }
+  }
+
+  Future<void> _loadSummary() async {
+    final win = _selectedWindow;
+    if (win == null) return;
+    setState(() {
+      _summaryLoading = true;
+      _summaryError = null;
+    });
+    try {
+      final res = await FirebaseFunctions.instanceFor(region: 'europe-west2')
+          .httpsCallable('getFollowUpSummary')
+          .call({
+        'dateKey': win.dateKey,
+        'windowId': win.id,
+      });
+      final data = res.data;
+      if (mounted) {
+        setState(() {
+          _summary = data is Map ? Map<String, dynamic>.from(data) : null;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _summaryError = e.toString());
+    } finally {
+      if (mounted) setState(() => _summaryLoading = false);
     }
   }
 
@@ -132,8 +216,78 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
     _searchDebounce?.cancel();
     _searchDebounce = Timer(const Duration(milliseconds: 250), () {
       if (!mounted) return;
-      setState(() => _searchQuery = _searchCtrl.text.trim().toLowerCase());
+      final q = _searchCtrl.text.trim().toLowerCase();
+      setState(() => _searchQuery = q);
+      _resetAbsentees();
+      _loadAbsenteesForCurrentTab(reset: true);
     });
+  }
+
+  void _resetAbsentees() {
+    _absentLists['member'] = [];
+    _absentLists['visitor'] = [];
+    _absentCursor['member'] = null;
+    _absentCursor['visitor'] = null;
+    _absentHasMore['member'] = true;
+    _absentHasMore['visitor'] = true;
+  }
+
+  String _currentType() => _tabController.index == 0 ? 'member' : 'visitor';
+
+  Future<void> _loadAbsenteesForCurrentTab({required bool reset}) async {
+    await _loadAbsentees(type: _currentType(), reset: reset);
+  }
+
+  Future<void> _loadAbsentees({required String type, required bool reset}) async {
+    if (_absentLoading[type] == true) return;
+    if (!reset && _absentHasMore[type] == false) return;
+    final win = _selectedWindow;
+    if (win == null) return;
+
+    setState(() => _absentLoading[type] = true);
+    if (reset) {
+      _absentLists[type] = [];
+      _absentCursor[type] = null;
+      _absentHasMore[type] = true;
+    }
+
+    try {
+      final res = await FirebaseFunctions.instanceFor(region: 'europe-west2')
+          .httpsCallable('listFollowUpAbsentees')
+          .call({
+        'dateKey': win.dateKey,
+        'windowId': win.id,
+        'type': type,
+        'gender': _selectedGender,
+        'ministryName': _selectedMinistry == 'All' ? null : _selectedMinistry,
+        'query': _searchQuery,
+        'matchMode': _searchMode,
+        'limit': _absentPageSize,
+        'cursor': _absentCursor[type],
+      });
+      final data = res.data is Map ? Map<String, dynamic>.from(res.data) : <String, dynamic>{};
+      final items = (data['results'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+      final cursor = data['cursor'] is Map ? Map<String, dynamic>.from(data['cursor']) : null;
+      final hasMore = data['hasMore'] == true;
+
+      setState(() {
+        final current = _absentLists[type] ?? const <Map<String, dynamic>>[];
+        _absentLists[type] = [...current, ...items];
+        _absentCursor[type] = cursor;
+        _absentHasMore[type] = hasMore;
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to load absentees: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _absentLoading[type] = false);
+    }
   }
 
   /* ------------------------- HELPERS ------------------------- */
@@ -151,44 +305,6 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
     final p1 = (m['phone'] ?? '').toString();
     final p2 = (m['phoneNumber'] ?? '').toString();
     return p1.isNotEmpty ? p1 : p2;
-  }
-
-  bool _matchesQuery(Map<String, dynamic> m) {
-    if (_searchQuery.isEmpty) return true;
-    final name = '${m['firstName'] ?? ''} ${m['lastName'] ?? ''}'.trim().toLowerCase();
-    final phone = _bestPhone(m).toLowerCase();
-    return name.contains(_searchQuery) || phone.contains(_searchQuery);
-  }
-
-  List<String> _weekRangeLabels(DateTime selected) {
-    final start = selected.subtract(const Duration(days: 6));
-    return List.generate(7, (i) => DateFormat('MMM d').format(start.add(Duration(days: i))));
-  }
-
-  bool _recordMatchesWindow(
-    Map<String, dynamic> data,
-    _AttendanceWindow w,
-  ) {
-    final windowId = (data['windowId'] ?? '').toString().trim();
-    if (windowId.isNotEmpty) return windowId == w.id;
-    // No windowId on record (legacy/manual).
-    if (_usingWindowFallback) return w.dateKey.isNotEmpty;
-    // If there is only one window for the selected date, treat missing windowId as a match.
-    final sameDateCount =
-        _availableWindows.where((x) => x.dateKey == w.dateKey).length;
-    return w.dateKey.isNotEmpty && sameDateCount <= 1;
-  }
-
-  bool _isPresentRecord(Map<String, dynamic> data) {
-    final status = (data['status'] ?? '').toString().toLowerCase();
-    if (status == 'present') return true;
-    if (status == 'absent') return false;
-    if (data['present'] == true) return true;
-    if (data['present'] == false) return false;
-    final result = (data['result'] ?? '').toString().toLowerCase();
-    if (result == 'present') return true;
-    if (result == 'absent') return false;
-    return false;
   }
 
   /* ------------------------- CONTACT ------------------------- */
@@ -236,7 +352,10 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                 _DateDropdown(
                   windows: _availableWindows,
                   value: _selectedWindowId!,
-                  onChanged: (newId) => setState(() => _selectedWindowId = newId),
+                  onChanged: (newId) {
+                    setState(() => _selectedWindowId = newId);
+                    _loadSummary();
+                  },
                 ),
                 const SizedBox(height: 8),
                 TextField(
@@ -247,6 +366,25 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                     contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                   ),
+                ),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<String>(
+                  value: _searchMode,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Search Mode',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  items: const [
+                    DropdownMenuItem(value: 'prefix', child: Text('Starts with')),
+                    DropdownMenuItem(value: 'exact', child: Text('Exact match')),
+                  ],
+                  onChanged: (v) {
+                    setState(() => _searchMode = v ?? 'prefix');
+                    _resetAbsentees();
+                    _loadAbsenteesForCurrentTab(reset: true);
+                  },
                 ),
               ],
             ),
@@ -315,129 +453,36 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                   .snapshots(),
               builder: (context, recordsSnap) {
                 final records = recordsSnap.data?.docs ?? const [];
-                final Map<String, bool> presentMap = {};
-                for (final r in records) {
-                  final data = r.data() as Map<String, dynamic>;
-                  if (!_recordMatchesWindow(data, _selectedWindow!)) continue;
-                  final mid = (data['memberId'] ?? r.id).toString();
-                  if (mid.isEmpty) continue;
-                  presentMap[mid] = _isPresentRecord(data);
-                }
-                final presentIds = presentMap.entries
-                    .where((e) => e.value == true)
-                    .map((e) => e.key)
-                    .toSet();
+                final noRecords = records.isEmpty;
 
-                return StreamBuilder<QuerySnapshot>(
-                  stream: _db.collection('members').snapshots(),
-                  builder: (context, membersSnap) {
-                    if (!membersSnap.hasData) {
-                      return const Center(child: CircularProgressIndicator());
-                    }
+                final summary = _summary ?? {};
+                final totalMembers = (summary['totalMembers'] as int?) ?? 0;
+                final totalVisitors = (summary['totalVisitors'] as int?) ?? 0;
+                final presentMembers = (summary['presentMembers'] as int?) ?? 0;
+                final presentVisitors = (summary['presentVisitors'] as int?) ?? 0;
+                final absentMembersCount = (summary['absentMembers'] as int?) ??
+                    (totalMembers - presentMembers);
+                final absentVisitorsCount = (summary['absentVisitors'] as int?) ??
+                    (totalVisitors - presentVisitors);
+                final malePresent = summary['malePresent'] ?? 0;
+                final femalePresent = summary['femalePresent'] ?? 0;
+                final unknownPresent = summary['unknownPresent'] ?? 0;
+                final maleAbsent = summary['maleAbsent'] ?? 0;
+                final femaleAbsent = summary['femaleAbsent'] ?? 0;
+                final unknownAbsent = summary['unknownAbsent'] ?? 0;
+                final memberAttendanceRate =
+                    totalMembers == 0 ? 0.0 : (presentMembers / totalMembers * 100);
+                final visitorAttendanceRate =
+                    totalVisitors == 0 ? 0.0 : (presentVisitors / totalVisitors * 100);
 
-                    final allMembers = membersSnap.data!.docs
-                        .map((d) => {'id': d.id, ...(d.data() as Map<String, dynamic>)})
-                        .toList();
-
-                    final confirmedMembers = allMembers.where((m) => m['isVisitor'] != true).toList();
-                    final visitors = allMembers.where((m) => m['isVisitor'] == true).toList();
-
-                    // Optional: If you want leaders to only see their ministries, filter here by ministry name overlap
-                    // (Uncomment to restrict leader view)
-                    // final leaderMins = _leadershipMinistries;
-                    // final filterByLeader = (Map<String, dynamic> m) {
-                    //   if (_isAdmin) return true;
-                    //   if (!_isLeader) return true;
-                    //   final mins = List<String>.from(m['ministries'] ?? const []);
-                    //   return mins.any((x) => leaderMins.contains(x));
-                    // };
-                    // confirmedMembers.retainWhere(filterByLeader);
-                    // visitors.retainWhere(filterByLeader);
-
-                    // Absentees
-                    final absentMembers = confirmedMembers.where((m) => !presentIds.contains(m['id'])).toList();
-                    final absentVisitors = visitors.where((v) => !presentIds.contains(v['id'])).toList();
-
-                    // Search filter
-                    final filteredMembers = absentMembers.where(_matchesQuery).toList();
-                    final filteredVisitors = absentVisitors.where(_matchesQuery).toList();
-
-                    // Stats
-                    final presentMembers = confirmedMembers.where((m) => presentIds.contains(m['id'])).length;
-                    final presentVisitors = visitors.where((v) => presentIds.contains(v['id'])).length;
-                    final totalMembers = confirmedMembers.length;
-                    final totalVisitors = visitors.length;
-
-                    int malePresent = 0, femalePresent = 0, maleAbsent = 0, femaleAbsent = 0;
-                    int unknownPresent = 0, unknownAbsent = 0;
-                    String genderOf(Map<String, dynamic> m) =>
-                        (m['gender'] ?? '').toString().toLowerCase().trim();
-                    bool isMale(Map<String, dynamic> m) => genderOf(m).startsWith('m');
-                    bool isFemale(Map<String, dynamic> m) => genderOf(m).startsWith('f');
-
-                    for (final m in confirmedMembers) {
-                      final isPresent = presentIds.contains(m['id']);
-                      if (isMale(m)) {
-                        if (isPresent) {
-                          malePresent++;
-                        } else {
-                          maleAbsent++;
-                        }
-                      } else if (isFemale(m)) {
-                        if (isPresent) {
-                          femalePresent++;
-                        } else {
-                          femaleAbsent++;
-                        }
-                      } else {
-                        if (isPresent) {
-                          unknownPresent++;
-                        } else {
-                          unknownAbsent++;
-                        }
-                      }
-                    }
-
-                    final memberAttendanceRate =
-                    confirmedMembers.isEmpty ? 0.0 : (presentMembers / confirmedMembers.length * 100);
-                    final visitorAttendanceRate =
-                    visitors.isEmpty ? 0.0 : (presentVisitors / visitors.length * 100);
-
-                    // New members (on selected date)
-                    DateTime? selectedDate;
-                    try {
-                      final parts = _selectedWindow!.dateKey.split('-').map(int.parse).toList();
-                      selectedDate = DateTime(parts[0], parts[1], parts[2]);
-                    } catch (_) {}
-                    final newMembersCount = confirmedMembers.where((m) {
-                      final ts = m['createdAt'] as Timestamp?;
-                      if (ts == null || selectedDate == null) return false;
-                      final created = ts.toDate();
-                      return created.year == selectedDate.year &&
-                          created.month == selectedDate.month &&
-                          created.day == selectedDate.day;
-                    }).length;
-
-                    // Birthdays in selected week
-                    final weekStart = selectedDate?.subtract(const Duration(days: 6));
-                    final birthdayCount = confirmedMembers.where((m) {
-                      final ts = m['dateOfBirth'] as Timestamp?;
-                      if (ts == null || selectedDate == null || weekStart == null) return false;
-                      final b = ts.toDate();
-                      final bThisYear = DateTime(selectedDate.year, b.month, b.day);
-                      return !bThisYear.isBefore(weekStart) && !bThisYear.isAfter(selectedDate);
-                    }).length;
-
-                    final noRecords = records.isEmpty;
-
-                    return NestedScrollView(
-                      headerSliverBuilder: (context, innerBoxIsScrolled) {
-                        return [
-                          if (noRecords)
-                            SliverToBoxAdapter(
-                              child: Padding(
-                                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                                child: Container(
+                return NestedScrollView(
+                  headerSliverBuilder: (context, innerBoxIsScrolled) {
+                    return [
+                      if (noRecords)
+                        SliverToBoxAdapter(
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                            child: Container(
                                   width: double.infinity,
                                   padding: const EdgeInsets.all(12),
                                   decoration: BoxDecoration(
@@ -450,6 +495,74 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                                     textAlign: TextAlign.center,
                                   ),
                                 ),
+                          ),
+                        ),
+                      SliverToBoxAdapter(
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: DropdownButtonFormField<String>(
+                                  value: _selectedMinistry,
+                                  isExpanded: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Ministry',
+                                    border: OutlineInputBorder(),
+                                    isDense: true,
+                                  ),
+                                  items: _ministryOptions
+                                      .map((m) => DropdownMenuItem(value: m, child: Text(m)))
+                                      .toList(),
+                                  onChanged: (v) {
+                                    setState(() => _selectedMinistry = v ?? 'All');
+                                    _resetAbsentees();
+                                    _loadAbsenteesForCurrentTab(reset: true);
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: DropdownButtonFormField<String>(
+                                  value: _selectedGender,
+                                  isExpanded: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Gender',
+                                    border: OutlineInputBorder(),
+                                    isDense: true,
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(value: 'all', child: Text('All')),
+                                    DropdownMenuItem(value: 'male', child: Text('Male')),
+                                    DropdownMenuItem(value: 'female', child: Text('Female')),
+                                    DropdownMenuItem(value: 'other', child: Text('Other')),
+                                  ],
+                                  onChanged: (v) {
+                                    setState(() => _selectedGender = v ?? 'all');
+                                    _resetAbsentees();
+                                    _loadAbsenteesForCurrentTab(reset: true);
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      if (_summaryLoading)
+                        const SliverToBoxAdapter(
+                          child: Padding(
+                            padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+                            child: LinearProgressIndicator(minHeight: 2),
+                              ),
+                            ),
+                          if (_summaryError != null)
+                            SliverToBoxAdapter(
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                                child: Text(
+                                  'Summary error: $_summaryError',
+                                  style: TextStyle(color: Colors.red.shade700),
+                                ),
                               ),
                             ),
                           SliverToBoxAdapter(
@@ -459,8 +572,8 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                                 items: [
                                   _StatData('Total Members', totalMembers, Icons.groups, Colors.blueGrey),
                                   _StatData('Total Visitors', totalVisitors, Icons.person_outline, Colors.teal),
-                                  _StatData('Absent Members', filteredMembers.length, Icons.group_off, Colors.red),
-                                  _StatData('Absent Visitors', filteredVisitors.length, Icons.person_off, Colors.orange),
+                                  _StatData('Absent Members', absentMembersCount, Icons.group_off, Colors.red),
+                                  _StatData('Absent Visitors', absentVisitorsCount, Icons.person_off, Colors.orange),
                                   _StatData('Male Present', malePresent, Icons.male, Colors.green),
                                   _StatData('Female Present', femalePresent, Icons.female, Colors.pink),
                                   _StatData('Male Absent', maleAbsent, Icons.male, Colors.redAccent),
@@ -469,8 +582,6 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                                   _StatData('Unknown Absent', unknownAbsent, Icons.help_outline, Colors.deepPurple),
                                   _StatData('Member Rate', memberAttendanceRate, Icons.insights, Colors.green, isPercent: true),
                                   _StatData('Visitor Rate', visitorAttendanceRate, Icons.pie_chart_outline, Colors.teal, isPercent: true),
-                                  _StatData('New Members', newMembersCount, Icons.person_add, Colors.blue),
-                                  _StatData('Birthdays', birthdayCount, Icons.cake, Theme.of(context).colorScheme.secondary),
                                 ],
                               ),
                             ),
@@ -497,22 +608,32 @@ class _FollowUpPageState extends State<FollowUpPage> with SingleTickerProviderSt
                         controller: _tabController,
                         children: [
                           _PeopleList(
-                            people: filteredMembers,
+                            people: _absentLists['member'] ?? const [],
                             titleBuilder: (m) => '${m['firstName'] ?? ''} ${m['lastName'] ?? ''}'.trim(),
                             subtitle: 'Member',
                             onTap: _openContactSheet,
+                            loadingMore: _absentLoading['member'] == true,
+                            hasMore: _absentHasMore['member'] == true,
+                            onLoadMore: () => _loadAbsentees(type: 'member', reset: false),
+                            emptyMessage: _absentLoading['member'] == true
+                                ? 'Loading...'
+                                : 'Nobody in this list 🎉',
                           ),
                           _PeopleList(
-                            people: filteredVisitors,
+                            people: _absentLists['visitor'] ?? const [],
                             titleBuilder: (v) => '${v['firstName'] ?? ''} ${v['lastName'] ?? ''}'.trim(),
                             subtitle: 'Visitor',
                             onTap: _openContactSheet,
+                            loadingMore: _absentLoading['visitor'] == true,
+                            hasMore: _absentHasMore['visitor'] == true,
+                            onLoadMore: () => _loadAbsentees(type: 'visitor', reset: false),
+                            emptyMessage: _absentLoading['visitor'] == true
+                                ? 'Loading...'
+                                : 'Nobody in this list 🎉',
                           ),
                         ],
                       ),
                     );
-                  },
-                );
               },
             ),
           ),
@@ -660,12 +781,20 @@ class _PeopleList extends StatelessWidget {
   final String Function(Map<String, dynamic>) titleBuilder;
   final String subtitle;
   final void Function(Map<String, dynamic>) onTap;
+  final bool loadingMore;
+  final bool hasMore;
+  final VoidCallback? onLoadMore;
+  final String emptyMessage;
 
   const _PeopleList({
     required this.people,
     required this.titleBuilder,
     required this.subtitle,
     required this.onTap,
+    this.loadingMore = false,
+    this.hasMore = false,
+    this.onLoadMore,
+    this.emptyMessage = 'Nobody in this list 🎉',
   });
 
   @override
@@ -674,15 +803,29 @@ class _PeopleList extends StatelessWidget {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: Text('Nobody in this list 🎉', style: Theme.of(context).textTheme.bodyLarge),
+          child: Text(emptyMessage, style: Theme.of(context).textTheme.bodyLarge),
         ),
       );
     }
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-      itemCount: people.length,
+      itemCount: people.length + (hasMore ? 1 : 0),
       separatorBuilder: (_, __) => const SizedBox(height: 6),
       itemBuilder: (context, i) {
+        if (hasMore && i == people.length) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Center(
+              child: loadingMore
+                  ? const CircularProgressIndicator()
+                  : TextButton.icon(
+                      onPressed: onLoadMore,
+                      icon: const Icon(Icons.add),
+                      label: const Text('Load more'),
+                    ),
+            ),
+          );
+        }
         final p = people[i];
         final title = titleBuilder(p);
         final phone = (p['phone'] ?? p['phoneNumber'] ?? '').toString();
