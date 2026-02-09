@@ -1749,10 +1749,28 @@ async function isLeaderOfMinistry(uid, ministryName) {
     const roles = new Set([single, ...(Array.isArray(u.roles) ? u.roles.map(toLc) : [])]);
 
     if (roles.has('admin')) return true;
-    if (!roles.has('leader')) return false;
-
     const leadMins = Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : [];
-    return leadMins.includes(ministryName);
+    if (roles.has('leader') && leadMins.includes(ministryName)) return true;
+
+    // Fallback: check member doc leadershipMinistries if user doc is out of sync.
+    let memberId = S(u.memberId);
+    if (!memberId) {
+      const byUid = await db.collection('members').where('userUid', '==', uid).limit(1).get();
+      if (!byUid.empty) memberId = byUid.docs[0].id;
+    }
+    if (!memberId) {
+      const emailLc = S(u.email).toLowerCase();
+      if (emailLc) {
+        const byEmail = await db.collection('members').where('email', '==', emailLc).limit(2).get();
+        if (byEmail.size === 1) memberId = byEmail.docs[0].id;
+      }
+    }
+    if (!memberId) return false;
+    const mSnap = await db.doc(`members/${memberId}`).get();
+    if (!mSnap.exists) return false;
+    const m = mSnap.data() || {};
+    const memberLeads = Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : [];
+    return memberLeads.includes(ministryName);
   } catch (e) {
     logger.error('isLeaderOfMinistry failed', { uid, ministryName, error: e });
     return false;
@@ -1954,6 +1972,48 @@ exports.searchMembers = onCall(async (req) => {
   });
 
   return { ok: true, results: payload };
+});
+
+/**
+ * listMembers
+ * - server-side member list with pagination (avoids client rules)
+ * - allowed for admin/pastor/leader
+ */
+exports.listMembers = onCall(async (req) => {
+  const uid = req.auth?.uid;
+  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+
+  const role = await getUserRole(uid);
+  const allowed = (await isUserPastorOrAdmin(uid)) || role === 'leader';
+  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
+
+  const gender = toLc(req.data?.gender || 'all');
+  const ministryName = S(req.data?.ministryName);
+  const visitor = toLc(req.data?.visitor || 'all'); // all | member | visitor
+  const limit = Math.max(1, Math.min(Number(req.data?.limit) || 100, 300));
+  const lastId = S(req.data?.cursor || '');
+
+  let q = db.collection('members');
+  if (gender && gender !== 'all') {
+    q = q.where('genderBucket', '==', gender);
+  }
+  if (ministryName) {
+    q = q.where('ministries', 'array-contains', ministryName);
+  }
+  if (visitor === 'visitor') {
+    q = q.where('isVisitor', '==', true);
+  } else if (visitor === 'member') {
+    q = q.where('isVisitor', '==', false);
+  }
+
+  q = q.orderBy(admin.firestore.FieldPath.documentId()).limit(limit);
+  if (lastId) q = q.startAfter(lastId);
+
+  const snap = await q.get();
+  const results = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const nextCursor = snap.docs.length ? snap.docs[snap.docs.length - 1].id : null;
+
+  return { ok: true, results, nextCursor };
 });
 
 /**
@@ -2961,86 +3021,100 @@ exports.adminDeleteMinistry = onCall(async (req) => {
  * - guards removing last leader unless allowLastLeader or pastor/admin
  */
 exports.setMinistryLeadership = onCall(async (req) => {
-  const uid = req.auth?.uid;
-  if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
+  try {
+    const uid = req.auth?.uid;
+    if (!uid) throw Object.assign(new Error('UNAUTHENTICATED'), { code: 'unauthenticated' });
 
-  const { memberId, ministryId, ministryName: nameArg, makeLeader, allowLastLeader = false } = req.data || {};
-  if (!memberId || typeof makeLeader !== 'boolean') {
-    throw Object.assign(new Error('invalid-argument: memberId/makeLeader'), { code: 'invalid-argument' });
-  }
-
-  const { ministryName } = await resolveMinistryByNameOrId(S(ministryId) || S(nameArg));
-  if (!ministryName) throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
-
-  const allowed = await hasMinistryModerationRights(uid, ministryName);
-  if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
-
-  if (makeLeader === false) {
-    const currentCount = await countLeadersInMinistry(ministryName);
-    if (currentCount <= 1 && !(await isUserPastorOrAdmin(uid)) && !allowLastLeader) {
-      throw Object.assign(new Error('would-remove-last-leader'), { code: 'failed-precondition' });
+    const { memberId, ministryId, ministryName: nameArg, makeLeader, allowLastLeader = false } = req.data || {};
+    if (!memberId || typeof makeLeader !== 'boolean') {
+      throw Object.assign(new Error('invalid-argument: memberId/makeLeader'), { code: 'invalid-argument' });
     }
-  }
 
-  const roleTag = await getMinistryRoleTag(ministryName);
+    const { ministryName } = await resolveMinistryByNameOrId(S(ministryId) || S(nameArg));
+    if (!ministryName) throw Object.assign(new Error('invalid-ministry'), { code: 'invalid-argument' });
 
-  await db.runTransaction(async (tx) => {
-    const mRef = db.doc(`members/${memberId}`);
-    const mSnap = await tx.get(mRef);
-    if (!mSnap.exists) throw Object.assign(new Error('member-not-found'), { code: 'not-found' });
+    const allowed = await hasMinistryModerationRights(uid, ministryName);
+    if (!allowed) throw Object.assign(new Error('PERMISSION_DENIED'), { code: 'permission-denied' });
 
-    const m = mSnap.data() || {};
-    const curMins = new Set(Array.isArray(m.ministries) ? m.ministries : []);
-    const curLeads = new Set(Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : []);
-    let roles = Array.isArray(m.roles) ? m.roles : [];
-
-    if (makeLeader) {
-      curMins.add(ministryName);
-      curLeads.add(ministryName);
-      roles = mergeRoles(roles, ['leader'], []);
-    } else {
-      curLeads.delete(ministryName);
-      if (curLeads.size === 0) roles = mergeRoles(roles, [], ['leader']);
+    if (makeLeader === false) {
+      const currentCount = await countLeadersInMinistry(ministryName);
+      if (currentCount <= 1 && !(await isUserPastorOrAdmin(uid)) && !allowLastLeader) {
+        throw Object.assign(new Error('would-remove-last-leader'), { code: 'failed-precondition' });
+      }
     }
-    if (roleTag) roles = mergeRoles(roles, [roleTag], []);
 
-    tx.update(mRef, {
-      ministries: Array.from(curMins),
-      leadershipMinistries: Array.from(curLeads),
-      roles: normalizeRoles(roles),
-      updatedAt: ts(),
-    });
+    const roleTag = await getMinistryRoleTag(ministryName);
 
-    // mirror to linked user
     const linked = await findUserByMemberId(memberId);
-    if (linked?.id) {
-      const uRef = db.doc(`users/${linked.id}`);
-      const uSnap = await tx.get(uRef);
-      const u = uSnap.exists ? uSnap.data() || {} : {};
+    const linkedId = linked?.id || null;
 
-      const uLead = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
-      let uRoles = Array.isArray(u.roles) ? u.roles : [];
-      const single = toLc(u.role);
-      uRoles = uniq([single, ...uRoles]).filter(Boolean);
+    await db.runTransaction(async (tx) => {
+      const mRef = db.doc(`members/${memberId}`);
+      const mSnap = await tx.get(mRef);
+      if (!mSnap.exists) throw Object.assign(new Error('member-not-found'), { code: 'not-found' });
+
+      let uRef = null;
+      let uSnap = null;
+      if (linkedId) {
+        uRef = db.doc(`users/${linkedId}`);
+        uSnap = await tx.get(uRef);
+      }
+
+      const m = mSnap.data() || {};
+      const curMins = new Set(Array.isArray(m.ministries) ? m.ministries : []);
+      const curLeads = new Set(Array.isArray(m.leadershipMinistries) ? m.leadershipMinistries : []);
+      let roles = Array.isArray(m.roles) ? m.roles : [];
 
       if (makeLeader) {
-        uLead.add(ministryName);
-        uRoles = mergeRoles(uRoles, ['leader'], []);
+        curMins.add(ministryName);
+        curLeads.add(ministryName);
+        roles = mergeRoles(roles, ['leader'], []);
       } else {
-        uLead.delete(ministryName);
-        if (uLead.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
+        curLeads.delete(ministryName);
+        if (curLeads.size === 0) roles = mergeRoles(roles, [], ['leader']);
       }
-      if (roleTag) uRoles = mergeRoles(uRoles, [roleTag], []);
+      if (roleTag) roles = mergeRoles(roles, [roleTag], []);
 
-      txSyncUserRoles(tx, linked.id, uRoles);
-      tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
+      tx.update(mRef, {
+        ministries: Array.from(curMins),
+        leadershipMinistries: Array.from(curLeads),
+        roles: normalizeRoles(roles),
+        updatedAt: ts(),
+      });
+
+      // mirror to linked user
+      if (linkedId && uRef && uSnap) {
+        const u = uSnap.exists ? uSnap.data() || {} : {};
+
+        const uLead = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
+        let uRoles = Array.isArray(u.roles) ? u.roles : [];
+        const single = toLc(u.role);
+        uRoles = uniq([single, ...uRoles]).filter(Boolean);
+
+        if (makeLeader) {
+          uLead.add(ministryName);
+          uRoles = mergeRoles(uRoles, ['leader'], []);
+        } else {
+          uLead.delete(ministryName);
+          if (uLead.size === 0) uRoles = mergeRoles(uRoles, [], ['leader']);
+        }
+        if (roleTag) uRoles = mergeRoles(uRoles, [roleTag], []);
+
+        txSyncUserRoles(tx, linkedId, uRoles);
+        tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
+      }
+    });
+
+    if (linkedId) await syncClaimsForUid(linkedId);
+
+    return { ok: true };
+  } catch (e) {
+    logger.error('setMinistryLeadership failed', { error: e });
+    if (e?.code && typeof e.code === 'string') {
+      throw new HttpsError(e.code, e?.message || 'setMinistryLeadership failed');
     }
-  });
-
-  const linked = await findUserByMemberId(memberId);
-  if (linked?.id) await syncClaimsForUid(linked.id);
-
-  return { ok: true };
+    throw new HttpsError('internal', e?.message || 'setMinistryLeadership failed');
+  }
 });
 
 /**
@@ -3078,10 +3152,20 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
   const remainingRoleTags = roleTag && hadMinistry ? await getRoleTagsForMinistryNames(remainingMins) : new Set();
   const shouldRemoveRoleTag = roleTag && hadMinistry && !remainingRoleTags.has(roleTag);
 
+  const linked = await findUserByMemberId(memberId);
+  const linkedId = linked?.id || null;
+
   await db.runTransaction(async (tx) => {
     const mRef = db.doc(`members/${memberId}`);
     const mSnap = await tx.get(mRef);
     if (!mSnap.exists) throw Object.assign(new Error('member-not-found'), { code: 'not-found' });
+
+    let uRef = null;
+    let uSnap = null;
+    if (linkedId) {
+      uRef = db.doc(`users/${linkedId}`);
+      uSnap = await tx.get(uRef);
+    }
 
     const data = mSnap.data() || {};
     const curMins = new Set(Array.isArray(data.ministries) ? data.ministries : []);
@@ -3105,10 +3189,7 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
       updatedAt: ts(),
     });
 
-    const linked = await findUserByMemberId(memberId);
-    if (linked?.id) {
-      const uRef = db.doc(`users/${linked.id}`);
-      const uSnap = await tx.get(uRef);
+    if (linkedId && uRef && uSnap) {
       const u = uSnap.exists ? uSnap.data() || {} : {};
 
       const uLead = new Set(Array.isArray(u.leadershipMinistries) ? u.leadershipMinistries : []);
@@ -3121,13 +3202,12 @@ exports.removeMemberFromMinistry = onCall(async (req) => {
 
       if (shouldRemoveRoleTag) uRoles = mergeRoles(uRoles, [], [roleTag]);
 
-      txSyncUserRoles(tx, linked.id, uRoles);
+      txSyncUserRoles(tx, linkedId, uRoles);
       tx.set(uRef, { leadershipMinistries: Array.from(uLead), updatedAt: ts() }, { merge: true });
     }
   });
 
-  const linked = await findUserByMemberId(memberId);
-  if (linked?.id) await syncClaimsForUid(linked.id);
+  if (linkedId) await syncClaimsForUid(linkedId);
 
   return { ok: true };
 });

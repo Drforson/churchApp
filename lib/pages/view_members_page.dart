@@ -21,7 +21,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
   String _searchQuery = '';
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   final List<Map<String, dynamic>> _members = [];
-  QueryDocumentSnapshot? _lastMemberDoc;
+  String? _lastCursor;
   bool _loadingMembers = true;
   bool _loadingMore = false;
   bool _hasMore = true;
@@ -112,7 +112,7 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
     );
   }
 
-  Future<void> _ensureRoleSync() async {
+  Future<void> _ensureRoleSync({bool forceLink = false}) async {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return;
     try {
@@ -122,13 +122,22 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
       await _functions.httpsCallable('syncUserRoleFromMemberOnLogin').call();
       await user.getIdToken(true);
     } catch (_) {}
+    if (!forceLink) return;
+    try {
+      final uSnap = await _db.collection('users').doc(user.uid).get();
+      final memberId = (uSnap.data()?['memberId'] as String?)?.trim();
+      if (memberId == null || memberId.isEmpty) {
+        await _functions.httpsCallable('linkSelfAfterVerification').call();
+        await user.getIdToken(true);
+      }
+    } catch (_) {}
   }
 
   Future<void> _loadInitialMembers() async {
     setState(() {
       _loadingMembers = true;
       _members.clear();
-      _lastMemberDoc = null;
+      _lastCursor = null;
       _hasMore = true;
     });
     await _loadMoreMembers();
@@ -137,38 +146,38 @@ class _ViewMembersPageState extends State<ViewMembersPage> with SingleTickerProv
     }
   }
 
-  Future<void> _loadMoreMembers() async {
+  Future<void> _loadMoreMembers({bool retrying = false}) async {
     if (_loadingMore || !_hasMore) return;
     setState(() => _loadingMore = true);
     try {
-      await _ensureRoleSync();
-      Query q = _db.collection('members');
-      if (_selectedMinistry != 'All') {
-        q = q.where('ministries', arrayContains: _selectedMinistry);
+      await _ensureRoleSync(forceLink: retrying);
+      final res = await _functions.httpsCallable('listMembers').call(<String, dynamic>{
+        'limit': _pageSize,
+        'cursor': _lastCursor ?? '',
+        if (_selectedMinistry != 'All') 'ministryName': _selectedMinistry,
+        'gender': _selectedGender,
+        'visitor': _selectedVisitor,
+      });
+      final data = res.data;
+      final results = (data is Map && data['results'] is List)
+          ? (data['results'] as List).whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList()
+          : <Map<String, dynamic>>[];
+      final nextCursor = (data is Map && data['nextCursor'] is String) ? data['nextCursor'] as String : null;
+
+      if (results.isNotEmpty) {
+        _members.addAll(results);
       }
-      if (_selectedGender != 'all') {
-        q = q.where('genderBucket', isEqualTo: _selectedGender);
-      }
-      if (_selectedVisitor == 'visitor') {
-        q = q.where('isVisitor', isEqualTo: true);
-      } else if (_selectedVisitor == 'member') {
-        q = q.where('isVisitor', isEqualTo: false);
-      }
-      q = q.orderBy('fullNameLower').limit(_pageSize);
-      if (_lastMemberDoc != null) {
-        q = q.startAfterDocument(_lastMemberDoc!);
-      }
-      final snap = await q.get();
-      if (snap.docs.isNotEmpty) {
-        _lastMemberDoc = snap.docs.last;
-        _members.addAll(
-          snap.docs.map((d) => {'id': d.id, ...(d.data() as Map<String, dynamic>)}),
-        );
-      }
-      if (snap.docs.length < _pageSize) {
+      _lastCursor = nextCursor;
+      if (results.length < _pageSize || nextCursor == null) {
         _hasMore = false;
       }
     } catch (e) {
+      if (!retrying && e is FirebaseException && e.code == 'permission-denied') {
+        await _ensureRoleSync(forceLink: true);
+        if (mounted) setState(() => _loadingMore = false);
+        await _loadMoreMembers(retrying: true);
+        return;
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Failed to load members: $e')),

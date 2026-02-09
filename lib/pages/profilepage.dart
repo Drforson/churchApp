@@ -50,6 +50,7 @@ class _HomePageState extends State<HomePage> {
   final _emergencyPhoneCtrl = TextEditingController();
   final _preferredContactCtrl = TextEditingController();
   final _emergencyRelationCtrl = TextEditingController();
+  final FocusNode _preferredContactFocus = FocusNode();
 
   FlutterGooglePlacesSdk? _places;
   final List<AutocompletePrediction> _addressPredictions = [];
@@ -59,6 +60,7 @@ class _HomePageState extends State<HomePage> {
   double? _selectedAddressLng;
   Timer? _addrDebounce;
   bool _settingAddressText = false;
+  bool _ignoreNextAddressChange = false;
 
   final List<String> _maritalOptions = const ['single', 'married', 'divorced', 'widowed'];
   String? _maritalStatus;
@@ -94,6 +96,7 @@ class _HomePageState extends State<HomePage> {
     _emergencyPhoneCtrl.dispose();
     _preferredContactCtrl.dispose();
     _emergencyRelationCtrl.dispose();
+    _preferredContactFocus.dispose();
     _cooldownTimer?.cancel();
     super.dispose();
   }
@@ -275,7 +278,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onAddressChanged() {
-    if (_settingAddressText || _places == null) return;
+    if (_settingAddressText || _ignoreNextAddressChange || _places == null) {
+      _ignoreNextAddressChange = false;
+      return;
+    }
     final q = _addressCtrl.text.trim();
     if (q.isEmpty) {
       setState(() {
@@ -338,6 +344,8 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       final place = det.place;
       final display = place?.address ?? place?.name ?? _addressCtrl.text;
+      _addrDebounce?.cancel();
+      _ignoreNextAddressChange = true;
       _settingAddressText = true;
       _addressCtrl.text = display;
       _settingAddressText = false;
@@ -348,6 +356,7 @@ class _HomePageState extends State<HomePage> {
         _selectedAddressLng = place?.latLng?.lng;
         _addressPredictions.clear();
       });
+      _preferredContactFocus.requestFocus();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -866,7 +875,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ),
               ],
-              if (_selectedAddressLat != null && _selectedAddressLng != null) ...[
+              if (_selectedAddressPlaceId != null) ...[
                 const SizedBox(height: 12),
                 Row(
                   children: [
@@ -874,9 +883,7 @@ class _HomePageState extends State<HomePage> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Selected: ${_addressCtrl.text.trim()}\n'
-                        'Lat: ${_selectedAddressLat!.toStringAsFixed(6)}, '
-                        'Lng: ${_selectedAddressLng!.toStringAsFixed(6)}',
+                        'Selected: ${_addressCtrl.text.trim()}',
                         style: const TextStyle(fontSize: 12),
                       ),
                     ),
@@ -886,6 +893,7 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 12),
               TextFormField(
                 controller: _preferredContactCtrl,
+                focusNode: _preferredContactFocus,
                 textInputAction: TextInputAction.next,
                 decoration: const InputDecoration(
                   labelText: 'Preferred contact method',

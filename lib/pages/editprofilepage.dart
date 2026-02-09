@@ -32,6 +32,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
   double? _selectedAddressLng;
   Timer? _addrDebounce;
   bool _settingAddressText = false;
+  bool _ignoreNextAddressChange = false;
 
   DateTime? _dob;
 
@@ -109,7 +110,10 @@ class _EditProfilePageState extends State<EditProfilePage> {
   }
 
   void _onAddressChanged() {
-    if (_settingAddressText || _places == null) return;
+    if (_settingAddressText || _ignoreNextAddressChange || _places == null) {
+      _ignoreNextAddressChange = false;
+      return;
+    }
     final q = _addressController.text.trim();
     if (q.isEmpty) {
       setState(() {
@@ -172,6 +176,8 @@ class _EditProfilePageState extends State<EditProfilePage> {
       if (!mounted) return;
       final place = det.place;
       final display = place?.address ?? place?.name ?? _addressController.text;
+      _addrDebounce?.cancel();
+      _ignoreNextAddressChange = true;
       _settingAddressText = true;
       _addressController.text = display;
       _settingAddressText = false;
@@ -182,6 +188,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
         _selectedAddressLng = place?.latLng?.lng;
         _addressPredictions.clear();
       });
+      FocusScope.of(context).nextFocus();
     } catch (e) {
       if (!mounted) return;
       Fluttertoast.showToast(
@@ -439,7 +446,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
                   ),
                 ),
               ],
-              if (_selectedAddressLat != null && _selectedAddressLng != null) ...[
+              if (_selectedAddressPlaceId != null) ...[
                 const SizedBox(height: 12),
                 Row(
                   children: [
@@ -447,9 +454,7 @@ class _EditProfilePageState extends State<EditProfilePage> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Selected: ${_addressController.text.trim()}\n'
-                        'Lat: ${_selectedAddressLat!.toStringAsFixed(6)}, '
-                        'Lng: ${_selectedAddressLng!.toStringAsFixed(6)}',
+                        'Selected: ${_addressController.text.trim()}',
                         style: const TextStyle(fontSize: 12),
                       ),
                     ),
