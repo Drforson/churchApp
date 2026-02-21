@@ -83,7 +83,6 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
         });
       }
     } catch (e) {
-      debugPrint('⚠️ Error preloading member data: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -119,7 +118,6 @@ class _SignupStep2PageState extends State<SignupStep2Page> {
       setState(() => _phoneNumberConflict = conflict);
     } catch (e) {
       // Non-fatal, don't block the flow on read error
-      debugPrint('⚠️ Phone check failed (non-fatal): $e');
       if (!mounted) return;
       setState(() => _phoneNumberConflict = false);
     }

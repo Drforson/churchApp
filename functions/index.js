@@ -3694,7 +3694,6 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
     .get();
 
   if (qs.empty) {
-    logger.debug('tickAttendanceWindows: no windows', { now: now.toISOString() });
     try {
       const next = await db.collection('attendance_windows')
         .where('startsAt', '>', now)
@@ -3712,7 +3711,6 @@ exports.tickAttendanceWindows = onSchedule('every 1 minutes', async () => {
         });
       }
     } catch (e) {
-      logger.debug('tickAttendanceWindows: next window lookup failed', { error: String(e) });
     }
     return;
   }

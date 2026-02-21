@@ -80,12 +80,6 @@ class AttendancePingService {
 
   Future<void> _handleMessage(RemoteMessage m, {required String source}) async {
     if (!_isAttendancePing(m)) return;
-    debugPrint(
-      '[AttendancePing] received ping source=$source '
-      'windowId=${(m.data['windowId'] ?? '').toString()} '
-      'title=${m.notification?.title ?? ''} '
-      'body=${m.notification?.body ?? ''}',
-    );
     _showWelcomeNotification(
       title: (m.notification?.title ?? 'Welcome to service').toString(),
       body: (m.data['welcomeMessage'] ?? m.notification?.body ?? 'Attendance check-in is open.')
@@ -106,7 +100,6 @@ class AttendancePingService {
     required String windowId,
     required String source,
   }) async {
-    debugPrint('[AttendancePing] attempt check-in source=$source windowId=$windowId');
     final user = _auth.currentUser;
     if (user == null) {
       _toast(context, 'Please sign in to record attendance.');
@@ -121,12 +114,8 @@ class AttendancePingService {
       pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
-      debugPrint(
-        '[AttendancePing] GPS ok lat=${pos.latitude} lng=${pos.longitude} acc=${pos.accuracy}',
-      );
     } catch (e) {
       _toast(context, 'Could not get location: $e');
-      debugPrint('[AttendancePing] GPS error: $e');
       return;
     }
 
@@ -164,7 +153,6 @@ class AttendancePingService {
   }) async {
     final enabled = await Geolocator.isLocationServiceEnabled();
     if (!enabled) {
-      debugPrint('[AttendancePing] location services disabled');
       _showLocationDialog(
         context,
         title: 'Turn on location',
@@ -175,10 +163,8 @@ class AttendancePingService {
     }
 
     LocationPermission perm = await Geolocator.checkPermission();
-    debugPrint('[AttendancePing] permission status: $perm');
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
-      debugPrint('[AttendancePing] permission after request: $perm');
     }
     if (perm == LocationPermission.denied) {
       _showLocationDialog(
@@ -190,7 +176,6 @@ class AttendancePingService {
       return false;
     }
     if (perm == LocationPermission.deniedForever) {
-      debugPrint('[AttendancePing] permission denied forever');
       _showLocationDialog(
         context,
         title: 'Location permission blocked',

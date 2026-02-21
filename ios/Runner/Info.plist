@@ -30,8 +30,12 @@
     <string>Used to confirm your presence at church during service time.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
     <string>Used to confirm your presence at church during service time.</string>
-    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-    <string>Used to confirm your presence at church during service time.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Used to confirm your presence at church during service time.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Allow access to your photo library to attach images to ministry posts and profiles.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Allow camera access to take photos for ministry posts and profiles.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

@@ -364,7 +364,6 @@ class _MinistryDetailsPageState extends State<MinistryDetailsPage>
           : const <Map<String, dynamic>>[];
       return items;
     } catch (e) {
-      debugPrint('[MinistryDetails] pending requests load failed: $e');
       return const <Map<String, dynamic>>[];
     }
   }

@@ -265,7 +265,6 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
 
     setState(() => _creating = true);
     try {
-      debugPrint('[AttendanceSetup] saving window for $dateKey ($title)');
       await _functions.httpsCallable('upsertAttendanceWindow').call({
         'title': title,
         'dateKey': dateKey,
@@ -333,7 +332,6 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
         if (endsAt.toDate().isAfter(now)) return d.id;
       }
     } catch (e) {
-      debugPrint('[AttendanceSetup] resolve active window failed: $e');
     }
     return null;
   }
@@ -351,10 +349,8 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
       }
 
       LocationPermission perm = await Geolocator.checkPermission();
-      debugPrint('[AttendanceSetup] GPS permission: $perm');
       if (perm == LocationPermission.denied) {
         perm = await Geolocator.requestPermission();
-        debugPrint('[AttendanceSetup] GPS permission after request: $perm');
       }
       if (perm == LocationPermission.denied ||
           perm == LocationPermission.deniedForever) {
@@ -366,9 +362,6 @@ class _AttendanceSetupPageState extends State<AttendanceSetupPage> {
 
       final pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
-      );
-      debugPrint(
-        '[AttendanceSetup] GPS ok lat=${pos.latitude} lng=${pos.longitude} acc=${pos.accuracy}',
       );
 
       final windowId = await _resolveActiveWindowId();

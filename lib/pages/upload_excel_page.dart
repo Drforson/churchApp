@@ -109,7 +109,6 @@ class _ExcelDatabaseUploaderState extends State<ExcelDatabaseUploader> {
           });
           newMembersCount++;
         } catch (e) {
-          print('⚠️ Error adding member $firstName $lastName: $e');
         }
       }
 

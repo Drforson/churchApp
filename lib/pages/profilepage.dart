@@ -1,12 +1,8 @@
 import 'dart:async';
-import 'dart:convert';
-
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_google_places_sdk/flutter_google_places_sdk.dart';
 import 'package:intl/intl.dart';
 
@@ -32,8 +28,6 @@ class _HomePageState extends State<HomePage> {
   bool _loading = true;
   bool _saving = false;
   bool _linking = false;
-  bool _showDebug = true;
-  String _debugInfo = '';
 
   bool _bypassMode = false;
   int _cooldownSecs = 0;
@@ -108,14 +102,7 @@ class _HomePageState extends State<HomePage> {
     }
 
     try {
-      final debugLines = <String>[];
-      debugLines.add('uid: ${user.uid}');
-      debugLines.add('email: ${user.email ?? ''}');
-
       await user.reload();
-      final refreshed = _auth.currentUser;
-      final isVerified = refreshed?.emailVerified ?? false;
-      debugLines.add('emailVerified: $isVerified');
 
       final emailLc = (user.email ?? '').trim().toLowerCase();
       final now = FieldValue.serverTimestamp();
@@ -134,11 +121,10 @@ class _HomePageState extends State<HomePage> {
             },
             SetOptions(merge: true),
           );
-        } on FirebaseException catch (e) {
+        } on FirebaseException {
           if (mounted) {
             setState(() {
               _loading = false;
-              _debugInfo = '${debugLines.join('\n')}\nusers.set error: ${e.code}';
             });
           }
           return;
@@ -152,11 +138,10 @@ class _HomePageState extends State<HomePage> {
             },
             SetOptions(merge: true),
           );
-        } on FirebaseException catch (e) {
+        } on FirebaseException {
           if (mounted) {
             setState(() {
               _loading = false;
-              _debugInfo = '${debugLines.join('\n')}\nusers.update error: ${e.code}';
             });
           }
           return;
@@ -170,7 +155,6 @@ class _HomePageState extends State<HomePage> {
       // Check link
       final uSnap = await userRef.get();
       String? memberId = (uSnap.data()?['memberId'] as String?)?.trim();
-      debugLines.add('users.memberId: ${memberId ?? ''}');
 
       // Try server-side auto-link (unique email or userUid) if not linked
       if (memberId == null || memberId.isEmpty) {
@@ -179,13 +163,11 @@ class _HomePageState extends State<HomePage> {
               .httpsCallable('syncUserRoleFromMemberOnLogin')
               .call();
           await user.getIdToken(true);
-        } catch (e) {
-          debugPrint('syncUserRoleFromMemberOnLogin (auto-link) failed: $e');
+        } catch (_) {
         }
 
         final uSnap2 = await userRef.get();
         memberId = (uSnap2.data()?['memberId'] as String?)?.trim();
-        debugLines.add('linked memberId: ${memberId ?? ''}');
       }
 
       // Fallback: if still not linked, try unique email match for UI access
@@ -198,12 +180,9 @@ class _HomePageState extends State<HomePage> {
               .get();
           if (q.size == 1) {
             memberId = q.docs.first.id;
-            debugLines.add('email match memberId: $memberId');
           } else {
-            debugLines.add('email match count: ${q.size}');
           }
-        } on FirebaseException catch (e) {
-          debugLines.add('email query error: ${e.code}');
+        } on FirebaseException {
         }
       }
 
@@ -211,7 +190,6 @@ class _HomePageState extends State<HomePage> {
         setState(() {
           _memberId = null;
           _loading = false;
-          _debugInfo = debugLines.join('\n');
         });
         return;
       }
@@ -219,12 +197,11 @@ class _HomePageState extends State<HomePage> {
       DocumentSnapshot<Map<String, dynamic>> mSnap;
       try {
         mSnap = await _db.collection('members').doc(memberId).get();
-      } on FirebaseException catch (e) {
+      } on FirebaseException {
         if (mounted) {
           setState(() {
             _memberId = null;
             _loading = false;
-            _debugInfo = '${debugLines.join('\n')}\nmembers.get error: ${e.code}';
           });
         }
         return;
@@ -260,11 +237,6 @@ class _HomePageState extends State<HomePage> {
 
       final ts = md['dateOfBirth'];
       _dob = ts is Timestamp ? ts.toDate() : null;
-
-      debugLines.add('resolved memberId: $memberId');
-      debugLines.add('member.email: ${(md['email'] ?? '').toString()}');
-      debugLines.add('member.userUid: ${(md['userUid'] ?? '').toString()}');
-      _debugInfo = debugLines.join('\n');
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -592,78 +564,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  dynamic _jsonSafe(dynamic value) {
-    if (value is Timestamp) return value.toDate().toIso8601String();
-    if (value is DateTime) return value.toIso8601String();
-    if (value is Map) {
-      return value.map((k, v) => MapEntry(k.toString(), _jsonSafe(v)));
-    }
-    if (value is Iterable) return value.map(_jsonSafe).toList();
-    return value;
-  }
-
-  Future<void> _dumpUserDoc() async {
-    final user = _auth.currentUser;
-    if (user == null) return;
-    try {
-      final uSnap = await _db.collection('users').doc(user.uid).get();
-      final uData = uSnap.data() ?? const <String, dynamic>{};
-      debugPrint('--- USERS/${user.uid} ---');
-      debugPrint(const JsonEncoder.withIndent('  ').convert(_jsonSafe(uData)));
-
-      final memberId = (uData['memberId'] as String?)?.trim();
-      if (memberId != null && memberId.isNotEmpty) {
-        final mSnap = await _db.collection('members').doc(memberId).get();
-        final mData = mSnap.data() ?? const <String, dynamic>{};
-        debugPrint('--- MEMBERS/$memberId ---');
-        debugPrint(const JsonEncoder.withIndent('  ').convert(_jsonSafe(mData)));
-      }
-    } catch (e) {
-      debugPrint('Dump user/member doc failed: $e');
-    }
-  }
-
-  Future<void> _showAppCheckToken() async {
-    String? token;
-    String? error;
-    try {
-      token = await FirebaseAppCheck.instance.getToken(true);
-    } catch (e) {
-      error = e.toString();
-    }
-    if (!mounted) return;
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('App Check token'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: SelectableText(
-            token ?? 'Failed to fetch token.\n${error ?? ''}',
-            style: const TextStyle(fontSize: 12),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close'),
-          ),
-          if (token != null)
-            TextButton(
-              onPressed: () {
-                Clipboard.setData(ClipboardData(text: token!));
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Token copied')),
-                );
-              },
-              child: const Text('Copy'),
-            ),
-        ],
-      ),
-    );
-  }
-
   Future<void> _linkSelfAfterVerification() async {
     final user = _auth.currentUser;
     if (user == null) {
@@ -718,12 +618,9 @@ class _HomePageState extends State<HomePage> {
         onResend: _resendVerificationEmail,
         onBypass: _enableBypassAndShowForm,
         onLinkSelf: _linkSelfAfterVerification,
-        onDump: _dumpUserDoc,
-        onAppCheckToken: _showAppCheckToken,
         linking: _linking,
         email: _auth.currentUser?.email,
         cooldownSecs: _cooldownSecs,
-        debugText: _showDebug ? _debugInfo : null,
       )
           : SafeArea(
       child: Form(
@@ -732,12 +629,6 @@ class _HomePageState extends State<HomePage> {
             padding:
             const EdgeInsets.fromLTRB(16, 12, 16, 24),
             children: [
-              if (_showDebug)
-                _DebugCard(
-                  text: _debugInfo,
-                  onDump: _dumpUserDoc,
-                  onAppCheckToken: _showAppCheckToken,
-                ),
               _Header(percent: percent),
               const SizedBox(height: 12),
 
@@ -1066,24 +957,18 @@ class _NoMemberSection extends StatelessWidget {
   final VoidCallback onResend;
   final VoidCallback onBypass;
   final VoidCallback onLinkSelf;
-  final VoidCallback onDump;
-  final VoidCallback onAppCheckToken;
   final bool linking;
   final String? email;
   final int cooldownSecs;
-  final String? debugText;
 
   const _NoMemberSection({
     required this.onRefresh,
     required this.onResend,
     required this.onBypass,
     required this.onLinkSelf,
-    required this.onDump,
-    required this.onAppCheckToken,
     required this.linking,
     required this.email,
     required this.cooldownSecs,
-    required this.debugText,
   });
 
   @override
@@ -1093,12 +978,6 @@ class _NoMemberSection extends StatelessWidget {
       child: ListView(
         padding: const EdgeInsets.all(24),
         children: [
-          if (debugText != null)
-            _DebugCard(
-              text: debugText!,
-              onDump: onDump,
-              onAppCheckToken: onAppCheckToken,
-            ),
           const SizedBox(height: 40),
           Icon(Icons.person_search_outlined,
               size: 62, color: Colors.grey.shade700),
@@ -1150,73 +1029,12 @@ class _NoMemberSection extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: onDump,
-              icon: const Icon(Icons.copy_all_outlined),
-              label: const Text('Print user doc to console'),
-            ),
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: onAppCheckToken,
-              icon: const Icon(Icons.security_outlined),
-              label: const Text('Show App Check token'),
-            ),
-          ),
-          const SizedBox(height: 12),
           Text(
             'Bypass lets you fill out your profile now. We’ll create a member record and link it to your account (email must still be verified).',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade600),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _DebugCard extends StatelessWidget {
-  final String text;
-  final VoidCallback? onDump;
-  final VoidCallback? onAppCheckToken;
-  const _DebugCard({required this.text, this.onDump, this.onAppCheckToken});
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      color: Colors.yellow.shade50,
-      margin: const EdgeInsets.only(bottom: 12),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              text.isEmpty ? 'Debug info unavailable' : text,
-              style: const TextStyle(fontSize: 12),
-            ),
-            if (onDump != null) ...[
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: onDump,
-                icon: const Icon(Icons.copy_all_outlined),
-                label: const Text('Print user doc to console'),
-              ),
-            ],
-            if (onAppCheckToken != null) ...[
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: onAppCheckToken,
-                icon: const Icon(Icons.security_outlined),
-                label: const Text('Show App Check token'),
-              ),
-            ],
-          ],
-        ),
       ),
     );
   }

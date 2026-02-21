@@ -60,7 +60,6 @@ export const onJoinRequestCreate = functions
     leadersQ.docs.forEach((d) => recipients.set(d.id, d.data()));
 
     if (recipients.size === 0) {
-      console.log("No recipients (no admins/leaders) for ministry:", ministryName || ministryId);
       return;
     }
 

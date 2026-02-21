@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
-import 'package:flutter/foundation.dart';
 
 class AuthService {
   AuthService._();
@@ -51,10 +50,8 @@ class AuthService {
     try {
       return await step();
     } on TimeoutException {
-      debugPrint('[AuthService] $name timed out; continuing.');
       return null;
     } catch (e) {
-      debugPrint('[AuthService] $name failed: $e');
       return null;
     }
   }

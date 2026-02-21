@@ -52,7 +52,6 @@ class _SignupStep1PageState extends State<SignupStep1Page> {
       // Non-fatal: do not block signup on this
       if (!mounted) return;
       setState(() => _emailExists = false);
-      debugPrint('fetchSignInMethodsForEmail failed (non-fatal): $e');
     }
   }
 

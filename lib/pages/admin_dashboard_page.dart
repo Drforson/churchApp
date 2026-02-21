@@ -99,8 +99,7 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
       try {
         final mSnap = await _db.collection('members').doc(memberId).get();
         md = mSnap.data() ?? {};
-      } on FirebaseException catch (e) {
-        debugPrint('[AdminDashboard] members/$memberId read failed: ${e.code}');
+      } on FirebaseException {
       }
 
       // Leadership from member doc
@@ -180,7 +179,6 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
         _pendingJoinRequestsCount = pending;
       });
     } catch (e) {
-      debugPrint('[AdminDashboard] stats load failed: $e');
     }
   }
 

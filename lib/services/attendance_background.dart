@@ -80,35 +80,29 @@ class AttendanceBackground {
 
     final user = await _ensureUser();
     if (user == null) {
-      debugPrint('[AttendanceBG] no user; skip ($source)');
       return;
     }
 
     final enabled = await Geolocator.isLocationServiceEnabled();
     if (!enabled) {
-      debugPrint('[AttendanceBG] location services disabled');
       await _notify('Attendance check-in', 'Enable location to check in.');
       return;
     }
 
     final perm = await Geolocator.checkPermission();
-    debugPrint('[AttendanceBG] permission status: $perm');
     // Background isolates cannot prompt for permission.
     if (perm == LocationPermission.denied) {
-      debugPrint('[AttendanceBG] permission denied (cannot request in background)');
       await _notify('Attendance check-in', 'Allow location permission to check in.');
       return;
     }
     if (perm == LocationPermission.deniedForever ||
         perm == LocationPermission.unableToDetermine) {
-      debugPrint('[AttendanceBG] location permission blocked: $perm');
       await _notify('Attendance check-in', 'Enable location permission in Settings to check in.');
       return;
     }
 
     final winId = windowId ?? await _resolveActiveWindowId();
     if (winId == null || winId.isEmpty) {
-      debugPrint('[AttendanceBG] no active window found');
       return;
     }
 
@@ -117,11 +111,7 @@ class AttendanceBackground {
       pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
-      debugPrint(
-        '[AttendanceBG] GPS ok lat=${pos.latitude} lng=${pos.longitude} acc=${pos.accuracy}',
-      );
     } catch (e) {
-      debugPrint('[AttendanceBG] GPS error: $e');
       return;
     }
 
@@ -133,9 +123,7 @@ class AttendanceBackground {
             'deviceLocation': {'lat': pos.latitude, 'lng': pos.longitude},
             'accuracy': pos.accuracy,
           });
-      debugPrint('[AttendanceBG] check-in ok ($source)');
     } catch (e) {
-      debugPrint('[AttendanceBG] check-in failed: $e');
     }
   }
 
@@ -157,7 +145,6 @@ class AttendanceBackground {
         if (endsAt.toDate().isAfter(now)) return d.id;
       }
     } catch (e) {
-      debugPrint('[AttendanceBG] resolve window failed: $e');
     }
     return null;
   }

@@ -38,7 +38,6 @@ class _LoginPageState extends State<LoginPage> {
     try {
       await FirebaseMessaging.instance.requestPermission();
     } catch (e) {
-      debugPrint('FCM permission request failed (non-fatal): $e');
     }
 
     try {
@@ -56,7 +55,6 @@ class _LoginPageState extends State<LoginPage> {
         }
       }
     } catch (e) {
-      debugPrint('Subscribe to all_members failed (non-fatal): $e');
     }
   }
 
@@ -65,7 +63,7 @@ class _LoginPageState extends State<LoginPage> {
     if (mounted) setState(() => _loading = true);
 
     try {
-      final userCred = await _authService.signIn(
+      await _authService.signIn(
         _email.text.trim(),
         _password.text.trim(),
       );

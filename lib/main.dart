@@ -85,7 +85,6 @@ Future<void> _ensureLocalNotificationsInitialized() async {
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   await _ensureLocalNotificationsInitialized();
-  debugPrint('[BG FCM] data=${message.data}');
   if ((message.data['type'] ?? '').toString().toLowerCase() ==
       'attendance_window_ping') {
     await AttendanceBackground.handleBackgroundPing(message);
@@ -144,7 +143,6 @@ Future<void> _initMessaging() async {
         }
       }
     } catch (e) {
-      debugPrint('[FCM] topic resubscribe failed: $e');
     }
   });
 
@@ -188,7 +186,6 @@ Future<void> _syncAttendanceTopicSubscription() async {
       await FirebaseMessaging.instance.unsubscribeFromTopic('all_members');
     }
   } catch (e) {
-    debugPrint('[FCM] attendance topic sync failed: $e');
   }
 }
 
@@ -200,7 +197,6 @@ Future<void> _activateAppCheck() async {
   if (!kReleaseMode) {
     final tp = defaultTargetPlatform;
     if (tp == TargetPlatform.iOS || tp == TargetPlatform.macOS) {
-      debugPrint('[AppCheck] Skipping App Check in debug on Apple platforms.');
       return;
     }
   }
@@ -213,21 +209,11 @@ Future<void> _activateAppCheck() async {
 
   // Force an App Check token now so the first callable won’t race
   try {
-    final t = await FirebaseAppCheck.instance
+    await FirebaseAppCheck.instance
         .getToken(true)
         .timeout(const Duration(seconds: 5));
-    debugPrint('[AppCheck] token len=${t?.length ?? 0}');
-    if (!kReleaseMode) {
-      debugPrint('[AppCheck] If Firestore is denied in debug, add the "App Check debug token" from logcat to Firebase Console.');
-      debugPrint('[AppCheck] current token (debug only): ${t ?? 'null'}');
-    }
   } on TimeoutException {
-    debugPrint('[AppCheck] getToken timeout; continuing startup.');
   } catch (e) {
-    debugPrint('[AppCheck] getToken warn: $e');
-    if (!kReleaseMode) {
-      debugPrint('[AppCheck] If you see "App Check debug token" in logcat, add it in Firebase Console → App Check → Debug tokens.');
-    }
   }
 
   await FirebaseAppCheck.instance.setTokenAutoRefreshEnabled(true);
@@ -270,8 +256,6 @@ Future<void> _postStartInit() async {
   // Stripe (via --dart-define)
   if (kStripePublishableKey.isNotEmpty) {
     Stripe.publishableKey = kStripePublishableKey;
-  } else {
-    debugPrint('[Stripe] publishable key missing; payments will fail.');
   }
 
   // Notifications
@@ -299,7 +283,6 @@ Future<void> _registerFcmTokenForUser() async {
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
   } catch (e) {
-    debugPrint('[FCM] token save failed: $e');
   }
 }
 
@@ -380,7 +363,6 @@ class _RoleLoaderState extends State<RoleLoader> {
       if (!mounted) return;
       Provider.of<ThemeProvider>(context, listen: false).setRole(effectiveRole);
     } catch (e) {
-      debugPrint('[RoleLoader] Failed to load theme role: $e');
     }
   }
 
@@ -450,7 +432,6 @@ class _RoleGateState extends State<RoleGate> {
           stream: _db.collection('users').doc(uid).snapshots(),
           builder: (context, userSnap) {
             if (userSnap.hasError) {
-              debugPrint('[RoleGate] user doc error: ${userSnap.error}');
               return const HomeDashboardPage();
             }
 
